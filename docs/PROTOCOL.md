@@ -130,7 +130,8 @@ For every configured `turn:` URL with UDP transport the server also lists the ma
 ### `GET /ws/{room_id}`
 
 WebSocket upgrade. Returns `404` with `ApiError` `room_not_found` if the room does not exist
-at upgrade time. Frames are UTF-8 JSON text frames, one message per frame, at most 64 KiB.
+at upgrade time, and `503` with `ApiError` `internal` while the server is shutting down.
+Frames are UTF-8 JSON text frames, one message per frame, at most 64 KiB.
 Binary frames are rejected with `bad_request`.
 
 ## 3. WebSocket messages
