@@ -51,6 +51,8 @@ pub struct MediaConfig {
     pub input_device: Option<String>,
     /// Output device name; `None` selects the system default.
     pub output_device: Option<String>,
+    /// Enable RNNoise-based noise suppression on the microphone input.
+    pub noise_suppression: bool,
 }
 
 /// What kind of surface a [`ScreenSource`] captures.
@@ -182,6 +184,8 @@ pub enum MediaCommand {
         /// Linear gain.
         volume: f32,
     },
+    /// Enable or disable microphone noise suppression.
+    SetNoiseSuppression(bool),
     /// Switch the input device (`None` = system default).
     SelectInput(Option<String>),
     /// Switch the output device (`None` = system default).
