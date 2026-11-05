@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chattercrab_protocol::{
@@ -45,6 +45,7 @@ pub struct AppState {
     pub config: Config,
     rooms: DashMap<RoomId, Arc<Room>>,
     room_count: AtomicUsize,
+    next_room_seq: AtomicU64,
     create_limiter: DefaultKeyedRateLimiter<IpAddr>,
     turn_limiter: DefaultKeyedRateLimiter<IpAddr>,
     /// Cancelled when the server shuts down; parent of every member's kick token.
@@ -71,6 +72,7 @@ impl AppState {
             config,
             rooms: DashMap::new(),
             room_count: AtomicUsize::new(0),
+            next_room_seq: AtomicU64::new(0),
             create_limiter: RateLimiter::keyed(create_quota),
             turn_limiter: RateLimiter::keyed(turn_quota),
             shutdown,
@@ -112,7 +114,8 @@ impl AppState {
                 continue;
             };
             if let Entry::Vacant(slot) = self.rooms.entry(id.clone()) {
-                let room = Arc::new(Room::new(id, name));
+                let seq = self.next_room_seq.fetch_add(1, Ordering::Relaxed);
+                let room = Arc::new(Room::new(id, name, seq));
                 slot.insert(Arc::clone(&room));
                 return Ok(room);
             }
@@ -129,15 +132,17 @@ impl AppState {
         self.room_count.load(Ordering::Acquire)
     }
 
-    /// Summaries of every room, sorted by creation time.
+    /// Summaries of every room in creation order.
     pub fn list_rooms(&self) -> Vec<RoomSummary> {
-        let mut rooms: Vec<RoomSummary> = self
+        let mut rooms: Vec<(u64, RoomSummary)> = self
             .rooms
             .iter()
-            .map(|entry| entry.value().summary())
+            .map(|entry| (entry.value().seq, entry.value().summary()))
             .collect();
-        rooms.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        rooms
+        // Creation sequence, not `created_at`: rooms created within the same
+        // millisecond must still list in creation order.
+        rooms.sort_unstable_by_key(|(seq, _)| *seq);
+        rooms.into_iter().map(|(_, summary)| summary).collect()
     }
 
     /// Removes `room` from the index if it is still the registered instance.
@@ -197,6 +202,8 @@ pub struct Room {
     pub name: RoomName,
     /// Creation time.
     pub created_at: UnixMillis,
+    /// Server-wide creation sequence number, used for stable listing order.
+    seq: u64,
     member_count: AtomicUsize,
     inner: Mutex<RoomInner>,
 }
@@ -268,11 +275,12 @@ pub enum ScreenStopOutcome {
 }
 
 impl Room {
-    fn new(id: RoomId, name: RoomName) -> Self {
+    fn new(id: RoomId, name: RoomName, seq: u64) -> Self {
         Self {
             id,
             name,
             created_at: now_millis(),
+            seq,
             member_count: AtomicUsize::new(0),
             inner: Mutex::new(RoomInner {
                 members: HashMap::new(),
