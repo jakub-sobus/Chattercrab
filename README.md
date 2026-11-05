@@ -2,10 +2,10 @@
 
 A minimalist peer-to-peer voice, text and screen-share application, written entirely in
 Rust. Rooms hold up to 5 people connected in a full WebRTC mesh; a small signaling server
-coordinates rooms and relays chat, but never touches audio or video. The signaling
-server is a single static binary and media is direct WebRTC using an external STUN URL,
-with no TURN. A shared password, set in the server environment and the client config,
-can block strangers from the signaling server. No Docker, no JavaScript, no webviews.
+coordinates rooms and relays chat, but never touches audio or video. The server is still
+a Rust binary. The VPS deploy is Docker Compose with Traefik. Media is direct WebRTC
+with an external STUN URL, and there is no TURN relay. A shared password, set in the
+server environment and the client config, can gate signaling. No JavaScript, no webviews.
 
 * Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.
@@ -17,7 +17,7 @@ can block strangers from the signaling server. No Docker, no JavaScript, no webv
 |----------|----------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, threading model, message flows, media pipeline |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Every REST endpoint and WebSocket message with JSON examples |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | VPS setup: DNS, TLS, Coturn, firewall, upgrades, troubleshooting |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | VPS setup: Docker Compose, Traefik, DNS, firewall, upgrades |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decision log (ADR style) |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | Requirement-by-requirement evidence |
 
@@ -38,7 +38,7 @@ crates/protocol   chattercrab-protocol   shared wire types, no I/O
 crates/server     chattercrab-server     binary chattercrab-signal
 crates/media      chattercrab-media      audio, video, WebRTC peer management
 crates/client     chattercrab-client     binary chattercrab (iced desktop app)
-deploy/           build, install, systemd, Coturn, firewall, certbot hook
+deploy/           release build and Linux verification scripts
 docs/             architecture, protocol, deployment, decisions, acceptance
 ```
 
@@ -94,7 +94,7 @@ cargo deny check
 ```
 
 * **Linux (Debian/Ubuntu)**: see the apt package list in
-  [docs/DEPLOY.md section 13](docs/DEPLOY.md#13-building-on-linux-client-prerequisites).
+  [docs/DEPLOY.md section 12](docs/DEPLOY.md#12-building-on-linux-client-prerequisites).
 * **Windows**: Visual Studio Build Tools (C++ workload and Windows SDK). CMake can come
   from `pip install --user cmake`.
 * **Release artifacts**: `deploy/build-release.sh` cross-compiles the static musl server

@@ -378,6 +378,7 @@ Superseded by ADR-504.
   or still the placeholder. The secret is always copied from env into Coturn, so an
   operator-chosen secret also propagates.
 * Consequences: rerunning the installer after editing the env file resyncs Coturn.
+  Superseded for deployment by ADR-506.
 
 ### ADR-402: NAT detection
 
@@ -549,3 +550,9 @@ Consequences: peers behind symmetric NAT may fail to connect. The signaling serv
 Context: the signaling server was open to anyone who could reach it. The operator wants a password, as part of config, enough to stop strangers connecting.
 Decision: `CHATTERCRAB_PASSWORD` (empty means off) and `CHATTERCRAB_AUTH_USER` (default `chattercrab`). When the password is set, all routes except `GET /health` and CORS preflight require HTTP Basic. The client stores `auth_user` and `password` in `config.toml` and sends them on REST and on the WebSocket upgrade. Comparison is constant-time. Failures are a single `401` / `unauthorized`.
 Consequences: the password sits in the server environment and in the client config file in plaintext. `GET /health` does not reveal rooms. Peers still exchange media directly; the password only guards signaling.
+
+### ADR-506: Docker Compose and Traefik, no TURN
+
+Context: deployment was a static binary plus Coturn under systemd (ADR-401 and the surrounding deploy ADRs). The operator wants a Docker image on a VPS, Compose, and Traefik, and does not want TURN.
+Decision: Dockerfile builds chattercrab-signal and serves plain HTTP on 8080 as user chattercrab. docker-compose.yml runs Traefik v3 (ports 80 and 443, Let's Encrypt HTTP-01) and the server with no published port. CHATTERCRAB_PASSWORD is required by the compose file. CHATTERCRAB_STUN_URL defaults to stun:stun.l.google.com:19302. Coturn, the systemd unit, and install.sh are removed.
+Consequences: TLS and certificates are Traefik's job. The Rust server does not see client certificates. Media is not relayed. The password is in the compose environment (visible to anyone who can inspect the container). ADR-401's installer is no longer the supported path.

@@ -3,17 +3,21 @@
 Chattercrab is a minimalist peer-to-peer voice, text and screen-share application.
 Everything is written in Rust. A small signaling server coordinates rooms and relays
 SDP/ICE messages and chat; all audio and video flows directly between peers over
-WebRTC. The VPS runs only `chattercrab-signal`. Clients use the configured external
-STUN server for server-reflexive candidates. Media is direct peer-to-peer. Peers that
-cannot establish a direct path do not get a relay. The signaling server never touches
-media.
+WebRTC. On a VPS, Traefik terminates TLS and proxies to `chattercrab-signal`, which
+speaks plain HTTP on the Compose network. Clients use an external STUN server for
+server-reflexive candidates. Media is direct peer-to-peer. Peers that cannot establish
+a direct path do not get a relay. The signaling server never touches media.
 
 ## 1. Components
 
 ```mermaid
 flowchart LR
-    subgraph VPS["Linux VPS (bare metal, systemd)"]
-        SIG["chattercrab-signal<br/>axum + rustls<br/>:8443 HTTPS/WSS"]
+    STUN["External STUN<br/>stun:stun.l.google.com:19302"]
+
+    subgraph VPS["Linux VPS (Docker Compose)"]
+        TR["Traefik<br/>:443 TLS"]
+        SIG["chattercrab-signal<br/>plain HTTP on the compose network"]
+        TR --> SIG
     end
 
     subgraph A["Client A (chattercrab)"]
@@ -26,9 +30,13 @@ flowchart LR
         RTC["net/media runtime"]
     end
 
-    RTA -- "REST + WSS (signaling, chat)" --> SIG
-    RTB -- "REST + WSS" --> SIG
-    RTC -- "REST + WSS" --> SIG
+    RTA -- "HTTPS + WSS (signaling, chat)" --> TR
+    RTB -- "HTTPS + WSS" --> TR
+    RTC -- "HTTPS + WSS" --> TR
+
+    RTA -. "STUN" .-> STUN
+    RTB -. "STUN" .-> STUN
+    RTC -. "STUN" .-> STUN
 
     RTA <-. "SRTP (Opus, H.264), full mesh" .-> RTB
     RTA <-. "SRTP" .-> RTC
