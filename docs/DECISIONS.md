@@ -543,7 +543,7 @@ Consequences: each upstream audio stream is about 96 kbps. A full mesh of N peer
 
 Context: ADR-006 derived `stun:` URLs from the operator's Coturn `turn:` URLs and the server minted TURN REST credentials. The operator does not want a TURN relay.
 Decision: `CHATTERCRAB_STUN_URL` (default `stun:stun.l.google.com:19302`) is the only ICE server. `GET /ice-servers` returns `{ "urls": [that url] }`. `turn:` and `turns:` URLs are rejected. TURN REST, HMAC-SHA1 credentials, and `ErrorCode::TurnUnavailable` are removed.
-Consequences: peers behind symmetric NAT may fail to connect. The signaling server no longer depends on `hmac`, `sha1`, or `base64`. ADR-006 is historical and superseded. Coturn deploy files are removed in a later change.
+Consequences: peers behind symmetric NAT may fail to connect. The signaling server no longer depends on `hmac` or `sha1`. ADR-505 brings `base64` back only to decode Basic credentials. ADR-006 is historical and superseded. Coturn deploy files are removed by ADR-506.
 
 ### ADR-505: Shared password via HTTP Basic
 
