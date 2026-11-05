@@ -15,8 +15,30 @@ tokio.workspace = true
 tracing.workspace = true
 crossbeam-queue = "0.3.14"
 
-[lints]
-workspace = true
+# WebRTC (sans-IO core + async layer). `rtc` is needed to name core types such as
+# `Sample`, `MediaStreamTrack` and the H.264 depacketizer.
+webrtc = "0.21.1"
+rtc = { version = "0.21.1", default-features = false }
+async-trait = "0.1.92"
+bytes = "1.12.1"
+rand = "0.10.3"
+
+# Audio
+cpal = "0.18.2"
+opus = "0.4.0"
+ringbuf = "0.6.0"
+rubato = { version = "5.0.1", default-features = false }
+# dbus/rtkit support is disabled to avoid a libdbus build dependency on Linux; see ADR-205.
+audio_thread_priority = { version = "0.38.0", default-features = false }
+
+# Screen share
+xcap = "0.9.8"
+fast_image_resize = "6.1.0"
+openh264 = "0.9.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
