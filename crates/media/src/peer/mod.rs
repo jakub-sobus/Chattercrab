@@ -230,6 +230,9 @@ struct PeerEntry {
     audio: Option<LocalSender>,
     video: Option<LocalSender>,
     restarts: u8,
+    /// DTLS-SRTP is up. Send targets are only published for connected peers, so the
+    /// audio pump never writes RTP before the SRTP context exists.
+    connected: bool,
 }
 
 struct Handler {
@@ -522,6 +525,7 @@ impl PeerManager {
                 audio: None,
                 video: None,
                 restarts: 0,
+                connected: false,
             },
         );
         self.events.push_back(PeerEvent::State {
@@ -609,6 +613,9 @@ impl PeerManager {
         }
         if changed {
             self.publish_targets();
+            // Track changes queue `negotiationneeded` in the core, which is only
+            // delivered once the driver runs.
+            self.wake_driver(peer).await;
         }
     }
 
@@ -616,11 +623,13 @@ impl PeerManager {
         let audio: Vec<Arc<SendTarget>> = self
             .peers
             .values()
+            .filter(|e| e.connected)
             .filter_map(|e| e.audio.as_ref().map(|s| s.target.clone()))
             .collect();
         let video: Vec<Arc<SendTarget>> = self
             .peers
             .values()
+            .filter(|e| e.connected)
             .filter_map(|e| e.video.as_ref().map(|s| s.target.clone()))
             .collect();
         self.audio_targets.send_replace(Arc::from(audio));
@@ -642,9 +651,11 @@ impl PeerManager {
         }
         .await;
         match result {
-            Ok(sdp) => self
-                .events
-                .push_back(PeerEvent::Signal(OutgoingSignal::Offer { to: peer, sdp })),
+            Ok(sdp) => {
+                tracing::debug!(%peer, "sending offer");
+                self.events
+                    .push_back(PeerEvent::Signal(OutgoingSignal::Offer { to: peer, sdp }));
+            }
             Err(e) => {
                 tracing::warn!(%peer, "create offer: {e}");
                 entry.neg.offer_failed();
@@ -654,6 +665,7 @@ impl PeerManager {
 
     /// Handles a remote offer (creating the connection if this is the first contact).
     pub async fn remote_offer(&mut self, from: PeerId, sdp: String) -> Result<(), MediaError> {
+        tracing::debug!(peer = %from, "received offer");
         if !self.peers.contains_key(&from) {
             self.add_peer(from, false).await?;
         }
@@ -692,6 +704,7 @@ impl PeerManager {
         // Attach our tracks to the transceivers the offer created before answering, so
         // the answer already sends our audio.
         self.sync_tracks(from).await;
+        self.wake_driver(from).await;
 
         let Some(entry) = self.peers.get_mut(&from) else {
             return Ok(());
@@ -715,6 +728,7 @@ impl PeerManager {
 
     /// Handles a remote answer.
     pub async fn remote_answer(&mut self, from: PeerId, sdp: String) -> Result<(), MediaError> {
+        tracing::debug!(peer = %from, "received answer");
         let Some(entry) = self.peers.get_mut(&from) else {
             return Ok(());
         };
@@ -737,6 +751,7 @@ impl PeerManager {
                 tracing::debug!(peer = %from, "buffered candidate rejected: {e}");
             }
         }
+        self.wake_driver(from).await;
         if again {
             self.make_offer(from).await;
         }
@@ -774,6 +789,35 @@ impl PeerManager {
         {
             tracing::debug!(peer = %from, "remote candidate rejected: {e}");
         }
+        tracing::debug!(peer = %from, "remote candidate added");
+        self.wake_driver(from).await;
+    }
+
+    /// Wakes the connection's background driver after a state change made through the
+    /// API.
+    ///
+    /// Workaround for webrtc 0.21.1: `add_ice_candidate` (UDP), `add_track` and
+    /// `remove_track` change the core without notifying the driver, which then keeps
+    /// sleeping on its previous timeout: connectivity checks for new candidate pairs
+    /// never start and `negotiationneeded` is never delivered. Any sample write wakes
+    /// it, so one Opus
+    /// silence frame is written to this peer's audio sender. Before DTLS completes the
+    /// packet is dropped by webrtc (one log line); afterwards it is a valid 20 ms silence
+    /// frame. See ADR-212.
+    async fn wake_driver(&self, peer: PeerId) {
+        /// TOC byte for CELT fullband 20 ms followed by a minimal silent payload.
+        static OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
+        let Some(target) = self
+            .peers
+            .get(&peer)
+            .and_then(|e| e.audio.as_ref())
+            .map(|a| a.target.clone())
+        else {
+            return;
+        };
+        let _ = target
+            .write(Bytes::from_static(&OPUS_SILENCE), Duration::from_millis(20))
+            .await;
     }
 
     /// Processes one connection callback.
@@ -787,6 +831,7 @@ impl PeerManager {
         }
         match ev.kind {
             InternalKind::Candidate(init) => {
+                tracing::debug!(%peer, candidate = %init.candidate, "local candidate");
                 self.events
                     .push_back(PeerEvent::Signal(OutgoingSignal::Ice {
                         to: peer,
@@ -810,10 +855,19 @@ impl PeerManager {
                         tracing::warn!(%peer, "ICE restart: {e}");
                     }
                 }
+                // Keep sending through a transient `Disconnected` (ICE may recover);
+                // stop on `Failed`/`Closed` and before the first `Connected`.
+                let connected = state == RTCPeerConnectionState::Connected
+                    || (entry.connected && state == RTCPeerConnectionState::Disconnected);
+                let targets_changed = connected != entry.connected;
+                entry.connected = connected;
                 self.events.push_back(PeerEvent::State {
                     peer,
                     state: map_state(state),
                 });
+                if targets_changed {
+                    self.publish_targets();
+                }
             }
             InternalKind::Track(track) => {
                 let ev = match track.kind().await {
@@ -823,6 +877,7 @@ impl PeerManager {
                 self.events.push_back(ev);
             }
             InternalKind::NegotiationNeeded => {
+                tracing::debug!(%peer, "negotiation needed");
                 if entry.neg.negotiation_needed() {
                     self.make_offer(peer).await;
                 }

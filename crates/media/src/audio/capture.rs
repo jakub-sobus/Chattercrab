@@ -58,6 +58,8 @@ pub struct AudioInput {
     /// Shared counters.
     pub stats: Arc<CaptureStats>,
     stream: Option<cpal::Stream>,
+    /// Synthetic tone thread standing in for the device callback (diagnostics only).
+    generator: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     encoder: Option<JoinHandle<()>>,
 }
@@ -135,13 +137,78 @@ impl AudioInput {
             .play()
             .map_err(|e| MediaError::Audio(format!("{name}: {e}")))?;
 
+        tracing::info!(device = %name, rate, channels, "audio input started");
+        let mut input = Self::spawn_encoder(
+            cons,
+            name,
+            rate,
+            Flags { muted, denoise },
+            level,
+            stats,
+            epoch,
+        )?;
+        input.stream = Some(stream);
+        Ok(input)
+    }
+
+    /// Starts a synthetic sine tone of `hz` (with a 3 Hz speech-like amplitude envelope)
+    /// instead of a microphone (diagnostics).
+    ///
+    /// A generator thread writes 10 ms blocks of 48 kHz audio into the capture ring at
+    /// real-time pace, exactly as a device callback would, so the encoder thread, mute,
+    /// noise suppression and Opus run unchanged. No audio device is needed.
+    pub fn start_tone(
+        hz: f32,
+        muted: Arc<AtomicBool>,
+        denoise: Arc<AtomicBool>,
+        level: Arc<AtomicU32>,
+    ) -> Result<Self, MediaError> {
+        if !(hz.is_finite() && hz > 0.0 && hz < SAMPLE_RATE as f32 / 2.0) {
+            return Err(MediaError::Audio(format!(
+                "invalid test tone frequency {hz}"
+            )));
+        }
+        let ring = HeapRb::<f32>::new((SAMPLE_RATE * RING_MS / 1000) as usize);
+        let (prod, cons) = ring.split();
+        let stats = Arc::new(CaptureStats::default());
+        let epoch = Instant::now();
+        let name = format!("test tone {hz} Hz");
+        let mut input = Self::spawn_encoder(
+            cons,
+            name.clone(),
+            SAMPLE_RATE,
+            Flags { muted, denoise },
+            level,
+            stats.clone(),
+            epoch,
+        )?;
+        let stop = input.stop.clone();
+        let generator = std::thread::Builder::new()
+            .name("cc-audio-tone".into())
+            .spawn(move || run_tone(hz, prod, stats, epoch, stop))
+            .map_err(|e| MediaError::Audio(format!("spawn tone thread: {e}")))?;
+        input.generator = Some(generator);
+        tracing::info!(device = %name, "audio input started");
+        Ok(input)
+    }
+
+    /// Spawns the encoder thread reading `cons` and assembles the [`AudioInput`].
+    fn spawn_encoder(
+        cons: HeapCons<f32>,
+        name: String,
+        rate: u32,
+        flags: Flags,
+        level: Arc<AtomicU32>,
+        stats: Arc<CaptureStats>,
+        epoch: Instant,
+    ) -> Result<Self, MediaError> {
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let worker = EncoderWorker::new(
             cons,
             rate,
             tx,
-            Flags { muted, denoise },
+            flags,
             level,
             stats.clone(),
             epoch,
@@ -151,17 +218,64 @@ impl AudioInput {
             .name("cc-audio-encoder".into())
             .spawn(move || worker.run())
             .map_err(|e| MediaError::Audio(format!("spawn encoder thread: {e}")))?;
-
-        tracing::info!(device = %name, rate, channels, "audio input started");
         Ok(Self {
             frames: rx,
             device_name: name,
             device_rate: rate,
             stats,
-            stream: Some(stream),
+            stream: None,
+            generator: None,
             stop,
             encoder: Some(encoder),
         })
+    }
+}
+
+/// Body of the test-tone thread: 10 ms blocks at real-time pace, no allocation.
+fn run_tone(
+    hz: f32,
+    mut prod: HeapProd<f32>,
+    stats: Arc<CaptureStats>,
+    epoch: Instant,
+    stop: Arc<AtomicBool>,
+) {
+    const BLOCK: usize = (SAMPLE_RATE / 100) as usize;
+    const BLOCK_PERIOD: Duration = Duration::from_millis(10);
+    // A perfectly steady sine looks like stationary background to Opus, which then
+    // switches to DTX (comfort noise) after a few seconds. A 3 Hz syllable-rate
+    // amplitude envelope keeps the encoder in active mode like real speech does.
+    const ENVELOPE_HZ: f64 = 3.0;
+    let tau = std::f64::consts::TAU;
+    let step = tau * f64::from(hz) / f64::from(SAMPLE_RATE);
+    let env_step = tau * ENVELOPE_HZ / f64::from(SAMPLE_RATE);
+    let mut phase = 0.0f64;
+    let mut env_phase = 0.0f64;
+    let mut block = [0f32; BLOCK];
+    let mut deadline = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        for s in &mut block {
+            let envelope = 0.55 + 0.45 * env_phase.sin();
+            *s = (phase.sin() * 0.3 * envelope) as f32;
+            phase = (phase + step) % tau;
+            env_phase = (env_phase + env_step) % tau;
+        }
+        let pushed = prod.push_slice(&block);
+        if pushed < BLOCK {
+            stats
+                .ring_overflow_samples
+                .fetch_add((BLOCK - pushed) as u64, Ordering::Relaxed);
+        }
+        stats
+            .last_callback_ns
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Release);
+        deadline += BLOCK_PERIOD;
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        } else if now - deadline > BLOCK_PERIOD * 10 {
+            // Fell far behind (suspended process): resynchronise instead of bursting.
+            deadline = now;
+        }
     }
 }
 
@@ -169,6 +283,9 @@ impl Drop for AudioInput {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         drop(self.stream.take());
+        if let Some(handle) = self.generator.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.encoder.take() {
             let _ = handle.join();
         }
@@ -397,6 +514,52 @@ impl EncoderWorker {
                 latency_count = 0;
                 last_log = Instant::now();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicU32>) {
+        (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    #[test]
+    fn tone_produces_paced_opus_frames_without_a_device() {
+        let (muted, denoise, level) = flags();
+        let mut input = AudioInput::start_tone(440.0, muted, denoise, level.clone()).unwrap();
+        assert_eq!(input.device_rate, SAMPLE_RATE);
+        std::thread::sleep(Duration::from_millis(500));
+        let mut frames = 0;
+        while let Ok(f) = input.frames.try_recv() {
+            assert!(!f.bytes().is_empty());
+            frames += 1;
+        }
+        // 500 ms of real-time audio is 25 frames; allow for scheduling jitter.
+        assert!((15..=40).contains(&frames), "got {frames} frames");
+        assert!(f32::from_bits(level.load(Ordering::Relaxed)) > 0.05);
+    }
+
+    #[test]
+    fn muted_tone_reports_zero_level() {
+        let (muted, denoise, level) = flags();
+        muted.store(true, Ordering::Relaxed);
+        let _input = AudioInput::start_tone(440.0, muted, denoise, level.clone()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(f32::from_bits(level.load(Ordering::Relaxed)), 0.0);
+    }
+
+    #[test]
+    fn rejects_invalid_tone_frequency() {
+        for hz in [0.0, -1.0, 24_000.0, f32::NAN] {
+            let (muted, denoise, level) = flags();
+            assert!(AudioInput::start_tone(hz, muted, denoise, level).is_err());
         }
     }
 }

@@ -129,3 +129,41 @@ ADR-style log for the media engine. Numbering starts at 200 to stay clear of the
   usable (receive-only without a microphone; without a speaker the mixer keeps draining
   peer buffers on its own 20 ms clock and discards the output).
 * Rationale: a missing or busy microphone should not prevent joining a room and chatting.
+
+## ADR-211: Synthetic test tone and the two-process harness
+
+* Context: the brief asks for a two-process call test against the real server. The
+  development machine's microphone delivers no samples, and CI-like environments (WSL)
+  have no audio devices at all.
+* Decision: `MediaDiagnostics::test_tone` replaces the microphone with a sine tone
+  produced by a generator thread that writes 10 ms blocks into the same capture ring at
+  real-time pace, so the encoder thread, mute, noise suppression and Opus run unchanged.
+  The tone has a 3 Hz amplitude envelope: a perfectly steady sine is classified as
+  stationary background by Opus, which then switches to DTX (comfort noise) within seconds,
+  so a peer joining later only ever received comfort noise from earlier members. The
+  option lives in a separate `MediaDiagnostics` struct so `MediaConfig` stays
+  source-compatible. `examples/signal_call.rs` is a headless participant mirroring the
+  client's session logic, and `tests/two_process.rs` (ignored by default) runs an
+  in-process server plus N participant processes and requires every participant to hear
+  every other one for at least half the call.
+* Consequences: end-to-end audio is verified without devices, on any OS.
+
+## ADR-212: Waking the webrtc 0.21 driver explicitly; send only when connected
+
+* Context: in webrtc 0.21.1, `add_track`, `remove_track` and `add_ice_candidate` (UDP)
+  change the sans-IO core without notifying the background driver. The driver keeps
+  sleeping on its previous timeout (up to a day), so `negotiationneeded` is never delivered
+  and connectivity checks for trickled candidates never start. Until now the engine only
+  worked because the audio pump wrote a microphone frame every 20 ms, which wakes the
+  driver as a side effect. With a microphone that delivers no frames (or none at all) a
+  call never connected, and every pre-connection write logged an SRTP warning.
+* Decision: `PeerManager` wakes the driver explicitly by writing one Opus silence frame to
+  that peer's audio sender after track changes and after remote candidates are added.
+  Send targets are published only for peers whose connection is `Connected` (kept through
+  a transient `Disconnected`), so media is no longer pushed into connections that cannot
+  encrypt it yet. Regression test: `connects_without_any_media_written` in
+  `tests/peer_loopback.rs` fails without the wake.
+* Consequences: connection setup no longer depends on microphone activity. A wake before
+  DTLS completes still logs one webrtc warning per wake (bounded by the number of
+  candidates) instead of one per 20 ms. Remove the workaround once webrtc wakes its driver
+  on these calls.
