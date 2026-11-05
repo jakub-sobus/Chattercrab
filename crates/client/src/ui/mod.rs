@@ -510,10 +510,12 @@ impl App {
             }
             AppEvent::Notice(text) => self.state.notice = Some(text),
             AppEvent::Joined(joined) => {
-                if self.room_mut().is_none() {
-                    self.enter_room(joined.id.clone(), joined.name.clone());
-                }
-                if let Some(room) = self.room_mut() {
+                // The room screen is entered when the user clicks Join and kept across
+                // reconnects. A welcome for any other room was already in flight when
+                // the user left, so it must not reopen the room.
+                if let Some(room) = self.room_mut()
+                    && room.model.id == joined.id
+                {
                     room.model.apply_joined(joined);
                     room.frame = None;
                 }
