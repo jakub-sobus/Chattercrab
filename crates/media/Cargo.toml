@@ -14,6 +14,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 crossbeam-queue = "0.3.14"
+nnnoiseless = { version = "0.5.2", default-features = false }
 
 [lints]
 workspace = true
