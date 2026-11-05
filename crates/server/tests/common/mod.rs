@@ -49,8 +49,17 @@ pub async fn start_with(customize: impl FnOnce(&mut Config)) -> TestServer {
         addr,
         signals,
         task,
-        http: reqwest::Client::new(),
+        http: http_client(),
     }
+}
+
+/// HTTP client for tests. In a full workspace build, Cargo feature unification gives
+/// reqwest the client crate's `rustls-no-provider` feature, which requires a process-wide
+/// crypto provider before a `Client` can be built.
+fn http_client() -> reqwest::Client {
+    // Fails harmlessly if another test already installed it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
 }
 
 impl TestServer {
