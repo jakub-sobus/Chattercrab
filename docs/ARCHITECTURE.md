@@ -284,8 +284,8 @@ encoder thread
   -> Opus encode: VoIP, 32 kbps, DTX, in-band FEC, complexity 5
   -> OpusFrame (fixed array + len) -> bounded channel (try_send)
 MediaEngine
-  -> write sample to the single shared Opus TrackLocalStaticSample
-     (bound to every peer connection)
+  -> wrap the frame once in refcounted Bytes and write it to each connection's
+     Opus TrackLocalStaticSample (encode once, packetize per connection)
 ```
 
 ### 6.2 Receive path (audio)
@@ -332,9 +332,15 @@ Frame rate defaults to 15 fps, configurable 5 to 30.
   answers. The decision logic lives in a pure state machine (`peer::negotiation`) that is
   unit tested against a fake signaling channel, separate from the webrtc plumbing.
 * Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `TurnCredentials`,
-  disconnected timeout 5 s, failed timeout 15 s, UDP and TCP candidates only (no mDNS).
-* Tracks: one shared Opus local track for every connection. While sharing, one shared
-  H.264 local track is added to every connection (renegotiation) and removed on stop.
+  disconnected timeout 5 s, failed timeout 15 s, UDP and TCP candidates only (IPv4 host
+  candidates, no mDNS).
+* Tracks: audio is encoded once and the same buffer is written to one Opus local track
+  per connection (webrtc 0.21 binds a local track to a single connection, ADR-201).
+  While sharing, an H.264 track is added to every connection (renegotiation) and removed
+  on stop; the H.264 stream is likewise encoded once.
+* webrtc 0.21 does not wake its connection driver when tracks or remote candidates
+  change, so the peer manager writes one Opus silence frame to nudge it (ADR-212);
+  media is only sent to a peer once its connection is `Connected`.
 
 ## 7. Failure handling summary
 
@@ -343,6 +349,6 @@ Frame rate defaults to 15 fps, configurable 5 to 30.
 | Slow signaling consumer | Queue (256) full: server kicks the member; others get `peer_left`. |
 | Client dead without TCP FIN | Two missed WS pongs (about 40 s) and the server cleans up. |
 | Signaling WS drops on client | Backoff reconnect, mesh rebuilt from the new `welcome`. |
-| ICE failure with one peer | That connection is closed and recreated once by the impolite side; the UI marks the peer as unreachable on repeated failure. |
+| ICE failure with one peer | The impolite side performs an ICE restart (up to 2 attempts, counter reset on `Connected`); the UI shows the peer's connection state. |
 | Audio device unplugged | Stream error event; UI shows it, user can reselect a device. |
 | Server restart | Clients reconnect; rooms are in-memory and must be recreated if empty. |
