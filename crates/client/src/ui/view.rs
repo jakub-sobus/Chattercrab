@@ -77,6 +77,21 @@ fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
                 .into(),
         ),
         labeled(
+            "User",
+            text_input("chattercrab", &config.auth_user)
+                .on_input(Message::AuthUserChanged)
+                .on_submit(Message::Connect)
+                .into(),
+        ),
+        labeled(
+            "Password",
+            text_input("Shared password", &config.password)
+                .secure(true)
+                .on_input(Message::PasswordChanged)
+                .on_submit(Message::Connect)
+                .into(),
+        ),
+        labeled(
             "Display name",
             text_input("Your name (1-32 characters)", &config.display_name)
                 .on_input(Message::DisplayNameChanged)

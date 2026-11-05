@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 use chattercrab_media::{MediaCommand, MediaEvent, OutgoingSignal, ScreenSource};
 use chattercrab_protocol::{
-    ClientMsg, DisplayName, ErrorCode, PeerId, PeerInfo, RoomId, RoomName, ServerMsg,
-    TurnCredentials,
+    ClientMsg, DisplayName, ErrorCode, IceServers, PeerId, PeerInfo, RoomId, RoomName, ServerMsg,
 };
 
 use super::{AppEvent, JoinedRoom};
@@ -31,7 +30,7 @@ pub struct Session {
     room_id: RoomId,
     room_name: RoomName,
     display_name: DisplayName,
-    ice: Option<TurnCredentials>,
+    ice: Option<IceServers>,
     me: Option<PeerId>,
     peers: BTreeMap<PeerId, PeerInfo>,
     screen_publisher: Option<PeerId>,
@@ -45,7 +44,7 @@ impl Session {
         room_id: RoomId,
         room_name: RoomName,
         display_name: DisplayName,
-        ice: Option<TurnCredentials>,
+        ice: Option<IceServers>,
     ) -> Self {
         Self {
             room_id,
@@ -70,8 +69,8 @@ impl Session {
         &self.display_name
     }
 
-    /// Replaces the ICE credentials used for the next `welcome`.
-    pub fn set_ice(&mut self, ice: Option<TurnCredentials>) {
+    /// Replaces the ICE servers used for the next `welcome`.
+    pub fn set_ice(&mut self, ice: Option<IceServers>) {
         self.ice = ice;
     }
 
@@ -318,11 +317,8 @@ mod tests {
     #[test]
     fn welcome_configures_then_offers_to_every_peer() {
         let mut s = session();
-        let ice = TurnCredentials {
-            username: "u".into(),
-            credential: "c".into(),
-            ttl_secs: 10,
-            urls: vec!["turn:x:3478".into()],
+        let ice = IceServers {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
         };
         s.set_ice(Some(ice.clone()));
         let effects = welcome(&mut s, vec![info(2), info(3)]);

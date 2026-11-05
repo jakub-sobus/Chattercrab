@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chattercrab_protocol::{PeerId, TurnCredentials};
+use chattercrab_protocol::{IceServers, PeerId};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::ice::network_type::NetworkType;
 use rtc::interceptor::Slot;
@@ -383,15 +383,15 @@ impl PeerManager {
     }
 
     /// Sets our peer id and the ICE servers for connections created afterwards.
-    pub fn configure(&mut self, me: PeerId, ice: Option<&TurnCredentials>) {
+    pub fn configure(&mut self, me: PeerId, ice: Option<&IceServers>) {
         self.me = Some(me);
         self.ice_servers = ice
             .filter(|c| !c.urls.is_empty())
             .map(|c| {
                 vec![RTCIceServer {
                     urls: c.urls.clone(),
-                    username: c.username.clone(),
-                    credential: c.credential.clone(),
+                    username: String::new(),
+                    credential: String::new(),
                 }]
             })
             .unwrap_or_default();

@@ -109,6 +109,10 @@ pub enum Message {
     VideoFrame(RgbaFrame),
     /// Server URL edited.
     ServerUrlChanged(String),
+    /// Basic auth user edited.
+    AuthUserChanged(String),
+    /// Shared password edited.
+    PasswordChanged(String),
     /// Display name edited.
     DisplayNameChanged(String),
     /// Microphone chosen.
@@ -281,6 +285,8 @@ impl App {
                 }
             }
             Message::ServerUrlChanged(url) => self.config.server_url = url,
+            Message::AuthUserChanged(user) => self.config.auth_user = user,
+            Message::PasswordChanged(password) => self.config.password = password,
             Message::DisplayNameChanged(name) => self.config.display_name = name,
             Message::InputSelected(name) => {
                 self.config.input_device = (name != SYSTEM_DEFAULT).then_some(name);
@@ -451,6 +457,8 @@ impl App {
         self.state.screen = Screen::Connect { connecting: true };
         self.send(UiCommand::Connect {
             server_url: self.config.server_url.clone(),
+            auth_user: self.config.auth_user.clone(),
+            password: self.config.password.clone(),
             display_name: name,
             input_device: self.config.input_device.clone(),
             output_device: self.config.output_device.clone(),

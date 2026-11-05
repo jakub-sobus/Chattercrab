@@ -19,7 +19,9 @@ pub const UI_COMMAND_CAPACITY: usize = 64;
 pub const APP_EVENT_CAPACITY: usize = 256;
 
 /// Commands from the UI to the backend.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts [`UiCommand::Connect`]'s password.
+#[derive(Clone)]
 pub enum UiCommand {
     /// Enumerate audio devices.
     ListDevices,
@@ -27,6 +29,10 @@ pub enum UiCommand {
     Connect {
         /// Server base URL (`https://host:port` or `http://host:port`).
         server_url: String,
+        /// HTTP Basic user. Sent only when `password` is non-empty.
+        auth_user: String,
+        /// Shared password. Empty sends no `Authorization` header.
+        password: String,
         /// Display name for joins.
         display_name: DisplayName,
         /// Microphone; `None` = system default.
@@ -79,6 +85,61 @@ pub enum UiCommand {
     StopScreenShare,
     /// Stop the backend.
     Shutdown,
+}
+
+impl std::fmt::Debug for UiCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect {
+                server_url,
+                auth_user,
+                password: _,
+                display_name,
+                input_device,
+                output_device,
+                noise_suppression,
+            } => f
+                .debug_struct("UiCommand::Connect")
+                .field("server_url", server_url)
+                .field("auth_user", auth_user)
+                .field("password", &"<redacted>")
+                .field("display_name", display_name)
+                .field("input_device", input_device)
+                .field("output_device", output_device)
+                .field("noise_suppression", noise_suppression)
+                .finish(),
+            Self::ListDevices => f.write_str("UiCommand::ListDevices"),
+            Self::Disconnect => f.write_str("UiCommand::Disconnect"),
+            Self::RefreshRooms => f.write_str("UiCommand::RefreshRooms"),
+            Self::CreateRoom(name) => f.debug_tuple("UiCommand::CreateRoom").field(name).finish(),
+            Self::JoinRoom { id, name } => f
+                .debug_struct("UiCommand::JoinRoom")
+                .field("id", id)
+                .field("name", name)
+                .finish(),
+            Self::LeaveRoom => f.write_str("UiCommand::LeaveRoom"),
+            Self::SendChat(text) => f.debug_tuple("UiCommand::SendChat").field(text).finish(),
+            Self::SetMuted(muted) => f.debug_tuple("UiCommand::SetMuted").field(muted).finish(),
+            Self::SetDeafened(deaf) => f.debug_tuple("UiCommand::SetDeafened").field(deaf).finish(),
+            Self::SetNoiseSuppression(on) => f
+                .debug_tuple("UiCommand::SetNoiseSuppression")
+                .field(on)
+                .finish(),
+            Self::SetPeerVolume { peer, volume } => f
+                .debug_struct("UiCommand::SetPeerVolume")
+                .field("peer", peer)
+                .field("volume", volume)
+                .finish(),
+            Self::ListScreenSources => f.write_str("UiCommand::ListScreenSources"),
+            Self::StartScreenShare { source, fps } => f
+                .debug_struct("UiCommand::StartScreenShare")
+                .field("source", source)
+                .field("fps", fps)
+                .finish(),
+            Self::StopScreenShare => f.write_str("UiCommand::StopScreenShare"),
+            Self::Shutdown => f.write_str("UiCommand::Shutdown"),
+        }
+    }
 }
 
 /// State delivered by `welcome`.

@@ -1,7 +1,7 @@
 # chattercrab-media API changes
 
 Changes to the public contract in `src/lib.rs` relative to the stub committed in
-`e2cb69c` ("define media engine API contract with stub engine"). All are additive.
+`e2cb69c` ("define media engine API contract with stub engine"). Rows above the ICE change are additive.
 
 | Change | Kind | Notes |
 |--------|------|-------|
@@ -10,6 +10,7 @@ Changes to the public contract in `src/lib.rs` relative to the stub committed in
 | `MediaDiagnostics { test_tone: Option<f32> }` | new struct | Diagnostics only. `test_tone` replaces the microphone with a sine tone (3 Hz speech-like envelope) that goes through the normal encoder thread. Kept out of `MediaConfig` so the client's exhaustive `MediaConfig` literal keeps compiling. |
 | `MediaEngine::start_with_diagnostics(config, diagnostics)` | new function | `start(config)` is `start_with_diagnostics(config, MediaDiagnostics::default())`. Used by `examples/signal_call.rs` and `tests/two_process.rs`. |
 | `pub mod audio`, `jitter`, `mixer`, `peer`, `screen`, `denoise` | new modules | Building blocks used by the engine, the loopback example and tests. The client should keep using `MediaEngine`, `MediaCommand` and `MediaEvent` only. |
+| `MediaCommand::Configure.ice` is `Option<IceServers>` | breaking | Was `Option<TurnCredentials>`. STUN servers from `GET /ice-servers` (urls only). `None` or empty `urls` means host candidates only. |
 
 Behavior notes for the client (no type changes):
 

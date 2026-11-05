@@ -3,16 +3,21 @@
 Chattercrab is a minimalist peer-to-peer voice, text and screen-share application.
 Everything is written in Rust. A small signaling server coordinates rooms and relays
 SDP/ICE messages and chat; all audio and video flows directly between peers over
-WebRTC (or through the operator's Coturn TURN server when a direct path is impossible).
-The signaling server never touches media.
+WebRTC. On a VPS, Traefik terminates TLS and proxies to `chattercrab-signal`, which
+speaks plain HTTP on the Compose network. Clients use an external STUN server for
+server-reflexive candidates. Media is direct peer-to-peer. Peers that cannot establish
+a direct path do not get a relay. The signaling server never touches media.
 
 ## 1. Components
 
 ```mermaid
 flowchart LR
-    subgraph VPS["Linux VPS (bare metal, systemd)"]
-        SIG["chattercrab-signal<br/>axum + rustls<br/>:8443 HTTPS/WSS"]
-        TURN["coturn<br/>:3478 udp/tcp<br/>:5349 tls<br/>49152-49999 udp relay"]
+    STUN["External STUN<br/>stun:stun.l.google.com:19302"]
+
+    subgraph VPS["Linux VPS (Docker Compose)"]
+        TR["Traefik<br/>:443 TLS"]
+        SIG["chattercrab-signal<br/>plain HTTP on the compose network"]
+        TR --> SIG
     end
 
     subgraph A["Client A (chattercrab)"]
@@ -25,22 +30,23 @@ flowchart LR
         RTC["net/media runtime"]
     end
 
-    RTA -- "REST + WSS (signaling, chat)" --> SIG
-    RTB -- "REST + WSS" --> SIG
-    RTC -- "REST + WSS" --> SIG
+    RTA -- "HTTPS + WSS (signaling, chat)" --> TR
+    RTB -- "HTTPS + WSS" --> TR
+    RTC -- "HTTPS + WSS" --> TR
+
+    RTA -. "STUN" .-> STUN
+    RTB -. "STUN" .-> STUN
+    RTC -. "STUN" .-> STUN
 
     RTA <-. "SRTP (Opus, H.264), full mesh" .-> RTB
     RTA <-. "SRTP" .-> RTC
     RTB <-. "SRTP" .-> RTC
-
-    RTA -. "fallback relay" .- TURN
-    RTB -. "fallback relay" .- TURN
 ```
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
 | `chattercrab-protocol` | library | Shared serde types for REST and WebSocket messages. Validation newtypes. No I/O. |
-| `chattercrab-server` | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration, TURN REST credentials. |
+| `chattercrab-server` | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration. Clients receive one external STUN URL from `GET /ice-servers`. |
 | `chattercrab-media` | library | Audio capture/encode, jitter buffers, mixer, playback, screen capture/encode/decode, WebRTC peer management. Message-based API. |
 | `chattercrab-client` | binary `chattercrab` | iced desktop UI, configuration, signaling client, reconnect logic. Drives `chattercrab-media` through commands and events. |
 
@@ -52,12 +58,16 @@ free of native audio/video libraries.
 
 * Full mesh: with `N` participants each client maintains `N - 1` peer connections.
   The design target is 4 to 5 participants per room (`CHATTERCRAB_MAX_ROOM_SIZE`, default 5).
-* Upstream cost per client: `(N - 1) x 32 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
+* Upstream cost per client: `(N - 1) x 96 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
   that client is the screen publisher. With 5 participants a publisher needs about 6 Mbps up.
 * At most one screen publisher per room. The server is the arbiter (section 5.3), which
   keeps the mesh upstream bounded and the UI simple.
 
 ## 3. Signaling server
+
+When `CHATTERCRAB_PASSWORD` is set, the signaling server requires a shared HTTP Basic
+credential on every route except `GET /health` and CORS preflight. `GET /health` stays
+open. Peers still exchange media directly; the password only guards signaling.
 
 ### 3.1 State
 
@@ -202,8 +212,8 @@ sequenceDiagram
     participant A as Client A
     participant B as Client B
 
-    C->>S: GET /turn-credentials
-    S-->>C: TurnCredentials
+    C->>S: GET /ice-servers
+    S-->>C: IceServers
     C->>S: WSS /ws/{room}
     C->>S: join {display_name}
     S-->>C: welcome {you, peers:[A,B], history, screen_publisher}
@@ -281,7 +291,7 @@ encoder thread
   -> accumulate 960-sample (20 ms) frames
   -> mute: frame replaced by zeros (Opus DTX makes it ~1 byte)
   -> RMS for the local speaking indicator     (atomic store)
-  -> Opus encode: VoIP, 32 kbps, DTX, in-band FEC, complexity 5
+  -> Opus encode: VoIP, 96 kbps, DTX, in-band FEC, complexity 5
   -> OpusFrame (fixed array + len) -> bounded channel (try_send)
 MediaEngine
   -> wrap the frame once in refcounted Bytes and write it to each connection's
@@ -331,7 +341,7 @@ Frame rate defaults to 15 fps, configurable 5 to 30.
   offer in flight, the impolite peer ignores it and the polite peer rolls back and
   answers. The decision logic lives in a pure state machine (`peer::negotiation`) that is
   unit tested against a fake signaling channel, separate from the webrtc plumbing.
-* Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `TurnCredentials`,
+* Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `IceServers` (one `stun:` URL, empty username and credential),
   disconnected timeout 5 s, failed timeout 15 s, UDP and TCP candidates only (IPv4 host
   candidates, no mDNS).
 * Tracks: audio is encoded once and the same buffer is written to one Opus local track

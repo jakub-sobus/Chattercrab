@@ -23,11 +23,18 @@ pub enum ThemeChoice {
 }
 
 /// User settings persisted between runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::password`]. The password is stored in the TOML file in
+/// plaintext because the operator keeps it in config.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Signaling server base URL, e.g. `https://chat.example.com:8443`.
     pub server_url: String,
+    /// HTTP Basic user sent when [`Self::password`] is non-empty.
+    pub auth_user: String,
+    /// Shared signaling password. Empty sends no `Authorization` header.
+    pub password: String,
     /// Display name used when joining rooms.
     pub display_name: String,
     /// Preferred microphone; `None` uses the system default.
@@ -46,6 +53,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server_url: "https://localhost:8443".to_owned(),
+            auth_user: "chattercrab".to_owned(),
+            password: String::new(),
             display_name: String::new(),
             input_device: None,
             output_device: None,
@@ -89,6 +98,22 @@ impl Config {
     }
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("server_url", &self.server_url)
+            .field("auth_user", &self.auth_user)
+            .field("password", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .field("input_device", &self.input_device)
+            .field("output_device", &self.output_device)
+            .field("theme", &self.theme)
+            .field("screen_fps", &self.screen_fps)
+            .field("noise_suppression", &self.noise_suppression)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +137,8 @@ mod tests {
         let path = dir.join("chattercrab").join("config.toml");
         let config = Config {
             server_url: "https://chat.example.com:8443".into(),
+            auth_user: "ada".into(),
+            password: "s3cret:with:colon".into(),
             display_name: "ada".into(),
             input_device: Some("USB Mic".into()),
             output_device: None,
@@ -120,7 +147,18 @@ mod tests {
             noise_suppression: true,
         };
         config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("s3cret:with:colon"),
+            "password is stored in the config file"
+        );
         assert_eq!(Config::load(&path).unwrap(), config);
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("s3cret:with:colon"),
+            "password leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -163,6 +201,8 @@ screen_fps = 15
         let config = Config::load(&path).unwrap();
         assert!(!config.noise_suppression);
         assert_eq!(config.display_name, "ada");
+        assert_eq!(config.auth_user, "chattercrab");
+        assert!(config.password.is_empty());
 
         let enabled = Config {
             noise_suppression: true,
@@ -172,6 +212,27 @@ screen_fps = 15
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("noise_suppression = true"));
         assert!(Config::load(&path).unwrap().noise_suppression);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_file_without_auth_keys_uses_defaults() {
+        let dir = temp_dir("old-auth");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "server_url = \"https://chat.example.com:8443\"
+display_name = \"ada\"
+theme = \"dark\"
+screen_fps = 15
+noise_suppression = false
+",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.auth_user, "chattercrab");
+        assert!(config.password.is_empty());
+        assert_eq!(config.display_name, "ada");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
