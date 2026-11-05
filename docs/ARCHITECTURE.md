@@ -57,6 +57,10 @@ free of native audio/video libraries.
 
 ## 3. Signaling server
 
+When `CHATTERCRAB_PASSWORD` is set, the signaling server requires a shared HTTP Basic
+credential on every route except `GET /health` and CORS preflight. `GET /health` stays
+open. Peers still exchange media directly; the password only guards signaling.
+
 ### 3.1 State
 
 ```mermaid

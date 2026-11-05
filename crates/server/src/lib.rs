@@ -3,10 +3,12 @@
 //! Hosts rooms, relays SDP offers/answers and ICE candidates between members,
 //! keeps a short in-memory chat history, and arbitrates the single screen-share slot per
 //! room. It never relays media. Clients learn the configured STUN URL from `GET /ice-servers`.
+//! When `CHATTERCRAB_PASSWORD` is set, every route except `GET /health` requires HTTP Basic auth.
 //!
 //! The binary `chattercrab-signal` is a thin wrapper around [`run`]; integration tests
 //! call [`run`] directly with an ephemeral listener.
 
+mod auth;
 pub mod config;
 pub mod http;
 pub mod state;

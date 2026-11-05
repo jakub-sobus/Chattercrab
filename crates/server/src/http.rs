@@ -8,6 +8,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
 use axum::http::{Method, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chattercrab_protocol::{
@@ -19,6 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::auth;
 use crate::state::{AppState, CreateRoomError};
 use crate::ws;
 
@@ -30,13 +32,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    // CORS is outside auth so a preflight OPTIONS is answered before credentials are required.
     Router::new()
         .route("/health", get(health))
         .route("/rooms", get(list_rooms).post(create_room))
         .route("/ice-servers", get(ice_servers))
         .route("/ws/{room_id}", get(ws_upgrade))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_basic_auth,
+        ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

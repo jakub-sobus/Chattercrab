@@ -150,6 +150,8 @@ impl Backend {
             }
             UiCommand::Connect {
                 server_url,
+                auth_user,
+                password,
                 display_name,
                 input_device,
                 output_device,
@@ -160,7 +162,8 @@ impl Backend {
                     output_device,
                     noise_suppression,
                 };
-                self.connect(&server_url, display_name, media).await;
+                self.connect(&server_url, auth_user, password, display_name, media)
+                    .await;
             }
             UiCommand::Disconnect => {
                 self.leave_room().await;
@@ -226,10 +229,12 @@ impl Backend {
     async fn connect(
         &mut self,
         server_url: &str,
+        auth_user: String,
+        password: String,
         display_name: DisplayName,
         media_config: MediaConfig,
     ) {
-        let rest = match Rest::new(server_url) {
+        let rest = match Rest::new(server_url, &auth_user, &password) {
             Ok(rest) => rest,
             Err(e) => return self.ui(AppEvent::ConnectFailed(format!("{e:#}"))).await,
         };
@@ -313,18 +318,28 @@ impl Backend {
     }
 
     fn open_connection(&mut self) {
-        let Some(rest) = &self.rest else { return };
+        let (url, display_name, auth_user, password) = {
+            let Some(rest) = &self.rest else { return };
+            let Some(room) = &self.room else { return };
+            (
+                rest.ws_url(room.session.room_id()),
+                room.session.display_name().clone(),
+                rest.auth_user().to_owned(),
+                rest.password().to_owned(),
+            )
+        };
         let Some(room) = self.room.as_mut() else {
             return;
         };
         self.next_generation += 1;
         room.generation = self.next_generation;
         room.retry_at = None;
-        let url = rest.ws_url(room.session.room_id());
         room.conn = Some(signaling::spawn(
             room.generation,
             url,
-            room.session.display_name().clone(),
+            display_name,
+            auth_user,
+            password,
             self.signal_tx.clone(),
         ));
     }

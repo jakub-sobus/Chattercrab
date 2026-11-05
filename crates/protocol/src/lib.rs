@@ -84,6 +84,8 @@ pub enum ErrorCode {
     MaxRooms,
     /// Too many requests from this client.
     RateLimited,
+    /// Missing or incorrect HTTP Basic credentials.
+    Unauthorized,
     /// No `join` arrived within the join timeout.
     JoinTimeout,
     /// A message other than `join` was sent before joining.
@@ -174,6 +176,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::NotScreenPublisher).unwrap(),
             "\"not_screen_publisher\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::Unauthorized).unwrap(),
+            "\"unauthorized\""
         );
     }
 }

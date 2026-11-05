@@ -773,6 +773,7 @@ name = "chattercrab-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bytes",
  "chattercrab-media",
  "chattercrab-protocol",
@@ -841,6 +842,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "base64 0.23.1",
  "chattercrab-protocol",
  "dashmap",
  "futures-util",

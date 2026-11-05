@@ -8,6 +8,26 @@ use std::time::Duration;
 /// STUN URL used when `CHATTERCRAB_STUN_URL` is unset or empty.
 pub const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
 
+/// HTTP Basic credentials required when authentication is enabled.
+///
+/// `Debug` redacts [`Self::password`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct BasicAuth {
+    /// User (`CHATTERCRAB_AUTH_USER`). Never contains `:`.
+    pub user: String,
+    /// Shared password (`CHATTERCRAB_PASSWORD`). Never logged.
+    pub password: String,
+}
+
+impl std::fmt::Debug for BasicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuth")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Paths of the PEM certificate chain and private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsPaths {
@@ -26,6 +46,8 @@ pub struct Config {
     pub tls: Option<TlsPaths>,
     /// Single `stun:` URL handed to clients (`CHATTERCRAB_STUN_URL`).
     pub stun_url: String,
+    /// Shared Basic credential. `None` leaves every route open.
+    pub auth: Option<BasicAuth>,
     /// Maximum members per room (`CHATTERCRAB_MAX_ROOM_SIZE`).
     pub max_room_size: usize,
     /// Maximum number of rooms (`CHATTERCRAB_MAX_ROOMS`).
@@ -54,6 +76,7 @@ impl Default for Config {
             bind: SocketAddr::from(([0, 0, 0, 0], 8443)),
             tls: None,
             stun_url: DEFAULT_STUN_URL.to_owned(),
+            auth: None,
             max_room_size: 5,
             max_rooms: 100,
             room_idle_ttl: Duration::from_secs(3600),
@@ -93,7 +116,8 @@ impl Config {
     }
 
     /// Loads the configuration through `lookup`, which maps a variable name to its
-    /// value. Empty values count as unset.
+    /// value. Empty values count as unset. `CHATTERCRAB_AUTH_USER` is read only when
+    /// `CHATTERCRAB_PASSWORD` is non-empty; an empty user is then an error, not a default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let get = |name: &str| {
             lookup(name)
@@ -123,6 +147,8 @@ impl Config {
             config.stun_url = parse_stun_url(&v)?;
         }
 
+        config.auth = parse_auth(&lookup)?;
+
         if let Some(v) = get("CHATTERCRAB_MAX_ROOM_SIZE") {
             config.max_room_size = parse_positive("CHATTERCRAB_MAX_ROOM_SIZE", &v)?;
         }
@@ -135,6 +161,39 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+/// `None` when the password is unset or empty after trimming.
+fn parse_auth(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<BasicAuth>, ConfigError> {
+    let Some(raw_password) = lookup("CHATTERCRAB_PASSWORD") else {
+        return Ok(None);
+    };
+    let password = raw_password.trim().to_owned();
+    if password.is_empty() {
+        return Ok(None);
+    }
+    let user = match lookup("CHATTERCRAB_AUTH_USER") {
+        None => "chattercrab".to_owned(),
+        Some(raw) => {
+            let user = raw.trim().to_owned();
+            if user.is_empty() {
+                return Err(ConfigError::Invalid {
+                    var: "CHATTERCRAB_AUTH_USER",
+                    value: raw,
+                    reason: "must not be empty",
+                });
+            }
+            if user.contains(':') {
+                return Err(ConfigError::Invalid {
+                    var: "CHATTERCRAB_AUTH_USER",
+                    value: user,
+                    reason: "must not contain ':'",
+                });
+            }
+            user
+        }
+    };
+    Ok(Some(BasicAuth { user, password }))
 }
 
 fn parse_positive(var: &'static str, value: &str) -> Result<usize, ConfigError> {
@@ -218,6 +277,7 @@ mod tests {
         assert_eq!(c.bind, "0.0.0.0:8443".parse().unwrap());
         assert!(c.tls.is_none());
         assert_eq!(c.stun_url, DEFAULT_STUN_URL);
+        assert!(c.auth.is_none());
         assert_eq!(c.max_room_size, 5);
         assert_eq!(c.max_rooms, 100);
         assert_eq!(c.room_idle_ttl, Duration::from_secs(3600));
@@ -287,6 +347,106 @@ mod tests {
                 other => panic!("expected invalid STUN URL for {value:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn password_unset_or_blank_disables_auth() {
+        assert!(load(&[]).unwrap().auth.is_none());
+        assert!(
+            load(&[("CHATTERCRAB_PASSWORD", "")])
+                .unwrap()
+                .auth
+                .is_none()
+        );
+        assert!(
+            load(&[("CHATTERCRAB_PASSWORD", "   ")])
+                .unwrap()
+                .auth
+                .is_none()
+        );
+        // The user is ignored when authentication is off, even if it would be invalid.
+        assert!(
+            load(&[
+                ("CHATTERCRAB_PASSWORD", "  "),
+                ("CHATTERCRAB_AUTH_USER", "a:b"),
+            ])
+            .unwrap()
+            .auth
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn password_defaults_user_and_trims() {
+        let auth = load(&[("CHATTERCRAB_PASSWORD", "  secret  ")])
+            .unwrap()
+            .auth
+            .unwrap();
+        assert_eq!(auth.user, "chattercrab");
+        assert_eq!(auth.password, "secret");
+    }
+
+    #[test]
+    fn custom_auth_user() {
+        let auth = load(&[
+            ("CHATTERCRAB_PASSWORD", "secret"),
+            ("CHATTERCRAB_AUTH_USER", "  ada  "),
+        ])
+        .unwrap()
+        .auth
+        .unwrap();
+        assert_eq!(auth.user, "ada");
+        assert_eq!(auth.password, "secret");
+    }
+
+    #[test]
+    fn rejects_user_with_colon() {
+        match load(&[
+            ("CHATTERCRAB_PASSWORD", "secret"),
+            ("CHATTERCRAB_AUTH_USER", "a:b"),
+        ]) {
+            Err(ConfigError::Invalid { var, value, .. }) => {
+                assert_eq!(var, "CHATTERCRAB_AUTH_USER");
+                assert_eq!(value, "a:b");
+            }
+            other => panic!("expected invalid user, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_user_when_password_set() {
+        for user in ["", "   "] {
+            match load(&[
+                ("CHATTERCRAB_PASSWORD", "secret"),
+                ("CHATTERCRAB_AUTH_USER", user),
+            ]) {
+                Err(ConfigError::Invalid { var, .. }) => {
+                    assert_eq!(var, "CHATTERCRAB_AUTH_USER");
+                }
+                other => panic!("expected empty user error for {user:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        let password = "super-secret-value";
+        let c = load(&[
+            ("CHATTERCRAB_PASSWORD", password),
+            ("CHATTERCRAB_AUTH_USER", "ada"),
+        ])
+        .unwrap();
+        let rendered = format!("{c:?}");
+        assert!(
+            !rendered.contains(password),
+            "password leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("ada"), "{rendered}");
+        let auth = c.auth.unwrap();
+        let auth_rendered = format!("{auth:?}");
+        assert!(!auth_rendered.contains(password), "{auth_rendered}");
+        assert!(auth_rendered.contains("<redacted>"));
     }
 
     #[test]

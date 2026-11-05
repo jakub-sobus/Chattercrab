@@ -543,3 +543,9 @@ Consequences: each upstream audio stream is about 96 kbps. A full mesh of N peer
 Context: ADR-006 derived `stun:` URLs from the operator's Coturn `turn:` URLs and the server minted TURN REST credentials. The operator does not want a TURN relay.
 Decision: `CHATTERCRAB_STUN_URL` (default `stun:stun.l.google.com:19302`) is the only ICE server. `GET /ice-servers` returns `{ "urls": [that url] }`. `turn:` and `turns:` URLs are rejected. TURN REST, HMAC-SHA1 credentials, and `ErrorCode::TurnUnavailable` are removed.
 Consequences: peers behind symmetric NAT may fail to connect. The signaling server no longer depends on `hmac`, `sha1`, or `base64`. ADR-006 is historical and superseded. Coturn deploy files are removed in a later change.
+
+### ADR-505: Shared password via HTTP Basic
+
+Context: the signaling server was open to anyone who could reach it. The operator wants a password, as part of config, enough to stop strangers connecting.
+Decision: `CHATTERCRAB_PASSWORD` (empty means off) and `CHATTERCRAB_AUTH_USER` (default `chattercrab`). When the password is set, all routes except `GET /health` and CORS preflight require HTTP Basic. The client stores `auth_user` and `password` in `config.toml` and sends them on REST and on the WebSocket upgrade. Comparison is constant-time. Failures are a single `401` / `unauthorized`.
+Consequences: the password sits in the server environment and in the client config file in plaintext. `GET /health` does not reveal rooms. Peers still exchange media directly; the password only guards signaling.

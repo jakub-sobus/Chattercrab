@@ -16,6 +16,8 @@ All settings come from environment variables (see `deploy/chattercrab.env.exampl
 | `CHATTERCRAB_BIND` | `0.0.0.0:8443` | Listen address. |
 | `CHATTERCRAB_TLS_CERT`, `CHATTERCRAB_TLS_KEY` | unset | PEM certificate chain and key. Both or neither; without them the server speaks plain HTTP/WS (local development only). |
 | `CHATTERCRAB_STUN_URL` | `stun:stun.l.google.com:19302` | Exactly one `stun:host:port` (or `stun:[ipv6]:port`) URL returned by `GET /ice-servers`. `turn:` and `turns:` are rejected. |
+| `CHATTERCRAB_AUTH_USER` | `chattercrab` | Basic auth user, used only when `CHATTERCRAB_PASSWORD` is set. Must be non-empty and must not contain `:`. |
+| `CHATTERCRAB_PASSWORD` | unset | Shared password. Empty or unset disables authentication. When set, every route except `GET /health` and CORS preflight requires `Authorization: Basic`. |
 | `CHATTERCRAB_MAX_ROOM_SIZE` | `5` | Members per room. |
 | `CHATTERCRAB_MAX_ROOMS` | `100` | Rooms per server. |
 | `CHATTERCRAB_ROOM_IDLE_TTL_SECS` | `3600` | Empty rooms idle this long are evicted (checked every 60 s). |
@@ -44,7 +46,7 @@ curl -X POST -H 'content-type: application/json' -d '{"name":"test"}' http://127
 cargo test -p chattercrab-server
 ```
 
-Unit tests cover configuration parsing, including the STUN URL. Integration tests in `tests/` start the server in-process on `127.0.0.1:0` with
+Unit tests cover configuration parsing, including the STUN URL and optional Basic auth (the password is redacted in `Debug`). Integration tests in `tests/` start the server in-process on `127.0.0.1:0` with
 shortened timers and drive it over HTTP and WebSocket: rooms, limits, join/welcome,
 relay, heartbeat, join timeout, room full, screen lock, chat history, slow-consumer kick,
 room deletion, graceful shutdown, and HTTPS with certificate hot reload.

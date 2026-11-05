@@ -4,7 +4,8 @@ A minimalist peer-to-peer voice, text and screen-share application, written enti
 Rust. Rooms hold up to 5 people connected in a full WebRTC mesh; a small signaling server
 coordinates rooms and relays chat, but never touches audio or video. The signaling
 server is a single static binary and media is direct WebRTC using an external STUN URL,
-with no TURN. No Docker, no JavaScript, no webviews.
+with no TURN. A shared password, set in the server environment and the client config,
+can block strangers from the signaling server. No Docker, no JavaScript, no webviews.
 
 * Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.

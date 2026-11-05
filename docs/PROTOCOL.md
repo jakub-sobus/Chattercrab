@@ -47,6 +47,7 @@ WS otherwise (local development only).
 | `room_full` | Room already has `CHATTERCRAB_MAX_ROOM_SIZE` members. |
 | `max_rooms` | Server already hosts `CHATTERCRAB_MAX_ROOMS` rooms. |
 | `rate_limited` | Too many requests from this IP. |
+| `unauthorized` | Missing or incorrect HTTP Basic credentials. |
 | `join_timeout` | No `join` within 5 seconds of connecting. |
 | `not_joined` | A message other than `join` was sent before joining. |
 | `already_joined` | A second `join` on the same socket. |
@@ -63,6 +64,29 @@ WS otherwise (local development only).
 ## 2. REST endpoints
 
 All bodies are `application/json`. Request bodies are limited to 16 KiB.
+
+### Authentication
+
+When `CHATTERCRAB_PASSWORD` is set (after trimming), every endpoint except `GET /health`
+requires HTTP Basic authentication. An empty or unset password disables the check.
+`GET /health` is always open. A CORS preflight (`OPTIONS`) does not require credentials.
+
+```http
+Authorization: Basic base64(user:password)
+```
+
+The user is `CHATTERCRAB_AUTH_USER` (default `chattercrab`). The user must not contain
+`:`. The password may. A missing header, wrong scheme, bad base64, bad UTF-8, wrong
+user, or wrong password is the same response: `401 Unauthorized`,
+`WWW-Authenticate: Basic realm="chattercrab"`, and
+
+```json
+{ "code": "unauthorized", "message": "unauthorized" }
+```
+
+The body does not say whether the user or the password was wrong. An authenticated
+`GET /ws/{room_id}` for an unknown room is still `404`. Without valid credentials that
+upgrade is `401`.
 
 ### `GET /health`
 

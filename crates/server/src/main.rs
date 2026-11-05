@@ -24,6 +24,7 @@ fn main() -> anyhow::Result<()> {
         bind = %config.bind,
         tls = config.tls.is_some(),
         stun_url = %config.stun_url,
+        auth = config.auth.is_some(),
         max_room_size = config.max_room_size,
         max_rooms = config.max_rooms,
         "starting chattercrab-signal"

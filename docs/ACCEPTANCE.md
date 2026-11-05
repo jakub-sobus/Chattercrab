@@ -78,11 +78,12 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| Stack: tokio, axum `ws`, axum-server rustls, tower-http (cors, trace, limit), dashmap, tracing JSON | PASS | `crates/server/Cargo.toml`. axum-server uses `tls-rustls-no-provider` with ring instead of aws-lc (ADR-100). No `hmac`, `sha1`, or `base64` dependency (ADR-504). |
+| Stack: tokio, axum `ws`, axum-server rustls, tower-http (cors, trace, limit), dashmap, tracing JSON | PASS | `crates/server/Cargo.toml`. axum-server uses `tls-rustls-no-provider` with ring instead of aws-lc (ADR-100). No `hmac` or `sha1` (ADR-504). `base64` decodes HTTP Basic credentials (ADR-505). |
 | Env config with the listed variables and defaults | PASS | `crates/server/src/config.rs`; `deploy/chattercrab.env.example`. |
 | `Arc<AppState>` with `DashMap<RoomId, Room>`, per-room tokio Mutex, no global lock | PASS | `crates/server/src/state.rs` (`Arc<Room>` values, `Mutex<RoomInner>`). |
 | Routes `/health`, `/rooms` GET and POST (rate limited, max rooms), `/ice-servers`, `/ws/{room_id}` | PASS | `crates/server/src/http.rs`; tests `health_reports_ok`, `create_and_list_rooms`, `create_room_rate_limited`, `max_rooms_enforced`, `ice_servers_returns_configured_stun_url`, `ice_servers_reflects_custom_stun_url`, `ice_servers_rate_limited`, `ws_to_unknown_room_is_404`. `GET /turn-credentials` is not served. |
 | `GET /ice-servers` returns the configured STUN URL and no credential | PASS | Default `stun:stun.l.google.com:19302` (`CHATTERCRAB_STUN_URL`). Response is `{ "urls": ["<that url>"] }` with no username or credential. `turn:` and `turns:` URLs are rejected at config load. No TURN relay. |
+| Optional shared Basic auth | PASS | `CHATTERCRAB_PASSWORD` empty or unset leaves the server open. When set, `GET /health` and CORS `OPTIONS` stay open and every other route requires `Authorization: Basic` (`401` / `unauthorized`, `WWW-Authenticate: Basic realm="chattercrab"`). Comparison is constant-time. The client stores `auth_user` and `password` in `config.toml` (ADR-505). |
 | Join within 5 s | PASS | `join_timeout_closes_socket`. |
 | Room size enforced | PASS | `room_full_rejected`. |
 | Outbound queue 256, slow consumer dropped | PASS | `OUTBOUND_QUEUE_CAPACITY = 256`; `slow_consumer_is_kicked`. |
@@ -92,7 +93,7 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 | Idle sweeper every 60 s | PASS | `idle_empty_rooms_are_evicted`; only empty rooms are evicted (ADR-003). |
 | TLS reload on SIGHUP without dropping connections | PASS | `serves_https_and_reloads_certificate`: after a reload the new certificate is served and the old one is not, and a broken key file keeps the current certificate. Existing connections are untouched by design, because `RustlsConfig::reload_from_config` swaps the config only for new handshakes; there is no dedicated test for that part. SIGHUP handler in `crates/server/src/main.rs`. |
 | Graceful SIGTERM within 10 s | PASS | `graceful_shutdown_sends_going_away`; Linux release binary exited 4 ms after SIGTERM. |
-| Integration tests with tokio-tungstenite on an ephemeral port | PASS | `crates/server/tests/` (24 tests). |
+| Integration tests with tokio-tungstenite on an ephemeral port | PASS | `crates/server/tests/` (29 tests). |
 | Static musl binary | PASS | `file`: "statically linked"; `ldd`: "not a dynamic executable"; 3,891,000 bytes. |
 
 ## 5. Media crate
