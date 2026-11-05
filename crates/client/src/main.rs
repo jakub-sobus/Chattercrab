@@ -21,8 +21,12 @@ use net::{APP_EVENT_CAPACITY, UI_COMMAND_CAPACITY, UiCommand};
 use ui::App;
 
 /// Log filter when `RUST_LOG` is unset: our logs at info, chatty GPU/windowing crates at warn.
-const DEFAULT_LOG_FILTER: &str =
-    "info,iced_winit=warn,iced_wgpu=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn";
+/// The webrtc driver logs an ERROR for every packet sent from a host candidate on an
+/// unreachable virtual adapter (Hyper-V, WSL); ICE handles that, so it is silenced.
+const DEFAULT_LOG_FILTER: &str = concat!(
+    "info,iced_winit=warn,iced_wgpu=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,",
+    "webrtc::peer_connection::driver=off"
+);
 
 const USAGE: &str = "\
 Usage: chattercrab [OPTIONS]
@@ -163,6 +167,16 @@ mod tests {
 
     fn args(list: &[&str]) -> anyhow::Result<Cli> {
         parse_args(list.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn default_log_filter_parses() {
+        let filter = tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_FILTER).unwrap();
+        assert!(
+            filter
+                .to_string()
+                .contains("webrtc::peer_connection::driver=off")
+        );
     }
 
     #[test]
