@@ -9,6 +9,9 @@
 //! The engine implementation currently is a stub that accepts commands and emits no
 //! events; it will be replaced by the real pipeline without changing these types.
 
+pub mod audio;
+pub mod jitter;
+pub mod mixer;
 mod video_queue;
 
 pub use video_queue::{RgbaFrame, VideoFrameQueue};
