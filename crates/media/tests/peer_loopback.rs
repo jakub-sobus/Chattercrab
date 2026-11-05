@@ -1,7 +1,9 @@
 //! Two real `PeerManager`s connected over loopback with a fake signaling channel.
 //!
 //! Verifies that negotiation completes, Opus RTP flows, and that simultaneous screen-share
-//! renegotiation from both sides (glare) is resolved by perfect negotiation.
+//! renegotiation from both sides (glare) is resolved by perfect negotiation. Also checks
+//! that a connection is established when no media is written at all (a silent or missing
+//! microphone).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
@@ -10,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use chattercrab_media::OutgoingSignal;
 use chattercrab_media::peer::{PeerEvent, PeerManager, PeerSettings, SendTargets};
+use chattercrab_media::{OutgoingSignal, PeerConnectionState};
 use chattercrab_protocol::PeerId;
 use tokio::sync::watch;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
@@ -58,6 +60,7 @@ struct Side {
     audio_rx: Arc<AtomicUsize>,
     video_rx: Arc<AtomicUsize>,
     video_tracks: usize,
+    connected: bool,
 }
 
 /// Moves queued events from `from` into `to`.
@@ -86,7 +89,11 @@ async fn route(from: &mut Side, to: &mut Side) {
                 from.video_tracks += 1;
                 count_rtp(track, from.video_rx.clone());
             }
-            PeerEvent::State { .. } => {}
+            PeerEvent::State { state, .. } => {
+                if state == PeerConnectionState::Connected {
+                    from.connected = true;
+                }
+            }
         }
     }
 }
@@ -101,6 +108,7 @@ async fn audio_flows_and_screen_glare_resolves() {
         audio_rx: Arc::default(),
         video_rx: Arc::default(),
         video_tracks: 0,
+        connected: false,
     };
     let mut b = Side {
         id: PeerId::random(),
@@ -108,6 +116,7 @@ async fn audio_flows_and_screen_glare_resolves() {
         audio_rx: Arc::default(),
         video_rx: Arc::default(),
         video_tracks: 0,
+        connected: false,
     };
     a.pm.configure(a.id, None);
     b.pm.configure(b.id, None);
@@ -163,6 +172,48 @@ async fn audio_flows_and_screen_glare_resolves() {
     }
     for p in pumps {
         p.abort();
+    }
+    a.pm.remove_all().await;
+    b.pm.remove_all().await;
+}
+
+/// Regression test: webrtc 0.21.1 only delivers `negotiationneeded` and starts ICE checks
+/// when its driver wakes, and track/candidate changes alone do not wake it. Without the
+/// engine's explicit wake, a peer whose microphone produces no frames never connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connects_without_any_media_written() {
+    let (pm_a, mut rx_a) = PeerManager::new(settings());
+    let (pm_b, mut rx_b) = PeerManager::new(settings());
+    let side = |pm| Side {
+        id: PeerId::random(),
+        pm,
+        audio_rx: Arc::default(),
+        video_rx: Arc::default(),
+        video_tracks: 0,
+        connected: false,
+    };
+    let mut a = side(pm_a);
+    let mut b = side(pm_b);
+    a.pm.configure(a.id, None);
+    b.pm.configure(b.id, None);
+    b.pm.add_peer(a.id, false).await.unwrap();
+    a.pm.add_peer(b.id, true).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !(a.connected && b.connected) {
+        tokio::select! {
+            Some(ev) = rx_a.recv() => a.pm.handle_internal(ev).await,
+            Some(ev) = rx_b.recv() => b.pm.handle_internal(ev).await,
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        route(&mut a, &mut b).await;
+        route(&mut b, &mut a).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not connected without media: a={} b={}",
+            a.connected,
+            b.connected
+        );
     }
     a.pm.remove_all().await;
     b.pm.remove_all().await;
