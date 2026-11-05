@@ -239,7 +239,6 @@ struct EncoderWorker {
     encoder: opus::Encoder,
     tx: mpsc::Sender<OpusFrame>,
     flags: Flags,
-    denoiser: Denoiser,
     level: Arc<AtomicU32>,
     stats: Arc<CaptureStats>,
     epoch: Instant,
@@ -275,7 +274,6 @@ impl EncoderWorker {
             encoder: new_opus_encoder()?,
             tx,
             flags,
-            denoiser: Denoiser::new(),
             level,
             stats,
             epoch,
@@ -297,7 +295,11 @@ impl EncoderWorker {
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES + max_out);
         let silence = [0f32; FRAME_SAMPLES];
         let mut frame_buf = [0f32; DENOISE_FRAME_LEN];
+        // Built here, on the encoder thread: the denoiser warms thread-local state in
+        // `new`, so constructing it elsewhere would allocate on the first `process`.
+        let mut denoiser = Denoiser::new();
         let mut denoise_was_on = false;
+        let mut was_muted = false;
         let mut packet = [0u8; MAX_OPUS_PACKET];
         let mut index = 0u64;
         let mut latency_sum_us = 0u64;
@@ -325,15 +327,18 @@ impl EncoderWorker {
             while acc.len() >= FRAME_SAMPLES {
                 let muted = self.flags.muted.load(Ordering::Relaxed);
                 let denoise_on = self.flags.denoise.load(Ordering::Relaxed);
-                if denoise_on && !denoise_was_on {
-                    self.denoiser.reset();
+                // Reset when suppression switches on, and on unmute while it is on, so the
+                // denoiser's 10 ms of internal history never replays stale audio.
+                if denoise_on && (!denoise_was_on || (was_muted && !muted)) {
+                    denoiser.reset();
                 }
                 denoise_was_on = denoise_on;
+                was_muted = muted;
                 let frame: &[f32] = if muted {
                     &silence
                 } else if denoise_on {
                     frame_buf.copy_from_slice(&acc[..FRAME_SAMPLES]);
-                    self.denoiser.process(&mut frame_buf);
+                    denoiser.process(&mut frame_buf);
                     &frame_buf
                 } else {
                     &acc[..FRAME_SAMPLES]
