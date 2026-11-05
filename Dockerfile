@@ -1,18 +1,12 @@
-# Multi-stage build of chattercrab-signal only. The client and media crates need
-# native audio and video libraries and are not part of this image.
+# Multi-stage build of chattercrab-signal only. The client and media crates are
+# copied so Cargo.lock still matches the workspace, and are not compiled.
 # rust-toolchain.toml is intentionally absent: see .dockerignore.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/protocol crates/protocol
-COPY crates/server crates/server
-# Cargo.lock lists every workspace member. This image only has protocol and
-# server, so Cargo must drop the client and media crates from the lockfile
-# before --locked will succeed. That refresh keeps the pinned versions of the
-# crates the server actually uses.
-RUN cargo metadata --format-version 1 >/dev/null \
-    && cargo build --locked --release -p chattercrab-server --bin chattercrab-signal
+COPY crates crates
+RUN cargo build --locked --release -p chattercrab-server --bin chattercrab-signal
 
 FROM debian:bookworm-slim
 RUN apt-get update \
