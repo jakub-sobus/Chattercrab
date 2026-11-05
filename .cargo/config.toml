@@ -7,5 +7,6 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
-# Avoid runtime dependencies on libgcc and winpthread DLLs.
-rustflags = ["-C", "target-feature=+crt-static"]
+# Avoid runtime dependencies on the libgcc, winpthread and libstdc++ DLLs (OpenH264 is
+# C++). crt-static covers the C runtime; -static makes the linker pick libstdc++.a.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
