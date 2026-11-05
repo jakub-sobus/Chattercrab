@@ -88,6 +88,12 @@ by `opusic-sys`). OpenH264 is compiled from source by `openh264-sys2`; `nasm` is
 **Windows (MSVC):** Visual Studio Build Tools with the C++ workload. CMake can come from
 `pip install --user cmake` if it is not on `PATH`.
 
+**Cross-compiling to `x86_64-pc-windows-gnu` from Windows** works with
+`cargo zigbuild` (Zig from `pip install --user ziglang`) plus Ninja as the CMake generator
+for libopus: `pip install --user ninja`, then `CMAKE_GENERATOR=Ninja cargo zigbuild
+-p chattercrab-media --target x86_64-pc-windows-gnu`. Verified: the loopback example built
+this way links and runs.
+
 **Linux (Debian/Ubuntu):**
 
 ```sh
