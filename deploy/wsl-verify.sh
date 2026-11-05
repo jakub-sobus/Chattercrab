@@ -10,8 +10,8 @@
 #                 script). It is cloned or fast-forwarded into ~/chattercrab-verify
 #                 because building on /mnt/<drive> is slow.
 #
-# Steps: fmt, clippy, tests, release build of the workspace, deploy/build-release.sh,
-# shellcheck, systemd-analyze verify, and an idle RSS measurement of the musl server.
+# Steps: fmt, clippy, tests, release build of the workspace, deploy/build-release.sh, the
+# ShellCheck, systemd-analyze verify, and an idle RSS measurement of the musl server.
 # Exits non-zero on the first failing step.
 set -euo pipefail
 
