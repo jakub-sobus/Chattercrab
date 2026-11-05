@@ -1,0 +1,11 @@
+# Target-specific settings. `cargo zigbuild` overrides the linker through the
+# environment, so these entries only matter for plain `cargo build --target ...`.
+
+[target.x86_64-unknown-linux-musl]
+# Fully static server binary (musl defaults to this; stated explicitly).
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# Avoid runtime dependencies on libgcc and winpthread DLLs.
+rustflags = ["-C", "target-feature=+crt-static"]
