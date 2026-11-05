@@ -1,0 +1,42 @@
+[package]
+name = "chattercrab-server"
+description = "Chattercrab signaling server: rooms, SDP/ICE relay, chat, screen-share arbitration, TURN credentials."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "chattercrab-signal"
+path = "src/main.rs"
+
+[dependencies]
+chattercrab-protocol.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws", "query"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2.2.0"
+tower-http = { version = "0.7.1", features = ["cors", "trace", "limit"] }
+dashmap = "6.2.1"
+governor = "0.10.4"
+hmac = "0.13.0"
+sha1 = "0.11.0"
+base64 = "0.23.1"
+rand = "0.10.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.30.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true
