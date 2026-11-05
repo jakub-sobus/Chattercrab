@@ -30,7 +30,6 @@ while [[ $# -gt 0 ]]; do
 done
 SOURCE="${SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 WORK="$HOME/chattercrab-verify"
-BRANCH="$(git -C "$SOURCE" rev-parse --abbrev-ref HEAD)"
 
 step() { printf '\n==== %s\n' "$*"; }
 
@@ -57,16 +56,26 @@ fi
 [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
 export PATH="$HOME/.local/bin:$PATH"
 
-step "syncing $SOURCE ($BRANCH) into $WORK"
 git config --global --add safe.directory "$SOURCE" 2>/dev/null || true
-if [[ -d "$WORK/.git" ]]; then
-    git -C "$WORK" fetch -q "$SOURCE" "$BRANCH"
-    git -C "$WORK" checkout -q -B "$BRANCH" FETCH_HEAD
+if BRANCH="$(git -C "$SOURCE" rev-parse --abbrev-ref HEAD 2>/dev/null)"; then
+    step "syncing $SOURCE ($BRANCH) into $WORK"
+    if [[ -d "$WORK/.git" ]]; then
+        git -C "$WORK" fetch -q "$SOURCE" "$BRANCH"
+        git -C "$WORK" checkout -q -B "$BRANCH" FETCH_HEAD
+    else
+        rm -rf "$WORK"
+        git clone -q --branch "$BRANCH" "$SOURCE" "$WORK"
+    fi
 else
-    git clone -q --branch "$BRANCH" "$SOURCE" "$WORK"
+    # Not usable as a git repository from here (e.g. a Windows git worktree whose
+    # .git file points at a drive-letter path): copy the working tree instead.
+    step "copying $SOURCE into $WORK (not a usable git repository)"
+    mkdir -p "$WORK"
+    find "$WORK" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
+    tar -C "$SOURCE" --exclude=./target --exclude=./dist --exclude=./.git -cf - . | tar -C "$WORK" -xf -
 fi
 cd "$WORK"
-git log --oneline -1
+git log --oneline -1 2>/dev/null || true
 rustc --version
 
 step "cargo fmt --check"
