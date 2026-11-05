@@ -15,7 +15,7 @@ the VPS public IPv4 address.
 | VPS | 1 vCPU, 512 MB RAM, x86_64, public IPv4 (NAT with 1:1 port forwarding also works) |
 | OS | Debian 12, Ubuntu 22.04 or Ubuntu 24.04 with systemd |
 | DNS | A record for the domain (AAAA optional) |
-| Bandwidth | Only relayed sessions use VPS bandwidth: about 32 kbps per relayed audio stream, about 1.5 Mbps per relayed screen-share stream |
+| Bandwidth | Only relayed sessions use VPS bandwidth: about 96 kbps per relayed audio stream, about 1.5 Mbps per relayed screen-share stream |
 
 Ports opened by `firewall.sh`:
 

@@ -2,7 +2,7 @@
 //!
 //! * [`AudioInput`]: cpal input stream, mono downmix in the callback, lock-free SPSC
 //!   ring to a dedicated encoder thread that resamples to 48 kHz, cuts 20 ms frames and
-//!   encodes them with Opus (VoIP, 32 kbps, DTX, in-band FEC, complexity 5).
+//!   encodes them with Opus (VoIP, 96 kbps, DTX, in-band FEC, complexity 5).
 //! * [`AudioOutput`]: cpal output stream fed from an SPSC ring of mono `f32` samples at
 //!   the device rate; the matching [`OutputSink`] is handed to the mixer thread.
 //! * Device enumeration and lookup by name.
@@ -27,7 +27,7 @@ pub const FRAME_SAMPLES: usize = 960;
 /// Largest Opus packet (RFC 6716).
 pub const MAX_OPUS_PACKET: usize = crate::jitter::MAX_PACKET;
 /// Target Opus bitrate.
-pub const OPUS_BITRATE: i32 = 32_000;
+pub const OPUS_BITRATE: i32 = 96_000;
 /// Capacity of the encoded frame channel (16 x 20 ms = 320 ms).
 pub const FRAME_CHANNEL_CAPACITY: usize = 16;
 
@@ -175,6 +175,13 @@ pub fn new_opus_decoder() -> Result<opus::Decoder, MediaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_bitrate_is_96_kbps() {
+        assert_eq!(OPUS_BITRATE, 96_000);
+        let mut enc = new_opus_encoder().unwrap();
+        assert_eq!(enc.get_bitrate().unwrap(), opus::Bitrate::Bits(96_000));
+    }
 
     #[test]
     fn opus_roundtrip_with_fec_and_plc() {

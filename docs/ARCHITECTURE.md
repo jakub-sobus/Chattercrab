@@ -52,7 +52,7 @@ free of native audio/video libraries.
 
 * Full mesh: with `N` participants each client maintains `N - 1` peer connections.
   The design target is 4 to 5 participants per room (`CHATTERCRAB_MAX_ROOM_SIZE`, default 5).
-* Upstream cost per client: `(N - 1) x 32 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
+* Upstream cost per client: `(N - 1) x 96 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
   that client is the screen publisher. With 5 participants a publisher needs about 6 Mbps up.
 * At most one screen publisher per room. The server is the arbiter (section 5.3), which
   keeps the mesh upstream bounded and the UI simple.
@@ -281,7 +281,7 @@ encoder thread
   -> accumulate 960-sample (20 ms) frames
   -> mute: frame replaced by zeros (Opus DTX makes it ~1 byte)
   -> RMS for the local speaking indicator     (atomic store)
-  -> Opus encode: VoIP, 32 kbps, DTX, in-band FEC, complexity 5
+  -> Opus encode: VoIP, 96 kbps, DTX, in-band FEC, complexity 5
   -> OpusFrame (fixed array + len) -> bounded channel (try_send)
 MediaEngine
   -> wrap the frame once in refcounted Bytes and write it to each connection's

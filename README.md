@@ -6,7 +6,7 @@ coordinates rooms and relays chat, but never touches audio or video. Deployment 
 single static binary plus Coturn on a bare Linux VPS, managed by systemd. No Docker, no
 JavaScript, no webviews.
 
-* Voice: Opus 32 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
+* Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.
 * Text: room chat with the last 200 messages kept in server memory only.
 * Screen share: one publisher per room (server-enforced), H.264 up to 1280x720.

@@ -100,7 +100,7 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
 | Modules `audio`, `screen`, `peer`, `mixer`, `jitter` | PASS | `crates/media/src/`, plus `denoise`. |
-| cpal capture, rubato to 48 kHz, 20 ms frames via SPSC ring, Opus VoIP 32 kbps, DTX, FEC, complexity 5 | PASS | `crates/media/src/audio/capture.rs` (ADR-206, ADR-207). |
+| cpal capture, rubato to 48 kHz, 20 ms frames via SPSC ring, Opus VoIP 96 kbps, DTX, FEC, complexity 5 | PASS | `crates/media/src/audio/capture.rs` (ADR-206, ADR-207, ADR-503). |
 | Device enumeration and selection by name; mute sends silence | PASS | `list_input_devices`/`list_output_devices`; `MediaCommand::SetMuted`. |
 | Adaptive jitter buffer, target 40 ms, max 120 ms, FEC or PLC | PASS | `crates/media/src/jitter.rs`; 12 tests including reorder, FEC, PLC, late, overflow and wraparound. |
 | Mixer on an RT-priority thread, i32 sum, soft-knee limiter, no allocation in the loop, per-peer volume 0 to 2, deafen | PASS | `crates/media/src/mixer.rs`; tests cover summing, silence, limiter bounds, volume, deafen and real Opus decode. |

@@ -529,3 +529,9 @@ server, media engine, client, deployment and noise suppression.
   behind the same `Denoiser` interface. The interface (one 20 ms, 48 kHz frame in
   place, plus `reset`) is deliberately engine-agnostic so that swap would not touch
   the encoder thread or the client.
+
+### ADR-503: Microphone Opus bitrate is 96 kbps
+
+Context: voice was encoded at 32 kbps (ADR-206). The operator wants higher mic quality.
+Decision: `OPUS_BITRATE` is 96_000. Application stays VoIP, mono 48 kHz, 20 ms, DTX, in-band FEC, complexity 5.
+Consequences: each upstream audio stream is about 96 kbps. A full mesh of N peers costs `(N - 1) x 96 kbps` upstream for audio. Screen share is unchanged. ADR-206 remains the historical record of the original settings; this ADR supersedes only the bitrate.
