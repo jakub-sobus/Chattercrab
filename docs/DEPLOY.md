@@ -67,6 +67,13 @@ dist/SHA256SUMS
 package manager or `pip install ziglang`), otherwise `cross`, otherwise plain `cargo`.
 Use `--server-only` when you only need the server.
 
+The Windows client in `dist/client-windows/` should come from `cargo zigbuild`: it links
+the C++ runtime (needed by OpenH264) statically and imports only Windows system DLLs,
+including the UCRT that ships with Windows 10 and later. A plain
+`cargo build --release -p chattercrab-client --target x86_64-pc-windows-gnu` with the
+mingw-w64 toolchain also succeeds, but the result needs `libstdc++-6.dll` from mingw-w64
+next to `chattercrab.exe`.
+
 Copy the server bundle to the VPS:
 
 ```sh

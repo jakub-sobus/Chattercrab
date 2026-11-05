@@ -429,6 +429,18 @@ server, media engine, client, deployment and noise suppression.
   (`--signal-port`, default 8443) so the 443 variant needs no script edits. It has a
   `--dry-run` mode; it was not executed for real inside WSL.
 
+### ADR-408: Distributable Windows client is built with cargo zigbuild
+
+* Context: OpenH264 is C++. With the mingw-w64 toolchain, rustc links the C++ runtime
+  requested by `openh264-sys2` as a dynamic library, so a plain
+  `cargo build --target x86_64-pc-windows-gnu` imports `libstdc++-6.dll`. Adding
+  `-C link-arg=-static` does not change that.
+* Decision: `build-release.sh` produces the Windows client with `cargo zigbuild`, which
+  links the C++ runtime statically; the binary imports only system DLLs and the UCRT
+  (built into Windows 10+). The plain mingw build is supported for development and
+  documented as needing `libstdc++-6.dll` alongside the executable.
+* Consequences: no extra linker overrides that could break the zigbuild path.
+
 ## Noise suppression (ADR-500 series)
 
 ### ADR-500: RNNoise via `nnnoiseless` for optional microphone noise suppression
