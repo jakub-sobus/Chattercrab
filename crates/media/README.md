@@ -61,6 +61,35 @@ explanation instead of hanging.
 | Denoiser cost | about 80 µs per 20 ms frame (measured by the denoise module, release) |
 | Capture-to-encode latency | not measured here: the test machine's microphone delivered no capture callbacks (also with plain cpal). The encoder records it per frame (`CaptureStats::last_latency_us` / `max_latency_us`) as the time since the last capture callback plus audio still queued; expected 10 to 22 ms with 10 ms device buffers. Run the loopback example on a machine with a working microphone to report it. |
 
+## Two-process call test
+
+`examples/signal_call.rs` is a headless call participant: it joins a room on a real
+`chattercrab-signal`, runs the real `MediaEngine` with a synthetic tone instead of the
+microphone (`MediaDiagnostics::test_tone`), and prints a `RESULT ... ok=true|false` line.
+It needs no audio devices.
+
+Automated (in-process server, separate participant processes; ignored by default):
+
+```text
+cargo test -p chattercrab-media --test two_process -- --ignored --nocapture
+CHATTERCRAB_E2E_PEERS=3 CHATTERCRAB_E2E_SECONDS=20 cargo test -p chattercrab-media --test two_process -- --ignored --nocapture
+```
+
+Manual, three terminals:
+
+```text
+# 1: server (plain HTTP, no TURN)
+CHATTERCRAB_BIND=127.0.0.1:8443 cargo run -p chattercrab-server
+# 2: first participant creates the room and prints "ROOM <id>"
+cargo run -p chattercrab-media --example signal_call -- --server http://127.0.0.1:8443 --create demo --name a --tone 440 --seconds 30
+# 3: second participant joins it
+cargo run -p chattercrab-media --example signal_call -- --server http://127.0.0.1:8443 --room <id> --name b --tone 660 --seconds 25
+```
+
+Add `--play` to hear the other side on the default speaker. Each participant exits
+non-zero unless every peer reached `Connected` and was heard above `--min-level`
+(default 0.02) for at least `--min-heard-secs`.
+
 ## Tests
 
 ```sh

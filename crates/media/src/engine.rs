@@ -22,7 +22,7 @@ use crate::audio::{AudioInput, AudioOutput, OpusFrame};
 use crate::mixer::{MixerControl, MixerHandle, PeerAudioControls, PeerSlot, RtpAudioPacket};
 use crate::peer::{InternalEvent, PeerEvent, PeerManager, PeerSettings, SendTargets};
 use crate::screen::{EncodedVideo, ScreenPublisher};
-use crate::{MediaCommand, MediaConfig, MediaEvent, VideoFrameQueue};
+use crate::{MediaCommand, MediaConfig, MediaDiagnostics, MediaEvent, VideoFrameQueue};
 
 /// Interval of [`MediaEvent::Levels`].
 const LEVELS_INTERVAL: Duration = Duration::from_millis(100);
@@ -48,6 +48,8 @@ struct Engine {
     local_level: Arc<AtomicU32>,
     input_device: Option<String>,
     output_device: Option<String>,
+    /// Synthetic input tone (diagnostics); replaces the microphone when set.
+    test_tone: Option<f32>,
     input: Option<AudioInput>,
     output: Option<AudioOutput>,
     audio_pump: Option<JoinHandle<()>>,
@@ -64,6 +66,7 @@ struct Engine {
 /// Runs the engine until `Shutdown` or until the command channel closes.
 pub(crate) async fn run(
     config: MediaConfig,
+    diagnostics: MediaDiagnostics,
     mut commands: mpsc::Receiver<MediaCommand>,
     events: mpsc::Sender<MediaEvent>,
     video: VideoFrameQueue,
@@ -87,6 +90,7 @@ pub(crate) async fn run(
         local_level: Arc::new(AtomicU32::new(0)),
         input_device: config.input_device,
         output_device: config.output_device,
+        test_tone: diagnostics.test_tone,
         input: None,
         output: None,
         audio_pump: None,
@@ -140,8 +144,10 @@ impl Engine {
         let muted = self.muted.clone();
         let denoise = self.denoise.clone();
         let level = self.local_level.clone();
-        let opened = tokio::task::spawn_blocking(move || {
-            AudioInput::start(device.as_deref(), muted, denoise, level)
+        let tone = self.test_tone;
+        let opened = tokio::task::spawn_blocking(move || match tone {
+            Some(hz) => AudioInput::start_tone(hz, muted, denoise, level),
+            None => AudioInput::start(device.as_deref(), muted, denoise, level),
         })
         .await;
         match opened {

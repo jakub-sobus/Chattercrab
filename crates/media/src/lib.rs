@@ -67,6 +67,16 @@ pub struct MediaConfig {
     pub noise_suppression: bool,
 }
 
+/// Diagnostic engine options, separate from [`MediaConfig`] so that adding them does not
+/// break code that builds `MediaConfig` with a struct literal.
+#[derive(Debug, Clone, Default)]
+pub struct MediaDiagnostics {
+    /// Diagnostics: replace the microphone with a sine tone of this frequency in Hz.
+    /// Used by tests and the two-process harness. The tone goes through the same encoder
+    /// thread (20 ms frames, mute, noise suppression, Opus) as microphone audio.
+    pub test_tone: Option<f32>,
+}
+
 /// What kind of surface a [`ScreenSource`] captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenSourceKind {
@@ -270,12 +280,27 @@ impl MediaEngine {
     ///
     /// Must be called from within a Tokio runtime.
     pub fn start(config: MediaConfig) -> Result<Self, MediaError> {
+        Self::start_with_diagnostics(config, MediaDiagnostics::default())
+    }
+
+    /// Like [`MediaEngine::start`], with diagnostic options such as a synthetic test tone
+    /// instead of the microphone.
+    pub fn start_with_diagnostics(
+        config: MediaConfig,
+        diagnostics: MediaDiagnostics,
+    ) -> Result<Self, MediaError> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| MediaError::Audio("MediaEngine::start needs a Tokio runtime".into()))?;
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel::<MediaEvent>(EVENT_CHANNEL_CAPACITY);
         let video = VideoFrameQueue::new();
-        handle.spawn(engine::run(config, cmd_rx, event_tx, video.clone()));
+        handle.spawn(engine::run(
+            config,
+            diagnostics,
+            cmd_rx,
+            event_tx,
+            video.clone(),
+        ));
         Ok(Self {
             commands: cmd_tx,
             events: event_rx,
