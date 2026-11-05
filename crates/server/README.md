@@ -2,8 +2,9 @@
 
 Signaling server for Chattercrab, built as the `chattercrab-signal` binary. It hosts rooms,
 relays SDP offers/answers and ICE candidates between members, keeps the last 200 chat
-messages per room in memory, arbitrates the single screen-share slot per room and issues
-TURN REST credentials for Coturn. It never relays media. The wire format is specified in
+messages per room in memory, and arbitrates the single screen-share slot per room. It
+never relays media. Clients gather server-reflexive candidates from one external STUN URL
+(`GET /ice-servers`). There is no TURN relay. The wire format is specified in
 [`docs/PROTOCOL.md`](../../docs/PROTOCOL.md).
 
 ## Configuration
@@ -14,9 +15,7 @@ All settings come from environment variables (see `deploy/chattercrab.env.exampl
 |----------|---------|---------|
 | `CHATTERCRAB_BIND` | `0.0.0.0:8443` | Listen address. |
 | `CHATTERCRAB_TLS_CERT`, `CHATTERCRAB_TLS_KEY` | unset | PEM certificate chain and key. Both or neither; without them the server speaks plain HTTP/WS (local development only). |
-| `CHATTERCRAB_TURN_SECRET` | unset | Coturn `static-auth-secret`. Unset or the template placeholder disables `/turn-credentials` (503). |
-| `CHATTERCRAB_TURN_REALM` | empty | TURN realm (informational). |
-| `CHATTERCRAB_TURN_URLS` | unset | Comma-separated `turn:`/`turns:` URLs. A `stun:` URL is derived for every UDP `turn:` URL. |
+| `CHATTERCRAB_STUN_URL` | `stun:stun.l.google.com:19302` | Exactly one `stun:host:port` (or `stun:[ipv6]:port`) URL returned by `GET /ice-servers`. `turn:` and `turns:` are rejected. |
 | `CHATTERCRAB_MAX_ROOM_SIZE` | `5` | Members per room. |
 | `CHATTERCRAB_MAX_ROOMS` | `100` | Rooms per server. |
 | `CHATTERCRAB_ROOM_IDLE_TTL_SECS` | `3600` | Empty rooms idle this long are evicted (checked every 60 s). |
@@ -24,7 +23,7 @@ All settings come from environment variables (see `deploy/chattercrab.env.exampl
 
 Fixed limits: join timeout 5 s, WebSocket Ping every 20 s (closed after 2 missed Pongs),
 outbound queue 256 messages per connection, WebSocket messages up to 64 KiB, REST bodies
-up to 16 KiB, `POST /rooms` 10 per minute per IP (burst 5), `GET /turn-credentials` 30 per
+up to 16 KiB, `POST /rooms` 10 per minute per IP (burst 5), `GET /ice-servers` 30 per
 minute per IP.
 
 Signals: `SIGHUP` reloads the certificate without dropping connections (a failed reload
@@ -45,8 +44,7 @@ curl -X POST -H 'content-type: application/json' -d '{"name":"test"}' http://127
 cargo test -p chattercrab-server
 ```
 
-Unit tests cover configuration parsing and TURN credentials (against a reference HMAC
-vector). Integration tests in `tests/` start the server in-process on `127.0.0.1:0` with
+Unit tests cover configuration parsing, including the STUN URL. Integration tests in `tests/` start the server in-process on `127.0.0.1:0` with
 shortened timers and drive it over HTTP and WebSocket: rooms, limits, join/welcome,
 relay, heartbeat, join timeout, room full, screen lock, chat history, slow-consumer kick,
 room deletion, graceful shutdown, and HTTPS with certificate hot reload.

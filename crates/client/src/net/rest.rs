@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use chattercrab_protocol::{
-    ApiError, CreateRoomRequest, HealthResponse, RoomId, RoomName, RoomSummary, TurnCredentials,
+    ApiError, CreateRoomRequest, HealthResponse, IceServers, RoomId, RoomName, RoomSummary,
 };
-use reqwest::{StatusCode, Url};
+use reqwest::Url;
 
 /// Timeout for every REST request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,18 +105,15 @@ impl Rest {
         parse(resp).await
     }
 
-    /// `GET /turn-credentials`. `Ok(None)` when TURN is not configured (503).
-    pub async fn turn_credentials(&self) -> anyhow::Result<Option<TurnCredentials>> {
+    /// `GET /ice-servers`.
+    pub async fn ice_servers(&self) -> anyhow::Result<IceServers> {
         let resp = self
             .client
-            .get(format!("{}/turn-credentials", self.base))
+            .get(format!("{}/ice-servers", self.base))
             .send()
             .await
-            .context("fetching TURN credentials")?;
-        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-            return Ok(None);
-        }
-        parse(resp).await.map(Some)
+            .context("fetching ICE servers")?;
+        parse(resp).await
     }
 }
 

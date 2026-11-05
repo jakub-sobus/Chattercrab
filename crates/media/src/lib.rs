@@ -25,7 +25,7 @@ mod video_queue;
 
 pub use video_queue::{RgbaFrame, VideoFrameQueue};
 
-use chattercrab_protocol::{PeerId, TurnCredentials};
+use chattercrab_protocol::{IceServers, PeerId};
 use tokio::sync::mpsc;
 
 /// Capacity of the command channel into the engine.
@@ -146,12 +146,12 @@ pub enum OutgoingSignal {
 #[derive(Debug, Clone)]
 pub enum MediaCommand {
     /// Set the local peer id (from `welcome`) and the ICE servers to use for every
-    /// peer connection created afterwards. `None` means host candidates only.
+    /// peer connection created afterwards.
     Configure {
         /// Our own peer id, used for perfect-negotiation politeness.
         me: PeerId,
-        /// TURN/STUN credentials from `GET /turn-credentials`.
-        ice: Option<TurnCredentials>,
+        /// STUN servers from `GET /ice-servers`. `None` or empty urls means host candidates only.
+        ice: Option<IceServers>,
     },
     /// Create a peer connection to `peer`. If `initiate` is true the engine sends the
     /// first offer (the newcomer does this for every peer listed in `welcome`);

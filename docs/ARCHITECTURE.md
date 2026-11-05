@@ -3,8 +3,10 @@
 Chattercrab is a minimalist peer-to-peer voice, text and screen-share application.
 Everything is written in Rust. A small signaling server coordinates rooms and relays
 SDP/ICE messages and chat; all audio and video flows directly between peers over
-WebRTC (or through the operator's Coturn TURN server when a direct path is impossible).
-The signaling server never touches media.
+WebRTC. The VPS runs only `chattercrab-signal`. Clients use the configured external
+STUN server for server-reflexive candidates. Media is direct peer-to-peer. Peers that
+cannot establish a direct path do not get a relay. The signaling server never touches
+media.
 
 ## 1. Components
 
@@ -12,7 +14,6 @@ The signaling server never touches media.
 flowchart LR
     subgraph VPS["Linux VPS (bare metal, systemd)"]
         SIG["chattercrab-signal<br/>axum + rustls<br/>:8443 HTTPS/WSS"]
-        TURN["coturn<br/>:3478 udp/tcp<br/>:5349 tls<br/>49152-49999 udp relay"]
     end
 
     subgraph A["Client A (chattercrab)"]
@@ -32,15 +33,12 @@ flowchart LR
     RTA <-. "SRTP (Opus, H.264), full mesh" .-> RTB
     RTA <-. "SRTP" .-> RTC
     RTB <-. "SRTP" .-> RTC
-
-    RTA -. "fallback relay" .- TURN
-    RTB -. "fallback relay" .- TURN
 ```
 
 | Crate | Kind | Responsibility |
 |-------|------|----------------|
 | `chattercrab-protocol` | library | Shared serde types for REST and WebSocket messages. Validation newtypes. No I/O. |
-| `chattercrab-server` | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration, TURN REST credentials. |
+| `chattercrab-server` | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration. Clients receive one external STUN URL from `GET /ice-servers`. |
 | `chattercrab-media` | library | Audio capture/encode, jitter buffers, mixer, playback, screen capture/encode/decode, WebRTC peer management. Message-based API. |
 | `chattercrab-client` | binary `chattercrab` | iced desktop UI, configuration, signaling client, reconnect logic. Drives `chattercrab-media` through commands and events. |
 
@@ -202,8 +200,8 @@ sequenceDiagram
     participant A as Client A
     participant B as Client B
 
-    C->>S: GET /turn-credentials
-    S-->>C: TurnCredentials
+    C->>S: GET /ice-servers
+    S-->>C: IceServers
     C->>S: WSS /ws/{room}
     C->>S: join {display_name}
     S-->>C: welcome {you, peers:[A,B], history, screen_publisher}
@@ -331,7 +329,7 @@ Frame rate defaults to 15 fps, configurable 5 to 30.
   offer in flight, the impolite peer ignores it and the polite peer rolls back and
   answers. The decision logic lives in a pure state machine (`peer::negotiation`) that is
   unit tested against a fake signaling channel, separate from the webrtc plumbing.
-* Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `TurnCredentials`,
+* Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `IceServers` (one `stun:` URL, empty username and credential),
   disconnected timeout 5 s, failed timeout 15 s, UDP and TCP candidates only (IPv4 host
   candidates, no mDNS).
 * Tracks: audio is encoded once and the same buffer is written to one Opus local track

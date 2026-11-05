@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Placeholder value written by the env template; treated as "no TURN secret".
-pub const TURN_SECRET_PLACEHOLDER: &str = "__GENERATED_BY_INSTALL_SH__";
+/// STUN URL used when `CHATTERCRAB_STUN_URL` is unset or empty.
+pub const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
 
 /// Paths of the PEM certificate chain and private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,27 +17,6 @@ pub struct TlsPaths {
     pub key: PathBuf,
 }
 
-/// TURN REST API settings.
-#[derive(Clone, PartialEq, Eq)]
-pub struct TurnConfig {
-    /// Shared secret, identical to Coturn's `static-auth-secret`.
-    pub secret: String,
-    /// TURN realm (informational; Coturn enforces it).
-    pub realm: String,
-    /// ICE server URLs handed to clients.
-    pub urls: Vec<String>,
-}
-
-impl std::fmt::Debug for TurnConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TurnConfig")
-            .field("secret", &"<redacted>")
-            .field("realm", &self.realm)
-            .field("urls", &self.urls)
-            .finish()
-    }
-}
-
 /// Complete server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,8 +24,8 @@ pub struct Config {
     pub bind: SocketAddr,
     /// TLS files; `None` serves plain HTTP (local development).
     pub tls: Option<TlsPaths>,
-    /// TURN settings; `None` makes `/turn-credentials` answer `503`.
-    pub turn: Option<TurnConfig>,
+    /// Single `stun:` URL handed to clients (`CHATTERCRAB_STUN_URL`).
+    pub stun_url: String,
     /// Maximum members per room (`CHATTERCRAB_MAX_ROOM_SIZE`).
     pub max_room_size: usize,
     /// Maximum number of rooms (`CHATTERCRAB_MAX_ROOMS`).
@@ -65,8 +44,8 @@ pub struct Config {
     pub create_room_per_minute: NonZeroU32,
     /// `POST /rooms` burst per IP.
     pub create_room_burst: NonZeroU32,
-    /// Sustained `GET /turn-credentials` rate per IP, per minute.
-    pub turn_per_minute: NonZeroU32,
+    /// Sustained `GET /ice-servers` rate per IP, per minute.
+    pub ice_per_minute: NonZeroU32,
 }
 
 impl Default for Config {
@@ -74,7 +53,7 @@ impl Default for Config {
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], 8443)),
             tls: None,
-            turn: None,
+            stun_url: DEFAULT_STUN_URL.to_owned(),
             max_room_size: 5,
             max_rooms: 100,
             room_idle_ttl: Duration::from_secs(3600),
@@ -84,7 +63,7 @@ impl Default for Config {
             shutdown_grace: Duration::from_secs(10),
             create_room_per_minute: NonZeroU32::MIN.saturating_add(9),
             create_room_burst: NonZeroU32::MIN.saturating_add(4),
-            turn_per_minute: NonZeroU32::MIN.saturating_add(29),
+            ice_per_minute: NonZeroU32::MIN.saturating_add(29),
         }
     }
 }
@@ -140,24 +119,9 @@ impl Config {
             _ => return Err(ConfigError::TlsIncomplete),
         };
 
-        let secret = get("CHATTERCRAB_TURN_SECRET").filter(|s| s != TURN_SECRET_PLACEHOLDER);
-        let urls: Vec<String> = get("CHATTERCRAB_TURN_URLS")
-            .map(|v| {
-                v.split(',')
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        config.turn = match secret {
-            Some(secret) if !urls.is_empty() => Some(TurnConfig {
-                secret,
-                realm: get("CHATTERCRAB_TURN_REALM").unwrap_or_default(),
-                urls,
-            }),
-            _ => None,
-        };
+        if let Some(v) = get("CHATTERCRAB_STUN_URL") {
+            config.stun_url = parse_stun_url(&v)?;
+        }
 
         if let Some(v) = get("CHATTERCRAB_MAX_ROOM_SIZE") {
             config.max_room_size = parse_positive("CHATTERCRAB_MAX_ROOM_SIZE", &v)?;
@@ -184,6 +148,57 @@ fn parse_positive(var: &'static str, value: &str) -> Result<usize, ConfigError> 
     }
 }
 
+/// Accepts exactly one `stun:host:port` or `stun:[ipv6]:port` URL.
+fn parse_stun_url(value: &str) -> Result<String, ConfigError> {
+    const VAR: &str = "CHATTERCRAB_STUN_URL";
+    let invalid = |reason: &'static str| ConfigError::Invalid {
+        var: VAR,
+        value: value.to_owned(),
+        reason,
+    };
+
+    if value.chars().any(char::is_whitespace) {
+        return Err(invalid("must not contain whitespace"));
+    }
+    if value.contains(',') {
+        return Err(invalid("expected exactly one URL"));
+    }
+    if value.contains('?') || value.contains('/') {
+        return Err(invalid("must not contain a query or path"));
+    }
+    let Some(rest) = value.strip_prefix("stun:") else {
+        return Err(invalid("expected a stun: URL"));
+    };
+    let Some((host, port)) = split_host_port(rest) else {
+        return Err(invalid("expected host:port"));
+    };
+    if host.is_empty() {
+        return Err(invalid("host is empty"));
+    }
+    match port.parse::<u16>() {
+        Ok(port) if port >= 1 => Ok(value.to_owned()),
+        _ => Err(invalid("port must be an integer from 1 to 65535")),
+    }
+}
+
+/// Splits `host:port` or `[ipv6]:port`. An unbracketed address with extra colons is rejected.
+fn split_host_port(rest: &str) -> Option<(&str, &str)> {
+    if let Some(inner) = rest.strip_prefix('[') {
+        let (host, after) = inner.split_once(']')?;
+        let port = after.strip_prefix(':')?;
+        if port.contains(':') || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        Some((host, port))
+    } else {
+        let (host, port) = rest.rsplit_once(':')?;
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            return None;
+        }
+        Some((host, port))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,13 +217,21 @@ mod tests {
         let c = load(&[]).unwrap();
         assert_eq!(c.bind, "0.0.0.0:8443".parse().unwrap());
         assert!(c.tls.is_none());
-        assert!(c.turn.is_none());
+        assert_eq!(c.stun_url, DEFAULT_STUN_URL);
         assert_eq!(c.max_room_size, 5);
         assert_eq!(c.max_rooms, 100);
         assert_eq!(c.room_idle_ttl, Duration::from_secs(3600));
         assert_eq!(c.create_room_per_minute.get(), 10);
         assert_eq!(c.create_room_burst.get(), 5);
-        assert_eq!(c.turn_per_minute.get(), 30);
+        assert_eq!(c.ice_per_minute.get(), 30);
+        assert_eq!(
+            load(&[("CHATTERCRAB_STUN_URL", "")]).unwrap().stun_url,
+            DEFAULT_STUN_URL
+        );
+        assert_eq!(
+            load(&[("CHATTERCRAB_STUN_URL", "   ")]).unwrap().stun_url,
+            DEFAULT_STUN_URL
+        );
     }
 
     #[test]
@@ -217,12 +240,7 @@ mod tests {
             ("CHATTERCRAB_BIND", "127.0.0.1:9000"),
             ("CHATTERCRAB_TLS_CERT", "/etc/chattercrab/tls/fullchain.pem"),
             ("CHATTERCRAB_TLS_KEY", "/etc/chattercrab/tls/privkey.pem"),
-            ("CHATTERCRAB_TURN_SECRET", "abc"),
-            ("CHATTERCRAB_TURN_REALM", "chat.example.com"),
-            (
-                "CHATTERCRAB_TURN_URLS",
-                "turn:a:3478?transport=udp, turns:a:5349?transport=tcp",
-            ),
+            ("CHATTERCRAB_STUN_URL", "stun:stun.example.com:3478"),
             ("CHATTERCRAB_MAX_ROOM_SIZE", "4"),
             ("CHATTERCRAB_MAX_ROOMS", "7"),
             ("CHATTERCRAB_ROOM_IDLE_TTL_SECS", "60"),
@@ -230,22 +248,45 @@ mod tests {
         .unwrap();
         assert_eq!(c.bind.port(), 9000);
         assert!(c.tls.is_some());
-        let turn = c.turn.unwrap();
-        assert_eq!(turn.urls.len(), 2);
-        assert_eq!(turn.realm, "chat.example.com");
+        assert_eq!(c.stun_url, "stun:stun.example.com:3478");
         assert_eq!(c.max_room_size, 4);
         assert_eq!(c.max_rooms, 7);
         assert_eq!(c.room_idle_ttl, Duration::from_secs(60));
     }
 
     #[test]
-    fn placeholder_secret_disables_turn() {
-        let c = load(&[
-            ("CHATTERCRAB_TURN_SECRET", TURN_SECRET_PLACEHOLDER),
-            ("CHATTERCRAB_TURN_URLS", "turn:a:3478"),
-        ])
-        .unwrap();
-        assert!(c.turn.is_none());
+    fn accepts_custom_stun_url() {
+        let c = load(&[("CHATTERCRAB_STUN_URL", "stun:stun.example.com:3478")]).unwrap();
+        assert_eq!(c.stun_url, "stun:stun.example.com:3478");
+        let v6 = load(&[("CHATTERCRAB_STUN_URL", "stun:[2001:db8::1]:19302")]).unwrap();
+        assert_eq!(v6.stun_url, "stun:[2001:db8::1]:19302");
+    }
+
+    #[test]
+    fn rejects_bad_stun_urls() {
+        for value in [
+            "turn:chat.example.com:3478",
+            "turns:chat.example.com:5349",
+            "stuns:stun.example.com:5349",
+            "http://stun.example.com:19302",
+            "https://stun.example.com:19302",
+            "stun:stun.l.google.com",
+            "stun:a.example:19302,stun:b.example:19302",
+            "stun::19302",
+            "stun:[]:19302",
+            "stun:stun.example.com:19302?transport=udp",
+            "stun:stun.example.com:19302/path",
+        ] {
+            match load(&[("CHATTERCRAB_STUN_URL", value)]) {
+                Err(ConfigError::Invalid {
+                    var, value: got, ..
+                }) => {
+                    assert_eq!(var, "CHATTERCRAB_STUN_URL");
+                    assert_eq!(got, value);
+                }
+                other => panic!("expected invalid STUN URL for {value:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -257,15 +298,5 @@ mod tests {
             load(&[("CHATTERCRAB_TLS_CERT", "/x")]),
             Err(ConfigError::TlsIncomplete)
         ));
-    }
-
-    #[test]
-    fn debug_redacts_secret() {
-        let t = TurnConfig {
-            secret: "topsecret".into(),
-            realm: String::new(),
-            urls: vec![],
-        };
-        assert!(!format!("{t:?}").contains("topsecret"));
     }
 }

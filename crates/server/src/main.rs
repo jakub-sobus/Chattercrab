@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         bind = %config.bind,
         tls = config.tls.is_some(),
-        turn = config.turn.is_some(),
+        stun_url = %config.stun_url,
         max_room_size = config.max_room_size,
         max_rooms = config.max_rooms,
         "starting chattercrab-signal"

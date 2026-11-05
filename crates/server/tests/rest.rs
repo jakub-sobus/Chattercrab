@@ -6,9 +6,7 @@ mod common;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use chattercrab_protocol::{ApiError, ErrorCode, HealthResponse, TurnCredentials};
-use chattercrab_server::config::TurnConfig;
-use chattercrab_server::turn::credential_for;
+use chattercrab_protocol::{ApiError, ErrorCode, HealthResponse};
 use common::{start, start_with};
 
 #[tokio::test]
@@ -110,64 +108,75 @@ async fn create_room_rate_limited() {
 }
 
 #[tokio::test]
-async fn turn_unavailable_without_config() {
+async fn ice_servers_returns_configured_stun_url() {
     let server = start().await;
     let resp = server
         .http
-        .get(server.url("/turn-credentials"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-    let err: ApiError = resp.json().await.unwrap();
-    assert_eq!(err.code, ErrorCode::TurnUnavailable);
-}
-
-#[tokio::test]
-async fn turn_credentials_are_valid_hmac() {
-    // Known vector first, so the check below is anchored to an external reference.
-    assert_eq!(
-        credential_for("north-sea-crab", "1793918400:9f2c4e7a1b3d5f60").unwrap(),
-        "JJ6+w6rZCy41aFa682aUle+dzcY="
-    );
-    let server = start_with(|c| {
-        c.turn = Some(TurnConfig {
-            secret: "north-sea-crab".into(),
-            realm: "chat.example.com".into(),
-            urls: vec![
-                "turn:chat.example.com:3478?transport=udp".into(),
-                "turns:chat.example.com:5349?transport=tcp".into(),
-            ],
-        });
-    })
-    .await;
-    let resp = server
-        .http
-        .get(server.url("/turn-credentials"))
+        .get(server.url("/ice-servers"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let creds: TurnCredentials = resp.json().await.unwrap();
-    assert_eq!(creds.ttl_secs, 12 * 3600);
+    let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        creds.credential,
-        credential_for("north-sea-crab", &creds.username).unwrap()
+        body,
+        serde_json::json!({ "urls": ["stun:stun.l.google.com:19302"] })
     );
-    let expiry: u64 = creds.username.split(':').next().unwrap().parse().unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    assert!(expiry >= now + 12 * 3600 - 5 && expiry <= now + 12 * 3600 + 5);
+    assert!(body.get("username").is_none());
+    assert!(body.get("credential").is_none());
+
+    let gone = server
+        .http
+        .get(server.url("/turn-credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+}
+
+#[tokio::test]
+async fn ice_servers_reflects_custom_stun_url() {
+    let server = start_with(|c| {
+        c.stun_url = "stun:stun.example.com:3478".into();
+    })
+    .await;
+    let resp = server
+        .http
+        .get(server.url("/ice-servers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        creds.urls,
-        [
-            "stun:chat.example.com:3478",
-            "turn:chat.example.com:3478?transport=udp",
-            "turns:chat.example.com:5349?transport=tcp"
-        ]
+        body,
+        serde_json::json!({ "urls": ["stun:stun.example.com:3478"] })
     );
+}
+
+#[tokio::test]
+async fn ice_servers_rate_limited() {
+    let server = start_with(|c| {
+        c.ice_per_minute = NonZeroU32::new(1).unwrap();
+    })
+    .await;
+    let first = server
+        .http
+        .get(server.url("/ice-servers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let resp = server
+        .http
+        .get(server.url("/ice-servers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let err: ApiError = resp.json().await.unwrap();
+    assert_eq!(err.code, ErrorCode::RateLimited);
+    assert!(err.message.contains("ICE"));
 }
 
 #[tokio::test]

@@ -51,6 +51,8 @@ server, media engine, client, deployment and noise suppression.
 * Decision: for every `turn:` URL with UDP transport, the server adds `stun:host:port`.
 * Consequences: peers behind ordinary NAT connect directly instead of always relaying.
 
+Superseded by ADR-504.
+
 ## ADR-007: Native build tooling on the Windows development host
 
 * Context: the development machine is Windows with MSVC. `opus` 0.4 builds libopus via
@@ -535,3 +537,9 @@ server, media engine, client, deployment and noise suppression.
 Context: voice was encoded at 32 kbps (ADR-206). The operator wants higher mic quality.
 Decision: `OPUS_BITRATE` is 96_000. Application stays VoIP, mono 48 kHz, 20 ms, DTX, in-band FEC, complexity 5.
 Consequences: each upstream audio stream is about 96 kbps. A full mesh of N peers costs `(N - 1) x 96 kbps` upstream for audio. Screen share is unchanged. ADR-206 remains the historical record of the original settings; this ADR supersedes only the bitrate.
+
+### ADR-504: External STUN URL, no TURN
+
+Context: ADR-006 derived `stun:` URLs from the operator's Coturn `turn:` URLs and the server minted TURN REST credentials. The operator does not want a TURN relay.
+Decision: `CHATTERCRAB_STUN_URL` (default `stun:stun.l.google.com:19302`) is the only ICE server. `GET /ice-servers` returns `{ "urls": [that url] }`. `turn:` and `turns:` URLs are rejected. TURN REST, HMAC-SHA1 credentials, and `ErrorCode::TurnUnavailable` are removed.
+Consequences: peers behind symmetric NAT may fail to connect. The signaling server no longer depends on `hmac`, `sha1`, or `base64`. ADR-006 is historical and superseded. Coturn deploy files are removed in a later change.

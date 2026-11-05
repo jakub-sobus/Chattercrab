@@ -2,9 +2,9 @@
 
 A minimalist peer-to-peer voice, text and screen-share application, written entirely in
 Rust. Rooms hold up to 5 people connected in a full WebRTC mesh; a small signaling server
-coordinates rooms and relays chat, but never touches audio or video. Deployment is a
-single static binary plus Coturn on a bare Linux VPS, managed by systemd. No Docker, no
-JavaScript, no webviews.
+coordinates rooms and relays chat, but never touches audio or video. The signaling
+server is a single static binary and media is direct WebRTC using an external STUN URL,
+with no TURN. No Docker, no JavaScript, no webviews.
 
 * Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.
@@ -45,7 +45,7 @@ docs/             architecture, protocol, deployment, decisions, acceptance
 
 Serde types shared by the client and server: validated newtypes (`RoomId`, `PeerId`
 (UUID v4), `DisplayName` (1 to 32 characters), `RoomName`), REST bodies (`RoomSummary`,
-`CreateRoomRequest`, `TurnCredentials`, `ApiError`) and the WebSocket enums `ClientMsg` and
+`CreateRoomRequest`, `IceServers`, `ApiError`) and the WebSocket enums `ClientMsg` and
 `ServerMsg`, tagged with `"t"` in snake_case. No I/O; every variant has a JSON round-trip
 test. Specification: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
@@ -54,7 +54,7 @@ test. Specification: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 The signaling server `chattercrab-signal`: axum over rustls (ring), per-room locks in a
 `DashMap`, bounded per-connection queues with slow-consumer eviction, WebSocket heartbeat,
 5 second join timeout, screen-share arbitration, chat history, idle-room sweeper, per-IP
-rate limits, TURN REST credentials (HMAC-SHA1), TLS reload on `SIGHUP` and graceful
+rate limits, one configured STUN URL via `GET /ice-servers`, TLS reload on `SIGHUP` and graceful
 shutdown on `SIGTERM`. Configured entirely through `CHATTERCRAB_*` environment variables.
 Builds as a fully static musl binary (about 3.9 MB) with about 3 MB idle RSS.
 Details: [crates/server/README.md](crates/server/README.md).

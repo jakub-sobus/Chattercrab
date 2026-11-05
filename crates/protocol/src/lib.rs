@@ -13,7 +13,7 @@ pub use ids::{
     DisplayName, MAX_DISPLAY_NAME_CHARS, MAX_ROOM_ID_LEN, MAX_ROOM_NAME_CHARS, PeerId, RoomId,
     RoomName,
 };
-pub use rest::{ApiError, CreateRoomRequest, HealthResponse, RoomSummary, TurnCredentials};
+pub use rest::{ApiError, CreateRoomRequest, HealthResponse, IceServers, RoomSummary};
 pub use ws::{ChatMessage, ClientMsg, PeerInfo, ServerMsg};
 
 use serde::{Deserialize, Serialize};
@@ -94,8 +94,6 @@ pub enum ErrorCode {
     PeerNotFound,
     /// `screen_stop` from a peer that is not the screen publisher.
     NotScreenPublisher,
-    /// TURN is not configured on this server.
-    TurnUnavailable,
     /// Unexpected server error.
     Internal,
 }

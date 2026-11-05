@@ -52,7 +52,6 @@ WS otherwise (local development only).
 | `already_joined` | A second `join` on the same socket. |
 | `peer_not_found` | The `to` peer is not in the room. |
 | `not_screen_publisher` | `screen_stop` from a peer that is not publishing. |
-| `turn_unavailable` | TURN is not configured on this server. |
 | `internal` | Unexpected server error. |
 
 `ApiError` (REST error body):
@@ -99,33 +98,20 @@ Request `CreateRoomRequest`:
 A room that nobody joins is evicted after `CHATTERCRAB_ROOM_IDLE_TTL_SECS`. A room is
 deleted immediately when its last member leaves.
 
-### `GET /turn-credentials`
+### `GET /ice-servers`
 
-TURN REST API (draft-uberti-behave-turn-rest). `username = "{expiry_unix}:{random}"`,
-`credential = base64(HMAC-SHA1(CHATTERCRAB_TURN_SECRET, username))`, TTL 12 hours.
+Returns the single STUN URL configured on the server (`CHATTERCRAB_STUN_URL`, default
+`stun:stun.l.google.com:19302`). There is no TURN relay and no credential. The body is
+`IceServers` and contains only `urls`.
 
 ```json
-{
-  "username": "1793918400:9f2c4e7a1b3d5f60",
-  "credential": "q1Z7m9B4c2v0kX8yT5rW3uN6pQs=",
-  "ttl_secs": 43200,
-  "urls": [
-    "stun:chat.example.com:3478",
-    "turn:chat.example.com:3478?transport=udp",
-    "turn:chat.example.com:3478?transport=tcp",
-    "turns:chat.example.com:5349?transport=tcp"
-  ]
-}
+{ "urls": ["stun:stun.l.google.com:19302"] }
 ```
-
-For every configured `turn:` URL with UDP transport the server also lists the matching
-`stun:` URL so clients can gather server-reflexive candidates from the same Coturn.
 
 | Status | Body |
 |--------|------|
-| `200 OK` | `TurnCredentials` |
-| `429 Too Many Requests` | `ApiError` `rate_limited` (default 30 per minute per IP) |
-| `503 Service Unavailable` | `ApiError` `turn_unavailable` (secret or URLs not configured). Clients fall back to host candidates only. |
+| `200 OK` | `IceServers` |
+| `429 Too Many Requests` | `ApiError` `rate_limited` (default 30 per minute per IP; the message says too many ICE server requests) |
 
 ### `GET /ws/{room_id}`
 

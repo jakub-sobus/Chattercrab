@@ -285,12 +285,12 @@ impl Backend {
         });
     }
 
-    async fn turn_credentials(&self) -> Option<chattercrab_protocol::TurnCredentials> {
+    async fn ice_servers(&self) -> Option<chattercrab_protocol::IceServers> {
         let rest = self.rest.as_ref()?;
-        match rest.turn_credentials().await {
-            Ok(creds) => creds,
+        match rest.ice_servers().await {
+            Ok(ice) => Some(ice),
             Err(e) => {
-                tracing::warn!(error = %e, "no TURN credentials; using host candidates only");
+                tracing::warn!(error = %e, "ICE server request failed; using host candidates only");
                 None
             }
         }
@@ -301,7 +301,7 @@ impl Backend {
             return;
         };
         self.leave_room().await;
-        let ice = self.turn_credentials().await;
+        let ice = self.ice_servers().await;
         self.room = Some(ActiveRoom {
             session: Session::new(id, name, display_name, ice),
             backoff: Backoff::new(),
@@ -330,7 +330,7 @@ impl Backend {
     }
 
     async fn reconnect(&mut self) {
-        let ice = self.turn_credentials().await;
+        let ice = self.ice_servers().await;
         if let Some(room) = self.room.as_mut() {
             room.session.set_ice(ice);
         }
