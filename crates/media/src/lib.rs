@@ -5,13 +5,22 @@
 //! `tokio::sync::mpsc` channels. Decoded remote screen-share frames are delivered
 //! through a [`VideoFrameQueue`] (capacity 2, oldest frame dropped when full).
 //!
-//! This file is the public API contract shared by the media engine and the client.
-//! The engine implementation currently is a stub that accepts commands and emits no
-//! events; it will be replaced by the real pipeline without changing these types.
+//! The types in this file are the public API contract shared by the media engine and
+//! the client (additive changes are recorded in `API_CHANGES.md`). The building blocks
+//! are public modules too: [`audio`], [`jitter`], [`mixer`], [`screen`], [`peer`] and
+//! [`denoise`].
+//!
+//! Threading: the engine is one Tokio task; capture callbacks, the Opus encoder, the
+//! mixer (real-time priority), screen capture/encode and H.264 decode each run on their
+//! own OS thread. See `crates/media/README.md`.
 
 pub mod audio;
+pub mod denoise;
+mod engine;
 pub mod jitter;
 pub mod mixer;
+pub mod peer;
+pub mod screen;
 mod video_queue;
 
 pub use video_queue::{RgbaFrame, VideoFrameQueue};
@@ -54,6 +63,8 @@ pub struct MediaConfig {
     pub input_device: Option<String>,
     /// Output device name; `None` selects the system default.
     pub output_device: Option<String>,
+    /// Enable RNNoise-based noise suppression on the microphone input.
+    pub noise_suppression: bool,
 }
 
 /// What kind of surface a [`ScreenSource`] captures.
@@ -178,6 +189,8 @@ pub enum MediaCommand {
     SetMuted(bool),
     /// Deafen or undeafen playback.
     SetDeafened(bool),
+    /// Enable or disable microphone noise suppression.
+    SetNoiseSuppression(bool),
     /// Per-peer playback volume, clamped to 0.0..=2.0.
     SetPeerVolume {
         /// Remote peer.
@@ -251,23 +264,18 @@ pub struct MediaEngine {
 }
 
 impl MediaEngine {
-    /// Starts the engine on the current Tokio runtime and opens the audio devices.
+    /// Starts the engine on the current Tokio runtime. The engine opens the audio devices
+    /// in the background; failures are reported as [`MediaEvent::Error`] and the engine
+    /// keeps running (for example without a microphone).
     ///
     /// Must be called from within a Tokio runtime.
     pub fn start(config: MediaConfig) -> Result<Self, MediaError> {
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| MediaError::Audio("MediaEngine::start needs a Tokio runtime".into()))?;
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel::<MediaEvent>(EVENT_CHANNEL_CAPACITY);
         let video = VideoFrameQueue::new();
-        tracing::debug!(?config, "media engine stub started");
-        tokio::spawn(async move {
-            // Stub: hold the event sender so the receiver stays open until shutdown.
-            let _events = event_tx;
-            while let Some(cmd) = cmd_rx.recv().await {
-                if matches!(cmd, MediaCommand::Shutdown) {
-                    break;
-                }
-            }
-        });
+        handle.spawn(engine::run(config, cmd_rx, event_tx, video.clone()));
         Ok(Self {
             commands: cmd_tx,
             events: event_rx,
@@ -278,15 +286,15 @@ impl MediaEngine {
 
 /// Names of the available audio input devices.
 pub fn list_input_devices() -> Result<Vec<String>, MediaError> {
-    Ok(Vec::new())
+    audio::input_device_names()
 }
 
 /// Names of the available audio output devices.
 pub fn list_output_devices() -> Result<Vec<String>, MediaError> {
-    Ok(Vec::new())
+    audio::output_device_names()
 }
 
 /// Monitors and windows that can be shared.
 pub fn list_screen_sources() -> Result<Vec<ScreenSource>, MediaError> {
-    Ok(Vec::new())
+    screen::list_sources()
 }

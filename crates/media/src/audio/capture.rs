@@ -17,6 +17,10 @@ use super::{
     find_input_device, new_opus_encoder, rms_f32,
 };
 use crate::MediaError;
+use crate::denoise::{DENOISE_FRAME_LEN, Denoiser};
+
+// The denoiser works on exactly one encoder frame.
+const _: () = assert!(DENOISE_FRAME_LEN == FRAME_SAMPLES);
 
 /// Capture ring capacity in milliseconds of audio.
 const RING_MS: u32 = 500;
@@ -71,11 +75,13 @@ impl AudioInput {
     /// Opens the input device (`None` = default) and starts capturing and encoding.
     ///
     /// `muted` replaces captured audio with silence (the stream keeps running and Opus
-    /// DTX keeps packets tiny). `level` receives the RMS of each frame as `f32` bits.
+    /// DTX keeps packets tiny). `denoise` enables noise suppression on unmuted frames.
+    /// `level` receives the RMS of each frame as `f32` bits.
     /// This call blocks while the device opens; call it from a blocking context.
     pub fn start(
         device: Option<&str>,
         muted: Arc<AtomicBool>,
+        denoise: Arc<AtomicBool>,
         level: Arc<AtomicU32>,
     ) -> Result<Self, MediaError> {
         let device = find_input_device(device)?;
@@ -135,7 +141,7 @@ impl AudioInput {
             cons,
             rate,
             tx,
-            muted,
+            Flags { muted, denoise },
             level,
             stats.clone(),
             epoch,
@@ -219,6 +225,12 @@ where
     )
 }
 
+/// Live switches read by the encoder thread every frame.
+struct Flags {
+    muted: Arc<AtomicBool>,
+    denoise: Arc<AtomicBool>,
+}
+
 /// State owned by the encoder thread.
 struct EncoderWorker {
     cons: HeapCons<f32>,
@@ -226,7 +238,8 @@ struct EncoderWorker {
     resampler: Option<MonoResampler>,
     encoder: opus::Encoder,
     tx: mpsc::Sender<OpusFrame>,
-    muted: Arc<AtomicBool>,
+    flags: Flags,
+    denoiser: Denoiser,
     level: Arc<AtomicU32>,
     stats: Arc<CaptureStats>,
     epoch: Instant,
@@ -239,7 +252,7 @@ impl EncoderWorker {
         cons: HeapCons<f32>,
         device_rate: u32,
         tx: mpsc::Sender<OpusFrame>,
-        muted: Arc<AtomicBool>,
+        flags: Flags,
         level: Arc<AtomicU32>,
         stats: Arc<CaptureStats>,
         epoch: Instant,
@@ -261,7 +274,8 @@ impl EncoderWorker {
             resampler,
             encoder: new_opus_encoder()?,
             tx,
-            muted,
+            flags,
+            denoiser: Denoiser::new(),
             level,
             stats,
             epoch,
@@ -282,6 +296,8 @@ impl EncoderWorker {
         let mut input = vec![0f32; chunk];
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES + max_out);
         let silence = [0f32; FRAME_SAMPLES];
+        let mut frame_buf = [0f32; DENOISE_FRAME_LEN];
+        let mut denoise_was_on = false;
         let mut packet = [0u8; MAX_OPUS_PACKET];
         let mut index = 0u64;
         let mut latency_sum_us = 0u64;
@@ -307,9 +323,18 @@ impl EncoderWorker {
             }
 
             while acc.len() >= FRAME_SAMPLES {
-                let muted = self.muted.load(Ordering::Relaxed);
+                let muted = self.flags.muted.load(Ordering::Relaxed);
+                let denoise_on = self.flags.denoise.load(Ordering::Relaxed);
+                if denoise_on && !denoise_was_on {
+                    self.denoiser.reset();
+                }
+                denoise_was_on = denoise_on;
                 let frame: &[f32] = if muted {
                     &silence
+                } else if denoise_on {
+                    frame_buf.copy_from_slice(&acc[..FRAME_SAMPLES]);
+                    self.denoiser.process(&mut frame_buf);
+                    &frame_buf
                 } else {
                     &acc[..FRAME_SAMPLES]
                 };
