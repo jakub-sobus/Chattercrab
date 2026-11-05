@@ -198,8 +198,6 @@ pub enum MediaCommand {
         /// Linear gain.
         volume: f32,
     },
-    /// Enable or disable microphone noise suppression.
-    SetNoiseSuppression(bool),
     /// Switch the input device (`None` = system default).
     SelectInput(Option<String>),
     /// Switch the output device (`None` = system default).
