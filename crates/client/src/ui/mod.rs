@@ -10,11 +10,12 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chattercrab_media::{RgbaFrame, ScreenSource, VideoFrameQueue};
+use chattercrab_media::{RgbaFrame, ScreenScale, ScreenSource, VideoFrameQueue};
 use chattercrab_protocol::{DisplayName, PeerId, RoomId, RoomName, RoomSummary};
 use iced::futures::stream;
 use iced::widget::image;
-use iced::{Subscription, Task, Theme, keyboard};
+use iced::{Subscription, Task, Theme, keyboard, window};
+use iced_runtime::image::Allocation;
 use tokio::sync::mpsc;
 
 use crate::config::{Config, SCREEN_FPS_RANGE, ThemeChoice};
@@ -56,6 +57,8 @@ pub struct SharePicker {
     pub selected: Option<SourceOption>,
     /// Chosen frame rate.
     pub fps: u32,
+    /// 4K, 2K, 1440p, or 1080p cap.
+    pub scale: ScreenScale,
 }
 
 /// A [`ScreenSource`] with a display label, for pick lists.
@@ -72,6 +75,13 @@ impl std::fmt::Display for SourceOption {
     }
 }
 
+fn clear_share_frame(room: &mut RoomScreen) {
+    room.frame = None;
+    room.frame_memory = None;
+    room.pending_frame = None;
+    room.frame_loading = false;
+}
+
 /// Room screen state.
 #[derive(Debug)]
 pub struct RoomScreen {
@@ -81,8 +91,15 @@ pub struct RoomScreen {
     pub chat_input: String,
     /// Open share picker, if any.
     pub picker: Option<SharePicker>,
-    /// Latest remote screen frame.
+    /// Latest remote screen frame that has finished uploading to the GPU.
     pub frame: Option<image::Handle>,
+    /// Holds the GPU copy of [`Self::frame`]. Dropping it before the next upload
+    /// finishes is what makes the picture flash blank between frames.
+    frame_memory: Option<Allocation>,
+    /// A frame is uploading; newer frames wait in [`Self::pending_frame`].
+    frame_loading: bool,
+    /// Newest frame that arrived while an upload was in progress.
+    pending_frame: Option<RgbaFrame>,
 }
 
 /// Mutable UI state.
@@ -107,6 +124,18 @@ pub enum Message {
     Backend(AppEvent),
     /// A decoded remote screen frame.
     VideoFrame(RgbaFrame),
+    /// A remote frame is ready to draw. `memory` is the GPU copy when the
+    /// renderer allocated one; without it the picture can flash between frames.
+    FramePresented {
+        /// Image to draw.
+        handle: image::Handle,
+        /// GPU allocation, kept alive while this frame is on screen.
+        memory: Option<Allocation>,
+    },
+    /// Show or leave the fullscreen share view.
+    ToggleShareFullscreen,
+    /// Leave fullscreen (Escape, or the share ended).
+    ExitShareFullscreen,
     /// Server URL edited.
     ServerUrlChanged(String),
     /// Basic auth user edited.
@@ -151,6 +180,8 @@ pub enum Message {
     ShareSourceSelected(SourceOption),
     /// Frame rate picked.
     ShareFpsSelected(u32),
+    /// Resolution picked.
+    ShareScaleSelected(ScreenScale),
     /// Start sharing the picked source.
     StartShare,
     /// Close the picker.
@@ -169,6 +200,16 @@ pub enum Message {
     DismissNotice,
 }
 
+/// Which room the UI is waiting to open. A `welcome` that arrives after Leave
+/// must not pull the user back in.
+#[derive(Debug)]
+enum PendingEnter {
+    /// Create-and-join: the id arrives with [`AppEvent::Entering`].
+    Created,
+    /// Join clicked for this room.
+    Room(RoomId),
+}
+
 /// The application: UI state, persisted config, and the command channel to the backend.
 pub struct App {
     /// UI state.
@@ -179,6 +220,10 @@ pub struct App {
     pub net_tx: mpsc::Sender<UiCommand>,
     bridge: EventBridge,
     config_path: Option<PathBuf>,
+    /// Set by Create or Join, cleared once that room is shown or the user leaves.
+    pending_enter: Option<PendingEnter>,
+    /// The window is fullscreen for a remote share.
+    share_fullscreen: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -230,6 +275,8 @@ impl App {
             net_tx,
             bridge: EventBridge(events),
             config_path,
+            pending_enter: None,
+            share_fullscreen: false,
         };
         app.send(UiCommand::ListDevices);
         app
@@ -274,14 +321,26 @@ impl App {
 
     /// Elm update.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let mut followup = Task::none();
         match message {
-            Message::Backend(event) => self.on_backend(event),
-            Message::VideoFrame(frame) => {
-                if let Some(room) = self.room_mut()
-                    && room.model.remote_share_active()
-                {
-                    let pixels = bytes::Bytes::from_owner(frame.pixels);
-                    room.frame = Some(image::Handle::from_rgba(frame.width, frame.height, pixels));
+            Message::Backend(event) => {
+                self.on_backend(event);
+                if self.share_fullscreen && !self.remote_share_visible() {
+                    followup = self.set_share_fullscreen(false);
+                }
+            }
+            Message::VideoFrame(frame) => followup = self.queue_share_frame(frame),
+            Message::FramePresented { handle, memory } => {
+                followup = self.finish_share_frame(handle, memory);
+            }
+            Message::ToggleShareFullscreen => {
+                if self.remote_share_visible() {
+                    followup = self.set_share_fullscreen(!self.share_fullscreen);
+                }
+            }
+            Message::ExitShareFullscreen => {
+                if self.share_fullscreen {
+                    followup = self.set_share_fullscreen(false);
                 }
             }
             Message::ServerUrlChanged(url) => self.config.server_url = url,
@@ -313,8 +372,12 @@ impl App {
             Message::RefreshDevices => self.send(UiCommand::ListDevices),
             Message::Connect => self.connect(),
             Message::Disconnect => {
+                self.pending_enter = None;
                 self.send(UiCommand::Disconnect);
                 self.state.screen = Screen::Connect { connecting: false };
+                if self.share_fullscreen {
+                    followup = self.set_share_fullscreen(false);
+                }
             }
             Message::RefreshRooms => self.send(UiCommand::RefreshRooms),
             Message::NewRoomChanged(name) => {
@@ -327,7 +390,8 @@ impl App {
                     match RoomName::new(&lobby.new_room) {
                         Ok(name) => {
                             lobby.new_room.clear();
-                            // The room screen opens when `welcome` arrives.
+                            // The room screen opens on `Entering`, once the id is known.
+                            self.pending_enter = Some(PendingEnter::Created);
                             self.send(UiCommand::CreateRoom(name));
                         }
                         Err(e) => self.state.notice = Some(e.to_string()),
@@ -335,6 +399,7 @@ impl App {
                 }
             }
             Message::JoinRoom(id, name) => {
+                self.pending_enter = Some(PendingEnter::Room(id.clone()));
                 self.enter_room(id.clone(), name.clone());
                 self.send(UiCommand::JoinRoom { id, name });
             }
@@ -376,11 +441,13 @@ impl App {
             }
             Message::OpenSharePicker => {
                 let fps = self.config.screen_fps;
+                let scale = self.config.screen_scale;
                 if let Some(room) = self.room_mut() {
                     room.picker = Some(SharePicker {
                         sources: Vec::new(),
                         selected: None,
                         fps,
+                        scale,
                     });
                     self.send(UiCommand::ListScreenSources);
                 }
@@ -395,15 +462,25 @@ impl App {
                     picker.fps = fps.clamp(*SCREEN_FPS_RANGE.start(), *SCREEN_FPS_RANGE.end());
                 }
             }
+            Message::ShareScaleSelected(scale) => {
+                if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
+                    picker.fps = match scale {
+                        ScreenScale::P1080 => 30,
+                        ScreenScale::P1440 | ScreenScale::P2K | ScreenScale::P4K => 60,
+                    };
+                    picker.scale = scale;
+                }
+            }
             Message::StartShare => {
                 let picked = self
                     .room_mut()
                     .and_then(|r| r.picker.take())
-                    .and_then(|p| p.selected.map(|s| (s.0, p.fps)));
-                if let Some((source, fps)) = picked {
+                    .and_then(|p| p.selected.map(|s| (s.0, p.fps, p.scale)));
+                if let Some((source, fps, scale)) = picked {
                     self.config.screen_fps = fps;
+                    self.config.screen_scale = scale;
                     self.save_config();
-                    self.send(UiCommand::StartScreenShare { source, fps });
+                    self.send(UiCommand::StartScreenShare { source, fps, scale });
                 }
             }
             Message::CancelShare => {
@@ -413,8 +490,12 @@ impl App {
             }
             Message::StopShare => self.send(UiCommand::StopScreenShare),
             Message::Leave => {
+                self.pending_enter = None;
                 self.send(UiCommand::LeaveRoom);
                 self.state.screen = Screen::Lobby(Lobby::default());
+                if self.share_fullscreen {
+                    followup = self.set_share_fullscreen(false);
+                }
             }
             Message::PeerVolumeChanged(peer, volume) => {
                 if let Some(m) = self.room_mut().and_then(|r| r.model.member_mut(peer)) {
@@ -430,7 +511,73 @@ impl App {
             }
             Message::DismissNotice => self.state.notice = None,
         }
-        Task::none()
+        followup
+    }
+
+    fn remote_share_visible(&self) -> bool {
+        matches!(&self.state.screen, Screen::Room(room) if room.model.remote_share_active())
+    }
+
+    fn set_share_fullscreen(&mut self, on: bool) -> Task<Message> {
+        self.share_fullscreen = on;
+        let mode = if on {
+            window::Mode::Fullscreen
+        } else {
+            window::Mode::Windowed
+        };
+        window::oldest().then(move |id| match id {
+            Some(id) => window::set_mode(id, mode),
+            None => Task::none(),
+        })
+    }
+
+    fn queue_share_frame(&mut self, frame: RgbaFrame) -> Task<Message> {
+        let Some(room) = self.room_mut() else {
+            return Task::none();
+        };
+        if !room.model.remote_share_active() {
+            return Task::none();
+        }
+        if room.frame_loading {
+            room.pending_frame = Some(frame);
+            return Task::none();
+        }
+        Self::upload_share_frame(room, frame)
+    }
+
+    fn finish_share_frame(
+        &mut self,
+        handle: image::Handle,
+        memory: Option<Allocation>,
+    ) -> Task<Message> {
+        let Some(room) = self.room_mut() else {
+            return Task::none();
+        };
+        room.frame_loading = false;
+        if !room.model.remote_share_active() {
+            clear_share_frame(room);
+            return Task::none();
+        }
+        room.frame = Some(handle);
+        room.frame_memory = memory;
+        let Some(next) = room.pending_frame.take() else {
+            return Task::none();
+        };
+        Self::upload_share_frame(room, next)
+    }
+
+    fn upload_share_frame(room: &mut RoomScreen, frame: RgbaFrame) -> Task<Message> {
+        room.frame_loading = true;
+        let handle = image::Handle::from_rgba(
+            frame.width,
+            frame.height,
+            bytes::Bytes::from_owner(frame.pixels),
+        );
+        let shown = handle.clone();
+        iced_runtime::image::allocate(handle).map(move |result| Message::FramePresented {
+            memory: result.ok(),
+            handle: shown.clone(),
+        })
     }
 
     fn push_peer_volume(&mut self, peer: PeerId) {
@@ -473,6 +620,9 @@ impl App {
             chat_input: String::new(),
             picker: None,
             frame: None,
+            frame_memory: None,
+            frame_loading: false,
+            pending_frame: None,
         }));
     }
 
@@ -517,22 +667,36 @@ impl App {
                 self.state.notice = Some(format!("Screen share denied: {reason}"));
             }
             AppEvent::Notice(text) => self.state.notice = Some(text),
+            AppEvent::Entering { id, name } => {
+                let follow = match &self.pending_enter {
+                    Some(PendingEnter::Created) => true,
+                    Some(PendingEnter::Room(expected)) => *expected == id,
+                    None => false,
+                };
+                if follow {
+                    self.pending_enter = None;
+                    let same = self.room_mut().is_some_and(|room| room.model.id == id);
+                    if !same {
+                        self.enter_room(id, name);
+                    }
+                }
+            }
             AppEvent::Joined(joined) => {
-                // The room screen is entered when the user clicks Join and kept across
-                // reconnects. A welcome for any other room was already in flight when
-                // the user left, so it must not reopen the room.
+                // Join opens the room immediately; Create opens it on `Entering`.
+                // A welcome that was already in flight when the user left must not
+                // reopen the room.
                 if let Some(room) = self.room_mut()
                     && room.model.id == joined.id
                 {
                     room.model.apply_joined(joined);
-                    room.frame = None;
+                    clear_share_frame(room);
                 }
             }
             other => {
                 if let Some(room) = self.room_mut() {
                     room.model.apply(&other);
                     if !room.model.remote_share_active() {
-                        room.frame = None;
+                        clear_share_frame(room);
                     }
                 }
             }
@@ -550,12 +714,17 @@ impl App {
             })
         });
         let keys = iced::event::listen_with(|event, _status, _window| match event {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
-                if modifiers.command() =>
-            {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 match key.as_ref() {
-                    keyboard::Key::Character("m") => Some(Message::ToggleMute),
-                    keyboard::Key::Character("d") => Some(Message::ToggleDeafen),
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        Some(Message::ExitShareFullscreen)
+                    }
+                    keyboard::Key::Character("m") if modifiers.command() => {
+                        Some(Message::ToggleMute)
+                    }
+                    keyboard::Key::Character("d") if modifiers.command() => {
+                        Some(Message::ToggleDeafen)
+                    }
                     _ => None,
                 }
             }
@@ -581,5 +750,82 @@ impl App {
     /// Elm view.
     pub fn view(&self) -> iced::Element<'_, Message> {
         view::view(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::JoinedRoom;
+
+    fn app() -> App {
+        let (tx, _rx) = mpsc::channel(8);
+        App::new(Config::default(), None, tx, Arc::new(Mutex::new(None)))
+    }
+
+    fn peer() -> PeerId {
+        "00000000-0000-4000-8000-000000000001".parse().unwrap()
+    }
+
+    fn entering(id: &str) -> AppEvent {
+        AppEvent::Entering {
+            id: RoomId::new(id).unwrap(),
+            name: RoomName::new("1").unwrap(),
+        }
+    }
+
+    fn joined(id: &str) -> AppEvent {
+        AppEvent::Joined(JoinedRoom {
+            id: RoomId::new(id).unwrap(),
+            name: RoomName::new("1").unwrap(),
+            me: peer(),
+            display_name: DisplayName::new("ada").unwrap(),
+            peers: Vec::new(),
+            history: Vec::new(),
+            screen_publisher: None,
+        })
+    }
+
+    fn room_id(app: &App) -> Option<&str> {
+        match &app.state.screen {
+            Screen::Room(room) => Some(room.model.id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn create_opens_the_room_when_the_backend_enters_it() {
+        let mut app = app();
+        app.state.screen = Screen::Lobby(Lobby::default());
+        app.pending_enter = Some(PendingEnter::Created);
+        app.on_backend(entering("room1"));
+        assert_eq!(room_id(&app), Some("room1"));
+        assert!(app.pending_enter.is_none());
+        app.on_backend(joined("room1"));
+        assert!(matches!(
+            &app.state.screen,
+            Screen::Room(room) if room.model.me == Some(peer())
+        ));
+    }
+
+    #[test]
+    fn welcome_after_leave_does_not_reopen_the_room() {
+        let mut app = app();
+        app.state.screen = Screen::Lobby(Lobby::default());
+        app.pending_enter = Some(PendingEnter::Created);
+        let _ = app.update(Message::Leave);
+        app.on_backend(entering("room1"));
+        app.on_backend(joined("room1"));
+        assert!(matches!(app.state.screen, Screen::Lobby(_)));
+    }
+
+    #[test]
+    fn entering_a_different_room_is_ignored() {
+        let mut app = app();
+        app.state.screen = Screen::Lobby(Lobby::default());
+        app.pending_enter = Some(PendingEnter::Room(RoomId::new("room2").unwrap()));
+        app.on_backend(entering("room1"));
+        assert!(matches!(app.state.screen, Screen::Lobby(_)));
+        assert!(app.pending_enter.is_some());
     }
 }

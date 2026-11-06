@@ -86,6 +86,49 @@ pub enum ScreenSourceKind {
     Window,
 }
 
+/// Resolution cap applied before encoding. The picture is never scaled up.
+///
+/// Older configs used `full`, `half`, and `2160p`. Those load as [`Self::P1440`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenScale {
+    /// Fit inside 1920×1080.
+    #[serde(rename = "1080p")]
+    P1080,
+    /// Fit inside 2560×1440. Default.
+    #[default]
+    #[serde(rename = "1440p", alias = "2160p", alias = "full", alias = "half")]
+    P1440,
+    /// Fit inside 2560×1440, the 2K name for the same cap as [`Self::P1440`].
+    #[serde(rename = "2k")]
+    P2K,
+    /// Fit inside 3840×2160.
+    #[serde(rename = "4k")]
+    P4K,
+}
+
+impl ScreenScale {
+    /// Maximum encoded width and height. Smaller captures stay at their own size.
+    pub fn max_dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P1080 => (1920, 1080),
+            Self::P1440 | Self::P2K => (2560, 1440),
+            Self::P4K => (3840, 2160),
+        }
+    }
+}
+
+impl std::fmt::Display for ScreenScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2K => "2K",
+            Self::P4K => "4K",
+        })
+    }
+}
+
 /// A capturable monitor or window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenSource {
@@ -216,8 +259,10 @@ pub enum MediaCommand {
     StartScreenShare {
         /// What to capture.
         source: ScreenSource,
-        /// Target frame rate, clamped to 5..=30.
+        /// Target frame rate, clamped to 5..=60.
         fps: u32,
+        /// Fit inside 4K, 2K, 1440p, or 1080p. Smaller captures are not scaled up.
+        scale: ScreenScale,
     },
     /// Stop publishing the screen share.
     StopScreenShare,

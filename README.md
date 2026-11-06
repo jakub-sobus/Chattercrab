@@ -7,19 +7,19 @@ a Rust binary. The VPS deploy is Docker Compose with Traefik. Media is direct We
 with an external STUN URL, and there is no TURN relay. A shared password, set in the
 server environment and the client config, can gate signaling. No JavaScript, no webviews.
 
-* Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
+- Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.
-* Text: room chat with the last 200 messages kept in server memory only.
-* Screen share: one publisher per room (server-enforced), H.264 up to 1280x720.
-* Clients: Windows 10+ and Linux (X11).
+- Text: room chat with the last 200 messages kept in server memory only.
+- Screen share: one publisher per room (server-enforced), hardware H.264 at 1440p 60 fps, or 1080p 30 fps.
+- Clients: Windows 10+ and Linux (X11).
 
-| Document | Contents |
-|----------|----------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, threading model, message flows, media pipeline |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Every REST endpoint and WebSocket message with JSON examples |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | VPS setup: Docker Compose, Traefik, DNS, firewall, upgrades |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Decision log (ADR style) |
-| [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | Requirement-by-requirement evidence |
+| Document                                     | Contents                                                     |
+| -------------------------------------------- | ------------------------------------------------------------ |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, threading model, message flows, media pipeline   |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | Every REST endpoint and WebSocket message with JSON examples |
+| [docs/DEPLOY.md](docs/DEPLOY.md)             | VPS setup: Docker Compose, Traefik, DNS, firewall, upgrades  |
+| [docs/DECISIONS.md](docs/DECISIONS.md)       | Decision log (ADR style)                                     |
+| [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)     | Requirement-by-requirement evidence                          |
 
 ## Quick start (local, no TLS, no TURN)
 
@@ -93,11 +93,11 @@ cargo fmt --check
 cargo deny check
 ```
 
-* **Linux (Debian/Ubuntu)**: see the apt package list in
+- **Linux (Debian/Ubuntu)**: see the apt package list in
   [docs/DEPLOY.md section 12](docs/DEPLOY.md#12-building-on-linux-client-prerequisites).
-* **Windows**: Visual Studio Build Tools (C++ workload and Windows SDK). CMake can come
+- **Windows**: Visual Studio Build Tools (C++ workload and Windows SDK). CMake can come
   from `pip install --user cmake`.
-* **Release artifacts**: `deploy/build-release.sh` cross-compiles the static musl server
+- **Release artifacts**: `deploy/build-release.sh` cross-compiles the static musl server
   and the Linux and Windows clients into `dist/` with `cargo zigbuild` and writes
   `dist/SHA256SUMS`.
 

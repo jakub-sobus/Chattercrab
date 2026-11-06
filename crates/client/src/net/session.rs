@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use chattercrab_media::{MediaCommand, MediaEvent, OutgoingSignal, ScreenSource};
+use chattercrab_media::{MediaCommand, MediaEvent, OutgoingSignal, ScreenScale, ScreenSource};
 use chattercrab_protocol::{
     ClientMsg, DisplayName, ErrorCode, IceServers, PeerId, PeerInfo, RoomId, RoomName, ServerMsg,
 };
@@ -34,8 +34,11 @@ pub struct Session {
     me: Option<PeerId>,
     peers: BTreeMap<PeerId, PeerInfo>,
     screen_publisher: Option<PeerId>,
-    pending_share: Option<(ScreenSource, u32)>,
+    pending_share: Option<(ScreenSource, u32, ScreenScale)>,
     local_sharing: bool,
+    /// Last `welcome`, kept current so joining the same room again can refresh
+    /// the UI without dropping the socket (which would delete a one-person room).
+    joined: Option<JoinedRoom>,
 }
 
 impl Session {
@@ -56,6 +59,7 @@ impl Session {
             screen_publisher: None,
             pending_share: None,
             local_sharing: false,
+            joined: None,
         }
     }
 
@@ -74,6 +78,11 @@ impl Session {
         self.ice = ice;
     }
 
+    /// Current membership, if `welcome` has arrived and the socket is still up.
+    pub fn joined_snapshot(&self) -> Option<JoinedRoom> {
+        self.joined.clone()
+    }
+
     /// Handles one message from the server.
     pub fn on_server_msg(&mut self, msg: ServerMsg) -> Vec<Effect> {
         match msg {
@@ -86,6 +95,16 @@ impl Session {
                 self.me = Some(you);
                 self.peers = peers.iter().map(|p| (p.id, p.clone())).collect();
                 self.screen_publisher = screen_publisher;
+                let joined = JoinedRoom {
+                    id: self.room_id.clone(),
+                    name: self.room_name.clone(),
+                    me: you,
+                    display_name: self.display_name.clone(),
+                    peers: peers.clone(),
+                    history,
+                    screen_publisher,
+                };
+                self.joined = Some(joined.clone());
                 let mut effects = vec![Effect::Media(MediaCommand::Configure {
                     me: you,
                     ice: self.ice.clone(),
@@ -97,19 +116,16 @@ impl Session {
                         initiate: true,
                     })
                 }));
-                effects.push(Effect::Ui(AppEvent::Joined(JoinedRoom {
-                    id: self.room_id.clone(),
-                    name: self.room_name.clone(),
-                    me: you,
-                    display_name: self.display_name.clone(),
-                    peers,
-                    history,
-                    screen_publisher,
-                })));
+                effects.push(Effect::Ui(AppEvent::Joined(joined)));
                 effects
             }
             ServerMsg::PeerJoined { peer } => {
                 self.peers.insert(peer.id, peer.clone());
+                if let Some(joined) = &mut self.joined
+                    && !joined.peers.iter().any(|p| p.id == peer.id)
+                {
+                    joined.peers.push(peer.clone());
+                }
                 vec![
                     Effect::Media(MediaCommand::AddPeer {
                         peer: peer.id,
@@ -120,6 +136,12 @@ impl Session {
             }
             ServerMsg::PeerLeft { peer_id } => {
                 self.peers.remove(&peer_id);
+                if let Some(joined) = &mut self.joined {
+                    joined.peers.retain(|p| p.id != peer_id);
+                    if joined.screen_publisher == Some(peer_id) {
+                        joined.screen_publisher = None;
+                    }
+                }
                 vec![
                     Effect::Media(MediaCommand::RemovePeer { peer: peer_id }),
                     Effect::Ui(AppEvent::PeerLeft(peer_id)),
@@ -142,12 +164,17 @@ impl Session {
                 sdp_mid,
                 sdp_mline_index,
             })],
-            ServerMsg::Chat { msg } => vec![Effect::Ui(AppEvent::Chat(msg))],
+            ServerMsg::Chat { msg } => {
+                if let Some(joined) = &mut self.joined {
+                    joined.history.push(msg.clone());
+                }
+                vec![Effect::Ui(AppEvent::Chat(msg))]
+            }
             ServerMsg::ScreenGranted => match self.pending_share.take() {
-                Some((source, fps)) => {
+                Some((source, fps, scale)) => {
                     self.local_sharing = true;
                     vec![
-                        Effect::Media(MediaCommand::StartScreenShare { source, fps }),
+                        Effect::Media(MediaCommand::StartScreenShare { source, fps, scale }),
                         Effect::Ui(AppEvent::LocalShare(true)),
                     ]
                 }
@@ -161,10 +188,16 @@ impl Session {
             }
             ServerMsg::ScreenStarted { publisher } => {
                 self.screen_publisher = Some(publisher);
+                if let Some(joined) = &mut self.joined {
+                    joined.screen_publisher = Some(publisher);
+                }
                 vec![Effect::Ui(AppEvent::ScreenStarted(publisher))]
             }
             ServerMsg::ScreenStopped => {
                 self.screen_publisher = None;
+                if let Some(joined) = &mut self.joined {
+                    joined.screen_publisher = None;
+                }
                 let mut effects = Vec::new();
                 if self.local_sharing {
                     self.local_sharing = false;
@@ -230,11 +263,16 @@ impl Session {
     }
 
     /// The user wants to share `source`; asks the server for the lock first.
-    pub fn request_share(&mut self, source: ScreenSource, fps: u32) -> Vec<Effect> {
+    pub fn request_share(
+        &mut self,
+        source: ScreenSource,
+        fps: u32,
+        scale: ScreenScale,
+    ) -> Vec<Effect> {
         if self.local_sharing {
             return Vec::new();
         }
-        self.pending_share = Some((source, fps));
+        self.pending_share = Some((source, fps, scale));
         vec![Effect::Send(ClientMsg::ScreenRequest)]
     }
 
@@ -258,6 +296,7 @@ impl Session {
         self.peers.clear();
         self.screen_publisher = None;
         self.pending_share = None;
+        self.joined = None;
         let mut effects = vec![Effect::Media(MediaCommand::RemoveAllPeers)];
         if self.local_sharing {
             // The server releases the lock when we disconnect.
@@ -340,6 +379,35 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_tracks_the_room_until_disconnect() {
+        let mut s = session();
+        assert!(s.joined_snapshot().is_none());
+        welcome(&mut s, vec![info(2)]);
+        s.on_server_msg(ServerMsg::PeerJoined { peer: info(3) });
+        s.on_server_msg(ServerMsg::PeerLeft { peer_id: peer(2) });
+        s.on_server_msg(ServerMsg::Chat {
+            msg: ChatMessage {
+                id: 1,
+                from: peer(3),
+                display_name: DisplayName::new("p3").unwrap(),
+                text: "hi".into(),
+                ts: 0,
+            },
+        });
+        s.on_server_msg(ServerMsg::ScreenStarted { publisher: peer(3) });
+        let snap = s.joined_snapshot().unwrap();
+        assert_eq!(snap.me, peer(1));
+        assert_eq!(
+            snap.peers.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![peer(3)]
+        );
+        assert_eq!(snap.history.len(), 1);
+        assert_eq!(snap.screen_publisher, Some(peer(3)));
+        s.on_disconnected();
+        assert!(s.joined_snapshot().is_none());
+    }
+
+    #[test]
     fn joined_peer_waits_for_offer_and_left_peer_is_removed() {
         let mut s = session();
         welcome(&mut s, vec![]);
@@ -411,12 +479,13 @@ mod tests {
     fn screen_share_grant_flow() {
         let mut s = session();
         welcome(&mut s, vec![]);
-        let effects = s.request_share(source(), 15);
+        let effects = s.request_share(source(), 15, ScreenScale::P1080);
         assert!(matches!(effects[0], Effect::Send(ClientMsg::ScreenRequest)));
         let effects = s.on_server_msg(ServerMsg::ScreenGranted);
         assert!(matches!(
             &effects[0],
-            Effect::Media(MediaCommand::StartScreenShare { source: src, fps: 15 }) if *src == source()
+            Effect::Media(MediaCommand::StartScreenShare { source: src, fps: 15, scale })
+                if *src == source() && *scale == ScreenScale::P1080
         ));
         assert!(s.local_sharing);
         let effects = s.stop_share();
@@ -434,7 +503,7 @@ mod tests {
     fn screen_share_denied_flow() {
         let mut s = session();
         welcome(&mut s, vec![info(2)]);
-        s.request_share(source(), 15);
+        s.request_share(source(), 15, ScreenScale::P1080);
         let effects = s.on_server_msg(ServerMsg::ScreenDenied {
             reason: "p2 is already sharing".into(),
         });
@@ -448,7 +517,7 @@ mod tests {
     fn server_stop_and_capture_failure_stop_local_share() {
         let mut s = session();
         welcome(&mut s, vec![]);
-        s.request_share(source(), 10);
+        s.request_share(source(), 10, ScreenScale::P1080);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_server_msg(ServerMsg::ScreenStopped);
         assert!(matches!(
@@ -457,7 +526,7 @@ mod tests {
         ));
         assert!(!s.local_sharing);
 
-        s.request_share(source(), 10);
+        s.request_share(source(), 10, ScreenScale::P1080);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_media_event(MediaEvent::LocalScreenStopped);
         assert!(matches!(effects[0], Effect::Send(ClientMsg::ScreenStop)));
@@ -468,7 +537,7 @@ mod tests {
     fn disconnect_tears_down_peers_and_share() {
         let mut s = session();
         welcome(&mut s, vec![info(2)]);
-        s.request_share(source(), 10);
+        s.request_share(source(), 10, ScreenScale::P1080);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_disconnected();
         assert!(matches!(

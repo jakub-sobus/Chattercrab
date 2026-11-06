@@ -54,8 +54,9 @@ use crate::{MediaError, OutgoingSignal, PeerConnectionState};
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 /// RTP payload type registered for H.264 constrained baseline.
 const H264_PAYLOAD_TYPE: u8 = 102;
-/// H.264 format parameters (constrained baseline, level 3.1, non-interleaved).
-const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+/// H.264 format parameters (constrained baseline, level 5.2, non-interleaved).
+/// Level 5.2 covers 4K60. Smaller shares fit inside it.
+const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034";
 /// Opus format parameters.
 const OPUS_FMTP: &str = "minptime=10;useinbandfec=1";
 /// ICE: no activity for this long marks the connection disconnected.

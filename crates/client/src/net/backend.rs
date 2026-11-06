@@ -210,9 +210,9 @@ impl Backend {
                     let _ = events.send(event).await;
                 });
             }
-            UiCommand::StartScreenShare { source, fps } => {
+            UiCommand::StartScreenShare { source, fps, scale } => {
                 if let Some(room) = self.room.as_mut() {
-                    let effects = room.session.request_share(source, fps);
+                    let effects = room.session.request_share(source, fps, scale);
                     self.apply(effects).await;
                 }
             }
@@ -302,9 +302,24 @@ impl Backend {
     }
 
     async fn join(&mut self, id: RoomId, name: RoomName) {
+        // Already in this room (create-and-join, then Join on the lobby row).
+        // Leaving first would drop the only member and the server would delete the room.
+        if let Some(room) = &self.room
+            && room.session.room_id() == &id
+        {
+            if let Some(joined) = room.session.joined_snapshot() {
+                self.ui(AppEvent::Joined(joined)).await;
+            }
+            return;
+        }
         let Some(display_name) = self.display_name.clone() else {
             return;
         };
+        self.ui(AppEvent::Entering {
+            id: id.clone(),
+            name: name.clone(),
+        })
+        .await;
         self.leave_room().await;
         let ice = self.ice_servers().await;
         self.room = Some(ActiveRoom {

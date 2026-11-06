@@ -1,12 +1,14 @@
 //! Screen sharing: capture and H.264 encode (publisher) and H.264 decode (receiver).
 //!
 //! Publisher: a dedicated thread captures the selected monitor or window with `xcap`,
-//! downscales to fit 1280x720 with `fast_image_resize`, converts to YUV 4:2:0 and encodes
-//! with OpenH264 (constrained baseline, about 1.5 Mbps, IDR every 2 s and whenever a peer
-//! sends PLI/FIR). Encoded access units (Annex-B) leave through a bounded channel.
+//! fits it inside 3840x2160, 2560x1440, or 1920x1080 without scaling up, and encodes H.264.
+//! Windows uses the GPU's Media Foundation encoder when one is registered.
+//! Linux uses VA-API when libva and a driver are installed. Otherwise the
+//! publisher uses OpenH264. Encoded access units (Annex-B) leave through a bounded channel.
 //!
 //! Receiver: see [`receive`].
 
+mod hw;
 pub mod receive;
 
 use std::sync::Arc;
@@ -19,26 +21,31 @@ use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile, RateControlMode,
-    UsageType,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
+    RateControlMode, UsageType,
 };
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
 use tokio::sync::mpsc;
 
-use crate::{MediaError, ScreenSource, ScreenSourceKind};
+use crate::{MediaError, ScreenScale, ScreenSource, ScreenSourceKind};
 
-/// Maximum encoded width.
-pub const MAX_WIDTH: u32 = 1280;
-/// Maximum encoded height.
-pub const MAX_HEIGHT: u32 = 720;
-/// Target bitrate.
-pub const BITRATE_BPS: u32 = 1_500_000;
+/// Maximum encoded width (H.264 level 5.2 frame size).
+pub const MAX_WIDTH: u32 = 4096;
+/// Maximum encoded height (H.264 level 5.2 frame size).
+pub const MAX_HEIGHT: u32 = 2304;
 /// Default frame rate.
 pub const DEFAULT_FPS: u32 = 15;
 /// Allowed frame-rate range.
-pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=30;
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=60;
+/// Floor for the rate-control target, so a small window is not starved.
+const MIN_BITRATE_BPS: u64 = 2_000_000;
+/// Ceiling for the rate-control target. High enough for 2160p60 on a one-to-one share.
+const MAX_BITRATE_BPS: u64 = 80_000_000;
 /// Encoded frames buffered towards the network.
-const VIDEO_CHANNEL_CAPACITY: usize = 4;
+const VIDEO_CHANNEL_CAPACITY: usize = 8;
+/// How often a backed-up sender may ask for an IDR. Asking on every dropped
+/// frame makes the encoder fall further behind and the picture flash.
+const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 /// Consecutive capture failures after which publishing stops.
 const MAX_CAPTURE_FAILURES: u32 = 30;
 
@@ -101,6 +108,21 @@ pub fn list_sources() -> Result<Vec<ScreenSource>, MediaError> {
     Ok(out)
 }
 
+/// Even output size for `scale`. Smaller than the cap is left unchanged.
+pub fn encode_dimensions(src_w: u32, src_h: u32, scale: ScreenScale) -> (u32, u32) {
+    let (max_w, max_h) = scale.max_dimensions();
+    fit_dimensions(src_w, src_h, max_w.min(MAX_WIDTH), max_h.min(MAX_HEIGHT))
+}
+
+/// Rate-control target for a picture of `width` x `height` at `fps`.
+///
+/// About 0.15 bits per pixel per frame. Too low a target makes OpenH264 skip
+/// pictures, which shows up as the share flashing between updates.
+pub fn target_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    let bps = u64::from(width) * u64::from(height) * u64::from(fps.max(1)) * 15 / 100;
+    bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS) as u32
+}
+
 /// Largest even size that fits within `max_w` x `max_h`, preserving aspect ratio.
 pub fn fit_dimensions(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
@@ -161,12 +183,13 @@ impl std::fmt::Debug for ScreenPublisher {
 }
 
 impl ScreenPublisher {
-    /// Opens `source` and starts capturing at `fps` (clamped to 5..=30). `keyframe` is
-    /// polled every frame; when set, the next frame is an IDR. Blocks until the source
-    /// is opened.
+    /// Opens `source` and starts capturing at `fps` (clamped to 5..=60) and `scale`.
+    /// `keyframe` is polled every frame; when set, the next frame is an IDR. Blocks
+    /// until the source is opened.
     pub fn start(
         source: &ScreenSource,
         fps: u32,
+        scale: ScreenScale,
         keyframe: Arc<AtomicBool>,
     ) -> Result<Self, MediaError> {
         let fps = fps.clamp(*FPS_RANGE.start(), *FPS_RANGE.end());
@@ -182,17 +205,22 @@ impl ScreenPublisher {
             .spawn(move || {
                 let opened = Target::open(&source_owned).and_then(|target| {
                     let first = target.capture()?;
-                    let encoder = new_encoder(fps)?;
-                    Ok((target, first, encoder))
+                    let (width, height) = (first.width(), first.height());
+                    let (tw, th) = encode_dimensions(width, height, scale);
+                    let encoder = ScreenEncoder::open(fps, tw, th)?;
+                    Ok((target, first, encoder, (tw, th)))
                 });
                 match opened {
-                    Ok((target, first, encoder)) => {
+                    Ok((target, first, encoder, encoded)) => {
                         let _ = ready_tx.send(Ok(()));
                         CaptureWorker {
                             target,
                             fps,
+                            scale,
                             encoder,
+                            encoded,
                             keyframe,
+                            last_keyframe_request: None,
                             tx,
                             stop: thread_stop,
                         }
@@ -234,24 +262,107 @@ impl Drop for ScreenPublisher {
     }
 }
 
-fn new_encoder(fps: u32) -> Result<Encoder, MediaError> {
+fn new_encoder(fps: u32, width: u32, height: u32) -> Result<Encoder, MediaError> {
     let config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(BITRATE_BPS))
+        .bitrate(BitRate::from_bps(target_bitrate(width, height, fps)))
         .max_frame_rate(FrameRate::from_hz(fps as f32))
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
         .profile(Profile::Baseline)
+        .level(Level::Level_5_2)
+        .complexity(Complexity::Low)
         .intra_frame_period(IntraFramePeriod::from_num_frames(fps * 2))
+        // OpenH264 only honors the bitrate target when skipping is enabled.
+        // The target above is high enough that a normal desktop rarely skips;
+        // a starved target skips every other picture and the view flashes.
         .skip_frames(true);
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .map_err(|e| MediaError::Codec(format!("openh264 encoder: {e}")))
 }
 
+/// Picture encoder. Hardware H.264 when the machine has one, otherwise OpenH264.
+enum ScreenEncoder {
+    Hardware(hw::HwEncoder),
+    Software(Box<SoftwareEncoder>),
+}
+
+struct SoftwareEncoder {
+    encoder: Encoder,
+    yuv: YUVBuffer,
+    width: usize,
+    height: usize,
+}
+
+impl SoftwareEncoder {
+    fn open(fps: u32, width: u32, height: u32) -> Result<Self, MediaError> {
+        Ok(Self {
+            encoder: new_encoder(fps, width, height)?,
+            yuv: YUVBuffer::new(width as usize, height as usize),
+            width: width as usize,
+            height: height as usize,
+        })
+    }
+
+    fn encode(
+        &mut self,
+        rgba: &[u8],
+        force_idr: bool,
+        elapsed_ms: u64,
+    ) -> Result<Vec<hw::AccessUnit>, MediaError> {
+        if force_idr {
+            self.encoder.force_intra_frame();
+        }
+        self.yuv
+            .read_rgba8(RgbaSliceU8::new(rgba, (self.width, self.height)));
+        let ts = openh264::Timestamp::from_millis(elapsed_ms);
+        let bs = self
+            .encoder
+            .encode_at(&self.yuv, ts)
+            .map_err(|e| MediaError::Codec(format!("h264 encode: {e}")))?;
+        let mut data = Vec::new();
+        bs.write_vec(&mut data);
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keyframe = matches!(bs.frame_type(), openh264::encoder::FrameType::IDR);
+        Ok(vec![hw::AccessUnit { data, keyframe }])
+    }
+}
+
+impl ScreenEncoder {
+    fn open(fps: u32, width: u32, height: u32) -> Result<Self, MediaError> {
+        match hw::HwEncoder::open(width, height, fps) {
+            Ok(encoder) => Ok(Self::Hardware(encoder)),
+            Err(error) => {
+                tracing::warn!(%error, "hardware h264 unavailable, using openh264");
+                Ok(Self::Software(Box::new(SoftwareEncoder::open(
+                    fps, width, height,
+                )?)))
+            }
+        }
+    }
+
+    fn encode(
+        &mut self,
+        rgba: &[u8],
+        force_idr: bool,
+        elapsed_ms: u64,
+    ) -> Result<Vec<hw::AccessUnit>, MediaError> {
+        match self {
+            Self::Hardware(encoder) => encoder.encode(rgba, force_idr).map_err(MediaError::Codec),
+            Self::Software(encoder) => encoder.encode(rgba, force_idr, elapsed_ms),
+        }
+    }
+}
+
 struct CaptureWorker {
     target: Target,
     fps: u32,
-    encoder: Encoder,
+    scale: ScreenScale,
+    encoder: ScreenEncoder,
+    encoded: (u32, u32),
     keyframe: Arc<AtomicBool>,
+    last_keyframe_request: Option<Instant>,
     tx: mpsc::Sender<EncodedVideo>,
     stop: Arc<AtomicBool>,
 }
@@ -265,8 +376,6 @@ impl CaptureWorker {
             .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
             .use_alpha(false);
         let mut scaled: Option<Image<'static>> = None;
-        let mut yuv: Option<YUVBuffer> = None;
-        let mut bitstream = Vec::with_capacity(256 * 1024);
         let mut failures = 0u32;
         let mut pending = Some(first);
         let mut next = Instant::now();
@@ -288,7 +397,19 @@ impl CaptureWorker {
                 }
             };
             let (sw, sh) = image.dimensions();
-            let (tw, th) = fit_dimensions(sw, sh, MAX_WIDTH, MAX_HEIGHT);
+            let (tw, th) = encode_dimensions(sw, sh, self.scale);
+            if (tw, th) != self.encoded {
+                match ScreenEncoder::open(self.fps, tw, th) {
+                    Ok(encoder) => {
+                        self.encoder = encoder;
+                        self.encoded = (tw, th);
+                    }
+                    Err(e) => {
+                        tracing::warn!("h264 encoder: {e}");
+                        continue;
+                    }
+                }
+            }
             let rgba: &[u8] = if (tw, th) == (sw, sh) {
                 image.as_raw()
             } else {
@@ -309,33 +430,32 @@ impl CaptureWorker {
                 }
                 dst.buffer()
             };
-            let (w, h) = (tw as usize, th as usize);
-            let buf = match yuv.as_mut() {
-                Some(b) if openh264::formats::YUVSource::dimensions(b) == (w, h) => b,
-                _ => yuv.insert(YUVBuffer::new(w, h)),
-            };
-            buf.read_rgba8(RgbaSliceU8::new(rgba, (w, h)));
-
-            if self.keyframe.swap(false, Ordering::Relaxed) {
-                self.encoder.force_intra_frame();
-            }
-            let ts = openh264::Timestamp::from_millis(started.elapsed().as_millis() as u64);
-            match self.encoder.encode_at(&*buf, ts) {
-                Ok(bs) => {
-                    let keyframe = matches!(bs.frame_type(), openh264::encoder::FrameType::IDR);
-                    bitstream.clear();
-                    bs.write_vec(&mut bitstream);
-                    if !bitstream.is_empty() {
+            let force_idr = self.keyframe.swap(false, Ordering::Relaxed);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match self.encoder.encode(rgba, force_idr, elapsed_ms) {
+                Ok(units) => {
+                    for unit in units {
+                        if unit.data.is_empty() {
+                            continue;
+                        }
                         let frame = EncodedVideo {
-                            data: Bytes::copy_from_slice(&bitstream),
+                            data: Bytes::from(unit.data),
                             duration: period,
-                            keyframe,
+                            keyframe: unit.keyframe,
                         };
                         match self.tx.try_send(frame) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // The network side is behind; the next IDR will resync.
-                                self.keyframe.store(true, Ordering::Relaxed);
+                                // One late IDR resyncs a dropped picture. Requesting one
+                                // on every drop makes each following frame an IDR, which
+                                // flashes and falls further behind.
+                                let due = self
+                                    .last_keyframe_request
+                                    .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
+                                if due {
+                                    self.keyframe.store(true, Ordering::Relaxed);
+                                    self.last_keyframe_request = Some(Instant::now());
+                                }
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
@@ -358,6 +478,7 @@ impl CaptureWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScreenScale;
 
     #[test]
     fn fit_keeps_aspect_and_even_sizes() {
@@ -372,8 +493,53 @@ mod tests {
     }
 
     #[test]
+    fn scale_keeps_aspect_and_caps_the_picture() {
+        assert_eq!(
+            encode_dimensions(1920, 1080, ScreenScale::P1080),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_dimensions(3840, 2160, ScreenScale::P1080),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_dimensions(3840, 2160, ScreenScale::P1440),
+            (2560, 1440)
+        );
+        assert_eq!(
+            encode_dimensions(1920, 1080, ScreenScale::P1440),
+            (1920, 1080)
+        );
+        assert_eq!(encode_dimensions(801, 601, ScreenScale::P1080), (800, 600));
+        assert_eq!(
+            encode_dimensions(7680, 4320, ScreenScale::P1440),
+            (2560, 1440)
+        );
+        assert_eq!(
+            encode_dimensions(3840, 2160, ScreenScale::P2K),
+            (2560, 1440)
+        );
+        assert_eq!(
+            encode_dimensions(3840, 2160, ScreenScale::P4K),
+            (3840, 2160)
+        );
+        assert_eq!(
+            encode_dimensions(1920, 1080, ScreenScale::P4K),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_dimensions(7680, 4320, ScreenScale::P4K),
+            (3840, 2160)
+        );
+        assert_eq!(target_bitrate(1920, 1080, 30), 9_331_200);
+        assert_eq!(target_bitrate(3840, 2160, 60), 74_649_600);
+        assert_eq!(target_bitrate(7680, 4320, 60), MAX_BITRATE_BPS as u32);
+        assert_eq!(target_bitrate(320, 240, 15), MIN_BITRATE_BPS as u32);
+    }
+
+    #[test]
     fn encoder_produces_idr_then_decodes() {
-        let mut enc = new_encoder(15).unwrap();
+        let mut enc = new_encoder(15, 320, 240).unwrap();
         let (w, h) = (320usize, 240usize);
         let mut rgba = vec![0u8; w * h * 4];
         for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {

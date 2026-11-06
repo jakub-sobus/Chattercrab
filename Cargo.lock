@@ -781,6 +781,7 @@ dependencies = [
  "embed-resource",
  "futures-util",
  "iced",
+ "iced_runtime",
  "reqwest",
  "rustls",
  "serde",
@@ -806,6 +807,7 @@ dependencies = [
  "crossbeam-queue",
  "fast_image_resize",
  "futures-util",
+ "libloading",
  "nnnoiseless",
  "openh264",
  "opus",
@@ -815,6 +817,7 @@ dependencies = [
  "rtc",
  "rubato",
  "rustls",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -822,6 +825,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "windows 0.62.2",
  "xcap",
 ]
 

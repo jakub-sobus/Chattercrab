@@ -80,6 +80,8 @@ pub enum UiCommand {
         source: ScreenSource,
         /// Frame rate.
         fps: u32,
+        /// Original size or half size.
+        scale: chattercrab_media::ScreenScale,
     },
     /// Stop publishing the screen.
     StopScreenShare,
@@ -131,10 +133,11 @@ impl std::fmt::Debug for UiCommand {
                 .field("volume", volume)
                 .finish(),
             Self::ListScreenSources => f.write_str("UiCommand::ListScreenSources"),
-            Self::StartScreenShare { source, fps } => f
+            Self::StartScreenShare { source, fps, scale } => f
                 .debug_struct("UiCommand::StartScreenShare")
                 .field("source", source)
                 .field("fps", fps)
+                .field("scale", scale)
                 .finish(),
             Self::StopScreenShare => f.write_str("UiCommand::StopScreenShare"),
             Self::Shutdown => f.write_str("UiCommand::Shutdown"),
@@ -182,6 +185,13 @@ pub enum AppEvent {
     ConnectFailed(String),
     /// Updated room list.
     Rooms(Vec<RoomSummary>),
+    /// The backend started joining this room. Shown before `welcome` arrives.
+    Entering {
+        /// Room id.
+        id: RoomId,
+        /// Room name.
+        name: RoomName,
+    },
     /// Joined (or re-joined after a reconnect) a room.
     Joined(JoinedRoom),
     /// Signaling dropped; retrying after a delay.

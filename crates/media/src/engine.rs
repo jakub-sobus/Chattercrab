@@ -239,7 +239,9 @@ impl Engine {
                 self.output_device = name;
                 self.open_output().await;
             }
-            MediaCommand::StartScreenShare { source, fps } => self.start_screen(source, fps).await,
+            MediaCommand::StartScreenShare { source, fps, scale } => {
+                self.start_screen(source, fps, scale).await;
+            }
             MediaCommand::StopScreenShare => self.stop_screen().await,
             // Handled by the run loop.
             MediaCommand::Shutdown => {}
@@ -320,14 +322,20 @@ impl Engine {
         self.peers.remove_peer(peer).await;
     }
 
-    async fn start_screen(&mut self, source: crate::ScreenSource, fps: u32) {
+    async fn start_screen(
+        &mut self,
+        source: crate::ScreenSource,
+        fps: u32,
+        scale: crate::ScreenScale,
+    ) {
         if self.screen.is_some() {
             self.stop_screen().await;
         }
         let keyframe = self.peers.keyframe_flag();
-        let started =
-            tokio::task::spawn_blocking(move || ScreenPublisher::start(&source, fps, keyframe))
-                .await;
+        let started = tokio::task::spawn_blocking(move || {
+            ScreenPublisher::start(&source, fps, scale, keyframe)
+        })
+        .await;
         match started {
             Ok(Ok(mut publisher)) => {
                 let (_, dummy) = mpsc::channel(1);

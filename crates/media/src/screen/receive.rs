@@ -26,7 +26,7 @@ const AU_CHANNEL_CAPACITY: usize = 8;
 /// Minimum interval between PLIs.
 const PLI_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound for one access unit; larger ones are dropped.
-const MAX_AU_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AU_BYTES: usize = 8 * 1024 * 1024;
 
 /// Whether an Annex-B buffer contains an IDR slice (NAL type 5).
 pub fn contains_idr(au: &[u8]) -> bool {
