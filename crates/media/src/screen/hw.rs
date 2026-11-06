@@ -4,9 +4,10 @@
 //! Sync, or AMD AMF, whichever the driver registered). Linux uses VA-API on a
 //! DRM render node, which covers Intel and AMD directly and NVIDIA through
 //! `nvidia-vaapi-driver`. libva is loaded at runtime, so the build does not
-//! link it. Both paths emit Annex-B H.264 Constrained Baseline with no
-//! B-frames, which the OpenH264 decoder can read. The operating point is 1440p
-//! at 60 fps and 12 Mbps, and 4K60 steps up to level 5.2.
+//! link it. Both paths emit Annex-B H.264 with no B-frames, which the OpenH264
+//! decoder can read. The standard operating point is Constrained Baseline,
+//! 1440p at 60 fps and 12 Mbps. High quality requests H.264 High at a higher
+//! fixed bitrate, and 4K60 or 1440p120 uses level 5.2.
 //!
 //! The Windows encoder is handed a Direct3D 11 device on the adapter that
 //! registered it. Without that device, `SetOutputType` fails with
@@ -20,6 +21,26 @@ pub struct AccessUnit {
     pub data: Vec<u8>,
     /// Whether this picture is an IDR.
     pub keyframe: bool,
+}
+
+/// Rate control for one encoder open.
+///
+/// Standard shares keep the existing bitrate and a two-second GOP. High quality
+/// follows the low-latency operating point: CBR at the spec bitrate, a GOP long
+/// enough that IDRs happen only on demand, no B-frames, and a one-to-two-frame
+/// rate-control window.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeParams {
+    /// CBR target, bits per second.
+    pub bitrate: u32,
+    /// Frames between periodic IDRs. High quality uses a very large value.
+    pub gop_frames: u32,
+    /// H.264 High profile, higher bitrate, IDR only on demand.
+    pub high_quality: bool,
+    /// 120 fps class: keep frame rate. Otherwise keep every picture.
+    pub game: bool,
+    /// Rate-control window. About two frames when [`Self::high_quality`].
+    pub rc_window_ms: u32,
 }
 
 /// Length-prefixed NALs (AVCC) become Annex-B start codes. Annex-B input is copied.
@@ -141,17 +162,20 @@ mod platform {
         IDXGIDevice, IDXGIFactory1,
     };
     use windows::Win32::Media::MediaFoundation::{
-        CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+        CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonLowLatency,
+        CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+        CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
         CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-        CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-        IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform, MEError,
-        METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
-        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
-        MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-        MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
-        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-        MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
-        MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
+        CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame,
+        CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIDeviceManager,
+        IMFMediaEventGenerator, IMFSample, IMFTransform, MEError, METransformHaveOutput,
+        METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
+        MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
+        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+        MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+        MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+        MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+        MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
         MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
         MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH,
         MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
@@ -159,13 +183,13 @@ mod platform {
         MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
         MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
-        eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase,
+        eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_High,
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4};
     use windows::core::Interface;
 
-    use super::{AccessUnit, hardware_bitrate, to_annex_b};
+    use super::{AccessUnit, EncodeParams, to_annex_b};
     use crate::screen::receive::contains_idr;
 
     /// How long to wait for the encoder to accept a frame.
@@ -195,7 +219,12 @@ mod platform {
 
     impl HwEncoder {
         /// Opens a Media Foundation encoder for even `width` x `height` frames at `fps`.
-        pub fn open(width: u32, height: u32, fps: u32) -> Result<Self, String> {
+        pub fn open(
+            width: u32,
+            height: u32,
+            fps: u32,
+            params: EncodeParams,
+        ) -> Result<Self, String> {
             if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
                 return Err(format!(
                     "hardware encoder needs even dimensions, got {width}x{height}"
@@ -203,8 +232,7 @@ mod platform {
             }
             let fps = fps.max(1);
             ensure_mf()?;
-            let bitrate = hardware_bitrate(width, height, fps);
-            unsafe { Self::start(width, height, fps, bitrate) }
+            unsafe { Self::start(width, height, fps, params) }
         }
 
         /// Encodes one tightly packed RGBA frame. `force_idr` starts a new GOP.
@@ -233,7 +261,12 @@ mod platform {
             Ok(units)
         }
 
-        unsafe fn start(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self, String> {
+        unsafe fn start(
+            width: u32,
+            height: u32,
+            fps: u32,
+            params: EncodeParams,
+        ) -> Result<Self, String> {
             let activates =
                 enumerate().map_err(|e| format!("enumerating hardware encoders: {e}"))?;
             if activates.is_empty() {
@@ -242,7 +275,7 @@ mod platform {
             let mut errors = Vec::new();
             for activate in &activates {
                 let name = friendly_name(activate).unwrap_or_else(|| "hardware h264".to_owned());
-                match open_activated(activate, &name, width, height, fps, bitrate) {
+                match open_activated(activate, &name, width, height, fps, params) {
                     Ok(encoder) => return Ok(encoder),
                     Err(error) => {
                         tracing::debug!(encoder = %name, %error, "skipping hardware encoder");
@@ -472,13 +505,13 @@ mod platform {
         width: u32,
         height: u32,
         fps: u32,
-        bitrate: u32,
+        params: EncodeParams,
     ) -> Result<HwEncoder, String> {
         let gpu = open_gpu(encoder_luid(activate))?;
         let transform: IMFTransform = activate
             .ActivateObject()
             .map_err(|e| format!("activating {name}: {e}"))?;
-        let opened = bind(transform.clone(), gpu, name, width, height, fps, bitrate);
+        let opened = bind(transform.clone(), gpu, name, width, height, fps, params);
         if opened.is_err() {
             let _ = activate.ShutdownObject();
         }
@@ -492,7 +525,7 @@ mod platform {
         width: u32,
         height: u32,
         fps: u32,
-        bitrate: u32,
+        params: EncodeParams,
     ) -> Result<HwEncoder, String> {
         let mut is_async = false;
         if let Ok(attrs) = transform.GetAttributes() {
@@ -518,6 +551,7 @@ mod platform {
                 Err(_) => (0, 0),
             };
 
+        let bitrate = params.bitrate;
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
             set_codec(
@@ -531,11 +565,42 @@ mod platform {
             set_codec(
                 api,
                 &CODECAPI_AVEncMPVGOPSize,
-                variant_u32(fps.saturating_mul(2).max(1)),
+                variant_u32(params.gop_frames.max(1)),
             );
+            if params.high_quality {
+                // VBV holds about two frames. The property is in bits.
+                let buffer_bits = bitrate.saturating_mul(2) / fps;
+                set_codec(api, &CODECAPI_AVEncCommonMaxBitRate, variant_u32(bitrate));
+                set_codec(
+                    api,
+                    &CODECAPI_AVEncCommonBufferSize,
+                    variant_u32(buffer_bits.max(1)),
+                );
+                // One reference at 120 fps, two for desktop text.
+                set_codec(
+                    api,
+                    &CODECAPI_AVEncVideoMaxNumRefFrame,
+                    variant_u32(if params.game { 1 } else { 2 }),
+                );
+                set_codec(api, &CODECAPI_AVEncCommonLowLatency, variant_bool(true));
+                // 0 is slowest, 100 is fastest. 33 ≈ NVENC P5, 50 ≈ P4.
+                set_codec(
+                    api,
+                    &CODECAPI_AVEncCommonQualityVsSpeed,
+                    variant_u32(if params.game { 50 } else { 33 }),
+                );
+            }
         }
 
-        set_output_type(&transform, output_stream_id, width, height, fps, bitrate)?;
+        set_output_type(
+            &transform,
+            output_stream_id,
+            width,
+            height,
+            fps,
+            bitrate,
+            params.high_quality,
+        )?;
         set_input_type(&transform, input_stream_id, width, height, fps)?;
 
         let info = transform
@@ -566,6 +631,7 @@ mod platform {
             height,
             fps,
             bitrate,
+            high_quality = params.high_quality,
             async_mft = is_async,
             "hardware h264 encoder"
         );
@@ -763,15 +829,25 @@ mod platform {
         height: u32,
         fps: u32,
         bitrate: u32,
+        high_quality: bool,
     ) -> Result<(), String> {
-        // Constrained Baseline matches the SDP profile and the OpenH264 decoder.
-        // Some drivers only accept plain Baseline; try that next.
-        let profiles = [
-            eAVEncH264VProfile_ConstrainedBase.0 as u32,
-            eAVEncH264VProfile_Base.0 as u32,
-        ];
+        // High profile is the universal fallback in the streaming spec: every
+        // viewer decodes H.264, and High is the best of those. Drivers that
+        // reject it fall through to Constrained Baseline, which OpenH264 still reads.
+        let profiles: &[u32] = if high_quality {
+            &[
+                eAVEncH264VProfile_High.0 as u32,
+                eAVEncH264VProfile_ConstrainedBase.0 as u32,
+                eAVEncH264VProfile_Base.0 as u32,
+            ]
+        } else {
+            &[
+                eAVEncH264VProfile_ConstrainedBase.0 as u32,
+                eAVEncH264VProfile_Base.0 as u32,
+            ]
+        };
         let mut last = String::from("no output type");
-        for profile in profiles {
+        for &profile in profiles {
             let output = match h264_output_type(width, height, fps, bitrate, profile) {
                 Ok(output) => output,
                 Err(e) => {
@@ -921,7 +997,12 @@ mod platform {
 
     impl HwEncoder {
         /// Hardware encode is not available on this platform.
-        pub fn open(_width: u32, _height: u32, _fps: u32) -> Result<Self, String> {
+        pub fn open(
+            _width: u32,
+            _height: u32,
+            _fps: u32,
+            _params: super::EncodeParams,
+        ) -> Result<Self, String> {
             Err("no hardware h264 encoder".into())
         }
 
@@ -963,12 +1044,24 @@ mod tests {
         assert_eq!(h264_level_idc(1920, 1080, 60), 51);
         assert_eq!(h264_level_idc(3840, 2160, 30), 51);
         assert_eq!(h264_level_idc(3840, 2160, 60), 52);
+        assert_eq!(h264_level_idc(2560, 1440, 120), 52);
     }
 
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn hardware_encoder_roundtrips_through_openh264_when_present() {
-        let mut encoder = match HwEncoder::open(320, 240, 30) {
+        let mut encoder = match HwEncoder::open(
+            320,
+            240,
+            30,
+            EncodeParams {
+                bitrate: hardware_bitrate(320, 240, 30),
+                gop_frames: 60,
+                high_quality: false,
+                game: false,
+                rc_window_ms: 1_000,
+            },
+        ) {
             Ok(encoder) => encoder,
             Err(error) => {
                 eprintln!("hardware encoder unavailable: {error}");

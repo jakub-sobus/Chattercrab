@@ -4,13 +4,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use chattercrab_media::ScreenScale;
+use chattercrab_media::{ScreenScale, clamp_input_gain};
 use serde::{Deserialize, Serialize};
 
 /// Default screen-share frame rate (paired with 1440p).
 pub const DEFAULT_SCREEN_FPS: u32 = 60;
-/// Allowed screen-share frame rates.
-pub const SCREEN_FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=60;
+/// Allowed screen-share frame rates. 120 is only used with high quality.
+pub const SCREEN_FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=120;
+/// Highest frame rate when high quality is off.
+pub const STANDARD_SCREEN_FPS_MAX: u32 = 60;
 
 /// Light or dark UI theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -44,12 +46,23 @@ pub struct Config {
     pub output_device: Option<String>,
     /// UI theme.
     pub theme: ThemeChoice,
-    /// Screen-share frame rate (5, 10, 15, 20, 30 or 60).
+    /// Screen-share frame rate (5, 10, 15, 20, 30, 60, or 120 with high quality).
     pub screen_fps: u32,
     /// Screen-share size cap: 4K, 2K, 1440p, or 1080p.
     pub screen_scale: ScreenScale,
     /// Microphone noise suppression (RNNoise) enabled.
     pub noise_suppression: bool,
+    /// Microphone gain. `1.0` is 100%, `5.0` is 500%.
+    #[serde(default = "default_input_gain")]
+    pub input_gain: f32,
+    /// Last choice of the "share audio from other apps" checkbox.
+    pub share_audio: bool,
+    /// Last choice of the high-quality screen share toggle.
+    pub high_quality: bool,
+}
+
+fn default_input_gain() -> f32 {
+    1.0
 }
 
 impl Default for Config {
@@ -65,6 +78,9 @@ impl Default for Config {
             screen_fps: DEFAULT_SCREEN_FPS,
             screen_scale: ScreenScale::P1440,
             noise_suppression: false,
+            input_gain: default_input_gain(),
+            share_audio: false,
+            high_quality: false,
         }
     }
 }
@@ -88,6 +104,7 @@ impl Config {
         config.screen_fps = config
             .screen_fps
             .clamp(*SCREEN_FPS_RANGE.start(), *SCREEN_FPS_RANGE.end());
+        config.input_gain = clamp_input_gain(config.input_gain);
         // The previous default was full capture at 15 fps. That pair now means 1440p60.
         if config.screen_fps == 15 && legacy_screen_scale(&text) {
             config.screen_fps = DEFAULT_SCREEN_FPS;
@@ -127,6 +144,9 @@ impl std::fmt::Debug for Config {
             .field("screen_fps", &self.screen_fps)
             .field("screen_scale", &self.screen_scale)
             .field("noise_suppression", &self.noise_suppression)
+            .field("input_gain", &self.input_gain)
+            .field("share_audio", &self.share_audio)
+            .field("high_quality", &self.high_quality)
             .finish()
     }
 }
@@ -164,6 +184,9 @@ mod tests {
             screen_fps: 60,
             screen_scale: ScreenScale::P1440,
             noise_suppression: true,
+            input_gain: 2.5,
+            share_audio: true,
+            high_quality: true,
         };
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -195,10 +218,11 @@ mod tests {
     fn partial_file_and_fps_clamp() {
         let dir = temp_dir("partial");
         let path = dir.join("config.toml");
-        std::fs::write(&path, "display_name = \"grace\"\nscreen_fps = 120\n").unwrap();
+        std::fs::write(&path, "display_name = \"grace\"\nscreen_fps = 240\n").unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.display_name, "grace");
-        assert_eq!(config.screen_fps, 60);
+        assert_eq!(config.screen_fps, 120);
+        assert!(!config.high_quality);
         assert_eq!(config.screen_scale, ScreenScale::P1440);
         assert_eq!(config.server_url, Config::default().server_url);
         std::fs::remove_dir_all(dir).unwrap();
@@ -251,6 +275,9 @@ screen_fps = 15
         .unwrap();
         let config = Config::load(&path).unwrap();
         assert!(!config.noise_suppression);
+        assert!((config.input_gain - 1.0).abs() < f32::EPSILON);
+        assert!(!config.share_audio);
+        assert!(!config.high_quality);
         assert_eq!(config.display_name, "ada");
         assert_eq!(config.auth_user, "");
         assert!(config.password.is_empty());

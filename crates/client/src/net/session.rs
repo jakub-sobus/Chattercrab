@@ -11,6 +11,16 @@ use chattercrab_protocol::{
 
 use super::{AppEvent, JoinedRoom};
 
+/// A screen share waiting for the server to grant the lock.
+#[derive(Debug, Clone)]
+struct PendingShare {
+    source: ScreenSource,
+    fps: u32,
+    scale: ScreenScale,
+    include_audio: bool,
+    high_quality: bool,
+}
+
 /// Something the backend must do as a consequence of an input.
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -34,7 +44,7 @@ pub struct Session {
     me: Option<PeerId>,
     peers: BTreeMap<PeerId, PeerInfo>,
     screen_publisher: Option<PeerId>,
-    pending_share: Option<(ScreenSource, u32, ScreenScale)>,
+    pending_share: Option<PendingShare>,
     local_sharing: bool,
     /// Last `welcome`, kept current so joining the same room again can refresh
     /// the UI without dropping the socket (which would delete a one-person room).
@@ -171,10 +181,22 @@ impl Session {
                 vec![Effect::Ui(AppEvent::Chat(msg))]
             }
             ServerMsg::ScreenGranted => match self.pending_share.take() {
-                Some((source, fps, scale)) => {
+                Some(PendingShare {
+                    source,
+                    fps,
+                    scale,
+                    include_audio,
+                    high_quality,
+                }) => {
                     self.local_sharing = true;
                     vec![
-                        Effect::Media(MediaCommand::StartScreenShare { source, fps, scale }),
+                        Effect::Media(MediaCommand::StartScreenShare {
+                            source,
+                            fps,
+                            scale,
+                            include_audio,
+                            high_quality,
+                        }),
                         Effect::Ui(AppEvent::LocalShare(true)),
                     ]
                 }
@@ -268,11 +290,19 @@ impl Session {
         source: ScreenSource,
         fps: u32,
         scale: ScreenScale,
+        include_audio: bool,
+        high_quality: bool,
     ) -> Vec<Effect> {
         if self.local_sharing {
             return Vec::new();
         }
-        self.pending_share = Some((source, fps, scale));
+        self.pending_share = Some(PendingShare {
+            source,
+            fps,
+            scale,
+            include_audio,
+            high_quality,
+        });
         vec![Effect::Send(ClientMsg::ScreenRequest)]
     }
 
@@ -479,13 +509,18 @@ mod tests {
     fn screen_share_grant_flow() {
         let mut s = session();
         welcome(&mut s, vec![]);
-        let effects = s.request_share(source(), 15, ScreenScale::P1080);
+        let effects = s.request_share(source(), 15, ScreenScale::P1080, true, true);
         assert!(matches!(effects[0], Effect::Send(ClientMsg::ScreenRequest)));
         let effects = s.on_server_msg(ServerMsg::ScreenGranted);
         assert!(matches!(
             &effects[0],
-            Effect::Media(MediaCommand::StartScreenShare { source: src, fps: 15, scale })
-                if *src == source() && *scale == ScreenScale::P1080
+            Effect::Media(MediaCommand::StartScreenShare {
+                source: src,
+                fps: 15,
+                scale,
+                include_audio: true,
+                high_quality: true,
+            }) if *src == source() && *scale == ScreenScale::P1080
         ));
         assert!(s.local_sharing);
         let effects = s.stop_share();
@@ -503,7 +538,7 @@ mod tests {
     fn screen_share_denied_flow() {
         let mut s = session();
         welcome(&mut s, vec![info(2)]);
-        s.request_share(source(), 15, ScreenScale::P1080);
+        s.request_share(source(), 15, ScreenScale::P1080, false, false);
         let effects = s.on_server_msg(ServerMsg::ScreenDenied {
             reason: "p2 is already sharing".into(),
         });
@@ -517,7 +552,7 @@ mod tests {
     fn server_stop_and_capture_failure_stop_local_share() {
         let mut s = session();
         welcome(&mut s, vec![]);
-        s.request_share(source(), 10, ScreenScale::P1080);
+        s.request_share(source(), 10, ScreenScale::P1080, false, false);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_server_msg(ServerMsg::ScreenStopped);
         assert!(matches!(
@@ -526,7 +561,7 @@ mod tests {
         ));
         assert!(!s.local_sharing);
 
-        s.request_share(source(), 10, ScreenScale::P1080);
+        s.request_share(source(), 10, ScreenScale::P1080, false, false);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_media_event(MediaEvent::LocalScreenStopped);
         assert!(matches!(effects[0], Effect::Send(ClientMsg::ScreenStop)));
@@ -537,7 +572,7 @@ mod tests {
     fn disconnect_tears_down_peers_and_share() {
         let mut s = session();
         welcome(&mut s, vec![info(2)]);
-        s.request_share(source(), 10, ScreenScale::P1080);
+        s.request_share(source(), 10, ScreenScale::P1080, false, false);
         s.on_server_msg(ServerMsg::ScreenGranted);
         let effects = s.on_disconnected();
         assert!(matches!(

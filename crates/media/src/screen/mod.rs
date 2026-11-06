@@ -35,8 +35,19 @@ pub const MAX_WIDTH: u32 = 4096;
 pub const MAX_HEIGHT: u32 = 2304;
 /// Default frame rate.
 pub const DEFAULT_FPS: u32 = 15;
-/// Allowed frame-rate range.
-pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=60;
+/// Allowed frame-rate range. 120 is the high-quality game preset.
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=120;
+/// Highest frame rate of a standard (not high-quality) share.
+pub const STANDARD_MAX_FPS: u32 = 60;
+/// Periodic IDR distance in high quality. Far enough that a call never hits it;
+/// a viewer PLI/FIR still inserts an IDR, and those requests are limited to one
+/// a second across every viewer.
+const HIGH_QUALITY_GOP: u32 = 65_535;
+/// 1440p60 desktop target for H.264. The spec's HEVC text rate is 25–35 Mbps;
+/// H.264 needs about 1.5× that, which lands in the 40–70 Mbps fallback band.
+const HQ_TEXT_1440P60: u64 = 45_000_000;
+/// 1440p120 game target for H.264. HEVC game rate is 35–50 Mbps; 1.5× is 60 Mbps.
+const HQ_GAME_1440P120: u64 = 60_000_000;
 /// Floor for the rate-control target, so a small window is not starved.
 const MIN_BITRATE_BPS: u64 = 2_000_000;
 /// Ceiling for the rate-control target. High enough for 2160p60 on a one-to-one share.
@@ -123,6 +134,91 @@ pub fn target_bitrate(width: u32, height: u32, fps: u32) -> u32 {
     bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS) as u32
 }
 
+/// Clamps `fps` to the range the chosen quality mode can encode.
+pub fn clamp_fps(fps: u32, high_quality: bool) -> u32 {
+    let max = if high_quality {
+        *FPS_RANGE.end()
+    } else {
+        STANDARD_MAX_FPS
+    };
+    fps.clamp(*FPS_RANGE.start(), max)
+}
+
+/// High-quality CBR target, scaled from 1440p by pixel count and frame rate.
+///
+/// 60 fps and below is the desktop preset (keep every picture). 90 fps and
+/// above is the game preset (keep frame rate). The ceiling is 120 Mbps.
+pub fn high_quality_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    let fps = u64::from(fps.max(1));
+    let game = fps >= 90;
+    let (reference, ref_fps) = if game {
+        (HQ_GAME_1440P120, 120)
+    } else {
+        (HQ_TEXT_1440P60, 60)
+    };
+    let pixels = u64::from(width) * u64::from(height);
+    let ref_pixels = 2560 * 1440;
+    let bps = reference.saturating_mul(pixels) / ref_pixels * fps / ref_fps;
+    bps.clamp(4_000_000, 120_000_000) as u32
+}
+
+/// `profile-level-id` the bitstream uses. Viewers advertise level 5.2 High
+/// (`640034`); fmtp matching ignores the level byte, and the SPS carries the
+/// real level. 1440p120 and 4K60 need level 5.2 (`640034`); slower shares fit
+/// in level 5.1 (`640033`).
+pub fn h264_profile_level_id(
+    high_quality: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> &'static str {
+    if !high_quality {
+        "42e034"
+    } else if hw::h264_level_idc(width, height, fps) >= 52 {
+        "640034"
+    } else {
+        "640033"
+    }
+}
+
+/// Encoder operating point. One encode is fanned out to every viewer, and every
+/// viewer decodes H.264, so high quality is H.264 High rather than HEVC or AV1.
+pub fn encode_params(
+    high_quality: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+    hardware: bool,
+) -> hw::EncodeParams {
+    let fps = fps.max(1);
+    let game = high_quality && fps >= 90;
+    let bitrate = if high_quality {
+        high_quality_bitrate(width, height, fps)
+    } else if hardware {
+        hw::hardware_bitrate(width, height, fps)
+    } else {
+        target_bitrate(width, height, fps)
+    };
+    let gop_frames = if high_quality {
+        HIGH_QUALITY_GOP
+    } else {
+        fps.saturating_mul(2).max(1)
+    };
+    // Two frames of rate-control delay. 1000 ms is the standard share's window.
+    let rc_window_ms = if high_quality {
+        (2_000 / fps).max(1)
+    } else {
+        1_000
+    };
+    hw::EncodeParams {
+        bitrate,
+        gop_frames,
+        high_quality,
+        game,
+        rc_window_ms,
+    }
+}
+
 /// Largest even size that fits within `max_w` x `max_h`, preserving aspect ratio.
 pub fn fit_dimensions(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
@@ -183,7 +279,8 @@ impl std::fmt::Debug for ScreenPublisher {
 }
 
 impl ScreenPublisher {
-    /// Opens `source` and starts capturing at `fps` (clamped to 5..=60) and `scale`.
+    /// Opens `source` and starts capturing at `fps` and `scale`.
+    /// `fps` is clamped to 5..=60, or 5..=120 when `high_quality` is set.
     /// `keyframe` is polled every frame; when set, the next frame is an IDR. Blocks
     /// until the source is opened.
     pub fn start(
@@ -191,8 +288,9 @@ impl ScreenPublisher {
         fps: u32,
         scale: ScreenScale,
         keyframe: Arc<AtomicBool>,
+        high_quality: bool,
     ) -> Result<Self, MediaError> {
-        let fps = fps.clamp(*FPS_RANGE.start(), *FPS_RANGE.end());
+        let fps = clamp_fps(fps, high_quality);
         let (tx, rx) = mpsc::channel(VIDEO_CHANNEL_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), MediaError>>(1);
@@ -207,7 +305,7 @@ impl ScreenPublisher {
                     let first = target.capture()?;
                     let (width, height) = (first.width(), first.height());
                     let (tw, th) = encode_dimensions(width, height, scale);
-                    let encoder = ScreenEncoder::open(fps, tw, th)?;
+                    let encoder = ScreenEncoder::open(fps, tw, th, high_quality)?;
                     Ok((target, first, encoder, (tw, th)))
                 });
                 match opened {
@@ -217,10 +315,12 @@ impl ScreenPublisher {
                             target,
                             fps,
                             scale,
+                            high_quality,
                             encoder,
                             encoded,
                             keyframe,
                             last_keyframe_request: None,
+                            last_slow_encode: None,
                             tx,
                             stop: thread_stop,
                         }
@@ -239,7 +339,7 @@ impl ScreenPublisher {
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => {
-                tracing::info!(source = %source.name, fps, "screen publisher started");
+                tracing::info!(source = %source.name, fps, high_quality, "screen publisher started");
                 Ok(publisher)
             }
             Ok(Err(e)) => Err(e),
@@ -262,19 +362,54 @@ impl Drop for ScreenPublisher {
     }
 }
 
-fn new_encoder(fps: u32, width: u32, height: u32) -> Result<Encoder, MediaError> {
+fn openh264_level(high_quality: bool, width: u32, height: u32, fps: u32) -> Level {
+    if high_quality && hw::h264_level_idc(width, height, fps) < 52 {
+        Level::Level_5_1
+    } else {
+        Level::Level_5_2
+    }
+}
+
+fn new_encoder(
+    fps: u32,
+    width: u32,
+    height: u32,
+    params: hw::EncodeParams,
+) -> Result<Encoder, MediaError> {
+    let profile = if params.high_quality {
+        Profile::High
+    } else {
+        Profile::Baseline
+    };
+    let complexity = if !params.high_quality {
+        Complexity::Low
+    } else if params.game {
+        Complexity::Medium
+    } else {
+        Complexity::High
+    };
+    // Game mode is motion: keep the frame rate. Desktop mode keeps every picture.
+    let usage = if params.game {
+        UsageType::CameraVideoRealTime
+    } else {
+        UsageType::ScreenContentRealTime
+    };
+    // OpenH264 only honors the bitrate target when frame skip is enabled, and it
+    // has no spatial AQ or background detection for screen content. The high
+    // target is large enough that a normal desktop rarely skips a picture.
+    // Game mode (camera usage) keeps adaptive quantization and a long GOP.
     let config = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(target_bitrate(width, height, fps)))
+        .bitrate(BitRate::from_bps(params.bitrate))
         .max_frame_rate(FrameRate::from_hz(fps as f32))
-        .usage_type(UsageType::ScreenContentRealTime)
+        .usage_type(usage)
         .rate_control_mode(RateControlMode::Bitrate)
-        .profile(Profile::Baseline)
-        .level(Level::Level_5_2)
-        .complexity(Complexity::Low)
-        .intra_frame_period(IntraFramePeriod::from_num_frames(fps * 2))
-        // OpenH264 only honors the bitrate target when skipping is enabled.
-        // The target above is high enough that a normal desktop rarely skips;
-        // a starved target skips every other picture and the view flashes.
+        .profile(profile)
+        .level(openh264_level(params.high_quality, width, height, fps))
+        .complexity(complexity)
+        .intra_frame_period(IntraFramePeriod::from_num_frames(params.gop_frames.max(1)))
+        .scene_change_detect(!(params.high_quality && params.game))
+        .adaptive_quantization(params.game)
+        .background_detection(false)
         .skip_frames(true);
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .map_err(|e| MediaError::Codec(format!("openh264 encoder: {e}")))
@@ -294,9 +429,10 @@ struct SoftwareEncoder {
 }
 
 impl SoftwareEncoder {
-    fn open(fps: u32, width: u32, height: u32) -> Result<Self, MediaError> {
+    fn open(fps: u32, width: u32, height: u32, high_quality: bool) -> Result<Self, MediaError> {
+        let params = encode_params(high_quality, width, height, fps, false);
         Ok(Self {
-            encoder: new_encoder(fps, width, height)?,
+            encoder: new_encoder(fps, width, height, params)?,
             yuv: YUVBuffer::new(width as usize, height as usize),
             width: width as usize,
             height: height as usize,
@@ -330,13 +466,17 @@ impl SoftwareEncoder {
 }
 
 impl ScreenEncoder {
-    fn open(fps: u32, width: u32, height: u32) -> Result<Self, MediaError> {
-        match hw::HwEncoder::open(width, height, fps) {
+    fn open(fps: u32, width: u32, height: u32, high_quality: bool) -> Result<Self, MediaError> {
+        let params = encode_params(high_quality, width, height, fps, true);
+        match hw::HwEncoder::open(width, height, fps, params) {
             Ok(encoder) => Ok(Self::Hardware(encoder)),
             Err(error) => {
                 tracing::warn!(%error, "hardware h264 unavailable, using openh264");
                 Ok(Self::Software(Box::new(SoftwareEncoder::open(
-                    fps, width, height,
+                    fps,
+                    width,
+                    height,
+                    high_quality,
                 )?)))
             }
         }
@@ -359,10 +499,12 @@ struct CaptureWorker {
     target: Target,
     fps: u32,
     scale: ScreenScale,
+    high_quality: bool,
     encoder: ScreenEncoder,
     encoded: (u32, u32),
     keyframe: Arc<AtomicBool>,
     last_keyframe_request: Option<Instant>,
+    last_slow_encode: Option<Instant>,
     tx: mpsc::Sender<EncodedVideo>,
     stop: Arc<AtomicBool>,
 }
@@ -399,7 +541,7 @@ impl CaptureWorker {
             let (sw, sh) = image.dimensions();
             let (tw, th) = encode_dimensions(sw, sh, self.scale);
             if (tw, th) != self.encoded {
-                match ScreenEncoder::open(self.fps, tw, th) {
+                match ScreenEncoder::open(self.fps, tw, th, self.high_quality) {
                     Ok(encoder) => {
                         self.encoder = encoder;
                         self.encoded = (tw, th);
@@ -432,8 +574,23 @@ impl CaptureWorker {
             };
             let force_idr = self.keyframe.swap(false, Ordering::Relaxed);
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            let encode_started = Instant::now();
             match self.encoder.encode(rgba, force_idr, elapsed_ms) {
                 Ok(units) => {
+                    if self.high_quality {
+                        let took = encode_started.elapsed();
+                        let overdue = self
+                            .last_slow_encode
+                            .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
+                        if took > period && overdue {
+                            tracing::warn!(
+                                ?took,
+                                ?period,
+                                "high quality encode missed the frame budget"
+                            );
+                            self.last_slow_encode = Some(Instant::now());
+                        }
+                    }
                     for unit in units {
                         if unit.data.is_empty() {
                             continue;
@@ -538,8 +695,39 @@ mod tests {
     }
 
     #[test]
+    fn high_quality_bitrate_matches_the_1440p_presets() {
+        assert_eq!(high_quality_bitrate(2560, 1440, 60), 45_000_000);
+        assert_eq!(high_quality_bitrate(2560, 1440, 30), 22_500_000);
+        assert_eq!(high_quality_bitrate(2560, 1440, 120), 60_000_000);
+        assert_eq!(high_quality_bitrate(1920, 1080, 60), 25_312_500);
+        assert_eq!(high_quality_bitrate(1920, 1080, 120), 33_750_000);
+        assert_eq!(clamp_fps(120, false), 60);
+        assert_eq!(clamp_fps(120, true), 120);
+        assert_eq!(clamp_fps(4, true), 5);
+        assert_eq!(h264_profile_level_id(false, 2560, 1440, 60), "42e034");
+        assert_eq!(h264_profile_level_id(true, 2560, 1440, 60), "640033");
+        assert_eq!(h264_profile_level_id(true, 2560, 1440, 120), "640034");
+        assert_eq!(h264_profile_level_id(true, 3840, 2160, 60), "640034");
+        let desktop = encode_params(true, 2560, 1440, 60, false);
+        assert!(desktop.high_quality);
+        assert!(!desktop.game);
+        assert_eq!(desktop.bitrate, 45_000_000);
+        assert_eq!(desktop.gop_frames, HIGH_QUALITY_GOP);
+        assert_eq!(desktop.rc_window_ms, 2_000 / 60);
+        let game = encode_params(true, 2560, 1440, 120, true);
+        assert!(game.game);
+        assert_eq!(game.bitrate, 60_000_000);
+        assert_eq!(game.rc_window_ms, 2_000 / 120);
+        let standard = encode_params(false, 2560, 1440, 60, true);
+        assert!(!standard.high_quality);
+        assert_eq!(standard.gop_frames, 120);
+        assert_eq!(standard.bitrate, hw::hardware_bitrate(2560, 1440, 60));
+    }
+
+    #[test]
     fn encoder_produces_idr_then_decodes() {
-        let mut enc = new_encoder(15, 320, 240).unwrap();
+        let params = encode_params(false, 320, 240, 15, false);
+        let mut enc = new_encoder(15, 320, 240, params).unwrap();
         let (w, h) = (320usize, 240usize);
         let mut rgba = vec![0u8; w * h * 4];
         for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -556,5 +744,44 @@ mod tests {
         let frame = receive::decode_to_rgba(&mut dec, &au).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.pixels.len(), 320 * 240 * 4);
+    }
+
+    fn sps_profile_idc(au: &[u8]) -> Option<u8> {
+        let mut i = 0;
+        while i + 4 < au.len() {
+            let (header, next) = if au[i..].starts_with(&[0, 0, 0, 1]) {
+                (i + 4, i + 5)
+            } else if au[i..].starts_with(&[0, 0, 1]) {
+                (i + 3, i + 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            if au[header] & 0x1F == 7 {
+                return au.get(next).copied();
+            }
+            i = next;
+        }
+        None
+    }
+
+    #[test]
+    fn high_quality_encoder_uses_high_profile_and_decodes() {
+        let params = encode_params(true, 320, 240, 60, false);
+        let mut enc = new_encoder(60, 320, 240, params).unwrap();
+        let (w, h) = (320usize, 240usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = [(i % 255) as u8, 32, 200, 255];
+        }
+        let mut yuv = YUVBuffer::new(w, h);
+        yuv.read_rgba8(RgbaSliceU8::new(&rgba, (w, h)));
+        let bs = enc.encode(&yuv).unwrap();
+        assert!(matches!(bs.frame_type(), openh264::encoder::FrameType::IDR));
+        let au = bs.to_vec();
+        assert_eq!(sps_profile_idc(&au), Some(100), "expected High profile");
+        let mut dec = receive::new_decoder().unwrap();
+        let frame = receive::decode_to_rgba(&mut dec, &au).unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (320, 240));
     }
 }

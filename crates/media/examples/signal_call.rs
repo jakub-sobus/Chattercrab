@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         input_device: None,
         output_device: (!args.play).then(|| NO_OUTPUT_DEVICE.to_owned()),
         noise_suppression: false,
+        input_gain: 1.0,
     };
     let diagnostics = MediaDiagnostics {
         test_tone: Some(args.tone),

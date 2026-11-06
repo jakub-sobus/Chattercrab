@@ -64,8 +64,9 @@ display_name = "ada"
 input_device = "Microphone (USB Audio)"   # omit for the system default
 output_device = "Speakers (Realtek)"      # omit for the system default
 theme = "dark"                            # or "light"
-screen_fps = 60                           # 5, 10, 15, 20, 30 or 60
-screen_scale = "1440p"                    # or "1080p"
+screen_fps = 60                           # 5, 10, 15, 20, 30, 60, or 120 with high quality
+screen_scale = "1440p"                    # or "1080p", "2k", "4k"
+high_quality = false                      # H.264 High, higher bitrate, low delay
 noise_suppression = false                 # RNNoise on the microphone input
 ```
 

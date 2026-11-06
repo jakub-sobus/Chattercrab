@@ -26,7 +26,7 @@ use super::va_abi::{
     VaEncSliceParameterBufferH264, VaImage, VaImageFormat, VaPictureH264, picture_fields,
     rate_control_flags, sequence_fields, vui_fields,
 };
-use super::{AccessUnit, h264_level_idc, hardware_bitrate};
+use super::{AccessUnit, EncodeParams, h264_level_idc};
 
 const _: () = assert!(
     size_of::<usize>() == 8,
@@ -52,6 +52,7 @@ pub struct HwEncoder {
     fps: u32,
     bitrate: u32,
     gop: u32,
+    rc_window_ms: u32,
     packed: u32,
     vendor: String,
     device: String,
@@ -72,13 +73,16 @@ struct Reference {
 
 impl HwEncoder {
     /// Opens a VA-API encoder for even `width` x `height` frames at `fps`.
-    pub fn open(width: u32, height: u32, fps: u32) -> Result<Self, String> {
+    pub fn open(width: u32, height: u32, fps: u32, params: EncodeParams) -> Result<Self, String> {
         if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(format!(
                 "hardware encoder needs even dimensions, got {width}x{height}"
             ));
         }
-        let mut encoder = open_device(width, height, fps)?;
+        let mut encoder = open_device(width, height, fps, params.bitrate)?;
+        encoder.gop = params.gop_frames.max(1);
+        encoder.rc_window_ms = params.rc_window_ms.max(1);
+        encoder.bitrate = params.bitrate;
         let blank = vec![0u8; (width as usize) * (height as usize) * 4];
         encoder
             .encode(&blank, true)
@@ -236,7 +240,7 @@ impl HwEncoder {
         let rate = VaEncMiscParameterRateControl {
             bits_per_second: self.bitrate,
             target_percentage: 100,
-            window_size: 1_000,
+            window_size: self.rc_window_ms,
             initial_qp: 26,
             rc_flags: rate_control_flags(self.frames == 0),
             ..VaEncMiscParameterRateControl::default()
@@ -432,12 +436,12 @@ struct Session {
     rate_control: &'static str,
 }
 
-fn open_device(width: u32, height: u32, fps: u32) -> Result<HwEncoder, String> {
+fn open_device(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<HwEncoder, String> {
     let va = Va::load()?;
     let nodes = render_nodes()?;
     let mut errors = Vec::new();
     for node in nodes {
-        match try_node(&va, &node, width, height, fps) {
+        match try_node(&va, &node, width, height, fps, bitrate) {
             Ok(built) => return Ok(built.encoder(va)),
             Err(error) => {
                 tracing::debug!(device = %node.display(), %error, "skipping vaapi device");
@@ -467,6 +471,7 @@ impl Built {
             fps: session.fps,
             bitrate: session.bitrate,
             gop: session.fps.saturating_mul(2).max(1),
+            rc_window_ms: 1_000,
             packed: session.packed,
             vendor: session.vendor,
             device: session.device,
@@ -481,7 +486,14 @@ impl Built {
     }
 }
 
-fn try_node(va: &Va, path: &Path, width: u32, height: u32, fps: u32) -> Result<Built, String> {
+fn try_node(
+    va: &Va,
+    path: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+) -> Result<Built, String> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -501,7 +513,7 @@ fn try_node(va: &Va, path: &Path, width: u32, height: u32, fps: u32) -> Result<B
         dpy,
         active: true,
     };
-    let session = setup(va, dpy, path, width, height, fps, major, minor)?;
+    let session = setup(va, dpy, path, width, height, fps, bitrate, major, minor)?;
     cleanup.active = false;
     drop(cleanup);
     Ok(Built { file, session })
@@ -531,6 +543,7 @@ fn setup(
     width: u32,
     height: u32,
     fps: u32,
+    bitrate: u32,
     major: i32,
     minor: i32,
 ) -> Result<Session, String> {
@@ -604,7 +617,7 @@ fn setup(
         coded_w: grid.coded_w,
         coded_h: grid.coded_h,
         fps,
-        bitrate: hardware_bitrate(width, height, fps.max(1)),
+        bitrate,
         packed,
         vendor,
         device: path.display().to_string(),

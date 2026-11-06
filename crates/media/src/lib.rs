@@ -23,6 +23,8 @@ pub mod peer;
 pub mod screen;
 mod video_queue;
 
+pub use audio::{INPUT_GAIN_MAX, INPUT_GAIN_MIN, clamp_input_gain};
+pub use mixer::PEER_VOLUME_MAX;
 pub use video_queue::{RgbaFrame, VideoFrameQueue};
 
 use chattercrab_protocol::{IceServers, PeerId};
@@ -57,7 +59,7 @@ pub enum MediaError {
 }
 
 /// Initial engine configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MediaConfig {
     /// Input device name; `None` selects the system default.
     pub input_device: Option<String>,
@@ -65,6 +67,19 @@ pub struct MediaConfig {
     pub output_device: Option<String>,
     /// Enable RNNoise-based noise suppression on the microphone input.
     pub noise_suppression: bool,
+    /// Microphone gain. `1.0` is unity, `5.0` is 500%. Clamped when applied.
+    pub input_gain: f32,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            input_device: None,
+            output_device: None,
+            noise_suppression: false,
+            input_gain: 1.0,
+        }
+    }
 }
 
 /// Diagnostic engine options, separate from [`MediaConfig`] so that adding them does not
@@ -244,7 +259,9 @@ pub enum MediaCommand {
     SetDeafened(bool),
     /// Enable or disable microphone noise suppression.
     SetNoiseSuppression(bool),
-    /// Per-peer playback volume, clamped to 0.0..=2.0.
+    /// Microphone gain, clamped to 0.0..=5.0 (`1.0` unity, `5.0` is 500%).
+    SetInputGain(f32),
+    /// Per-peer playback volume, clamped to 0.0..=5.0.
     SetPeerVolume {
         /// Remote peer.
         peer: PeerId,
@@ -259,10 +276,16 @@ pub enum MediaCommand {
     StartScreenShare {
         /// What to capture.
         source: ScreenSource,
-        /// Target frame rate, clamped to 5..=60.
+        /// Target frame rate, clamped to 5..=60, or 5..=120 when `high_quality`.
         fps: u32,
         /// Fit inside 4K, 2K, 1440p, or 1080p. Smaller captures are not scaled up.
         scale: ScreenScale,
+        /// Mix other applications' audio into the outgoing voice for this share.
+        include_audio: bool,
+        /// H.264 High at a fixed high bitrate. 60 fps is the desktop preset
+        /// (keep resolution); 120 fps is the game preset (keep frame rate).
+        /// IDR frames are sent only when a viewer asks, at most once a second.
+        high_quality: bool,
     },
     /// Stop publishing the screen share.
     StopScreenShare,

@@ -156,11 +156,13 @@ impl Backend {
                 input_device,
                 output_device,
                 noise_suppression,
+                input_gain,
             } => {
                 let media = MediaConfig {
                     input_device,
                     output_device,
                     noise_suppression,
+                    input_gain,
                 };
                 self.connect(&server_url, auth_user, password, display_name, media)
                     .await;
@@ -193,6 +195,9 @@ impl Backend {
             UiCommand::SetNoiseSuppression(on) => {
                 self.media(MediaCommand::SetNoiseSuppression(on)).await;
             }
+            UiCommand::SetInputGain(gain) => {
+                self.media(MediaCommand::SetInputGain(gain)).await;
+            }
             UiCommand::SetPeerVolume { peer, volume } => {
                 self.media(MediaCommand::SetPeerVolume { peer, volume })
                     .await;
@@ -210,9 +215,17 @@ impl Backend {
                     let _ = events.send(event).await;
                 });
             }
-            UiCommand::StartScreenShare { source, fps, scale } => {
+            UiCommand::StartScreenShare {
+                source,
+                fps,
+                scale,
+                include_audio,
+                high_quality,
+            } => {
                 if let Some(room) = self.room.as_mut() {
-                    let effects = room.session.request_share(source, fps, scale);
+                    let effects =
+                        room.session
+                            .request_share(source, fps, scale, include_audio, high_quality);
                     self.apply(effects).await;
                 }
             }
@@ -251,11 +264,13 @@ impl Backend {
                     input_device,
                     output_device,
                     noise_suppression,
+                    input_gain,
                 } = media_config;
                 self.media(MediaCommand::SelectInput(input_device)).await;
                 self.media(MediaCommand::SelectOutput(output_device)).await;
                 self.media(MediaCommand::SetNoiseSuppression(noise_suppression))
                     .await;
+                self.media(MediaCommand::SetInputGain(input_gain)).await;
             }
             None => match MediaEngine::start(media_config) {
                 Ok(engine) => self.media = Some(engine),

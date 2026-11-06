@@ -41,6 +41,8 @@ pub enum UiCommand {
         output_device: Option<String>,
         /// Microphone noise suppression.
         noise_suppression: bool,
+        /// Microphone gain (`1.0` unity, `5.0` is 500%).
+        input_gain: f32,
     },
     /// Forget the server and return to the connect screen.
     Disconnect,
@@ -65,7 +67,9 @@ pub enum UiCommand {
     SetDeafened(bool),
     /// Enable or disable microphone noise suppression.
     SetNoiseSuppression(bool),
-    /// Playback volume for one peer (0.0 to 2.0).
+    /// Microphone gain (`1.0` unity, `5.0` is 500%).
+    SetInputGain(f32),
+    /// Playback volume for one peer (0.0 to 5.0).
     SetPeerVolume {
         /// Remote peer.
         peer: PeerId,
@@ -82,6 +86,10 @@ pub enum UiCommand {
         fps: u32,
         /// Original size or half size.
         scale: chattercrab_media::ScreenScale,
+        /// Mix other applications' audio into the outgoing voice.
+        include_audio: bool,
+        /// H.264 High at a fixed high bitrate. 120 fps is the game preset.
+        high_quality: bool,
     },
     /// Stop publishing the screen.
     StopScreenShare,
@@ -100,6 +108,7 @@ impl std::fmt::Debug for UiCommand {
                 input_device,
                 output_device,
                 noise_suppression,
+                input_gain,
             } => f
                 .debug_struct("UiCommand::Connect")
                 .field("server_url", server_url)
@@ -109,6 +118,7 @@ impl std::fmt::Debug for UiCommand {
                 .field("input_device", input_device)
                 .field("output_device", output_device)
                 .field("noise_suppression", noise_suppression)
+                .field("input_gain", input_gain)
                 .finish(),
             Self::ListDevices => f.write_str("UiCommand::ListDevices"),
             Self::Disconnect => f.write_str("UiCommand::Disconnect"),
@@ -127,17 +137,29 @@ impl std::fmt::Debug for UiCommand {
                 .debug_tuple("UiCommand::SetNoiseSuppression")
                 .field(on)
                 .finish(),
+            Self::SetInputGain(gain) => f
+                .debug_tuple("UiCommand::SetInputGain")
+                .field(gain)
+                .finish(),
             Self::SetPeerVolume { peer, volume } => f
                 .debug_struct("UiCommand::SetPeerVolume")
                 .field("peer", peer)
                 .field("volume", volume)
                 .finish(),
             Self::ListScreenSources => f.write_str("UiCommand::ListScreenSources"),
-            Self::StartScreenShare { source, fps, scale } => f
+            Self::StartScreenShare {
+                source,
+                fps,
+                scale,
+                include_audio,
+                high_quality,
+            } => f
                 .debug_struct("UiCommand::StartScreenShare")
                 .field("source", source)
                 .field("fps", fps)
                 .field("scale", scale)
+                .field("include_audio", include_audio)
+                .field("high_quality", high_quality)
                 .finish(),
             Self::StopScreenShare => f.write_str("UiCommand::StopScreenShare"),
             Self::Shutdown => f.write_str("UiCommand::Shutdown"),

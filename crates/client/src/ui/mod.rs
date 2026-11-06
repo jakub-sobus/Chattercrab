@@ -4,6 +4,7 @@
 //! to the backend running on its own Tokio runtime thread.
 
 pub mod room_model;
+mod selectable;
 mod view;
 
 use std::hash::{Hash, Hasher};
@@ -18,7 +19,7 @@ use iced::{Subscription, Task, Theme, keyboard, window};
 use iced_runtime::image::Allocation;
 use tokio::sync::mpsc;
 
-use crate::config::{Config, SCREEN_FPS_RANGE, ThemeChoice};
+use crate::config::{Config, SCREEN_FPS_RANGE, STANDARD_SCREEN_FPS_MAX, ThemeChoice};
 use crate::net::{AppEvent, UiCommand};
 use room_model::RoomModel;
 
@@ -59,6 +60,10 @@ pub struct SharePicker {
     pub fps: u32,
     /// 4K, 2K, 1440p, or 1080p cap.
     pub scale: ScreenScale,
+    /// Mix other applications' audio into the outgoing voice.
+    pub include_audio: bool,
+    /// H.264 High, higher fixed bitrate, low delay. 120 fps is the game preset.
+    pub high_quality: bool,
 }
 
 /// A [`ScreenSource`] with a display label, for pick lists.
@@ -152,6 +157,10 @@ pub enum Message {
     DarkTheme(bool),
     /// Noise suppression toggled (connect screen or room bar).
     NoiseSuppression(bool),
+    /// Microphone gain slider moved (`1.0` is 100%, `5.0` is 500%).
+    InputGainChanged(f32),
+    /// Microphone gain slider released; persist the value.
+    InputGainReleased,
     /// Re-list audio devices.
     RefreshDevices,
     /// Connect button.
@@ -182,6 +191,10 @@ pub enum Message {
     ShareFpsSelected(u32),
     /// Resolution picked.
     ShareScaleSelected(ScreenScale),
+    /// "Share audio from other apps" toggled.
+    ShareAudioToggled(bool),
+    /// High-quality screen share toggled.
+    ShareHighQualityToggled(bool),
     /// Start sharing the picked source.
     StartShare,
     /// Close the picker.
@@ -369,6 +382,14 @@ impl App {
                     self.send(UiCommand::SetNoiseSuppression(on));
                 }
             }
+            Message::InputGainChanged(gain) => {
+                let gain = chattercrab_media::clamp_input_gain(gain);
+                self.config.input_gain = gain;
+                if !matches!(self.state.screen, Screen::Connect { .. }) {
+                    self.send(UiCommand::SetInputGain(gain));
+                }
+            }
+            Message::InputGainReleased => self.save_config(),
             Message::RefreshDevices => self.send(UiCommand::ListDevices),
             Message::Connect => self.connect(),
             Message::Disconnect => {
@@ -440,14 +461,26 @@ impl App {
                 }
             }
             Message::OpenSharePicker => {
-                let fps = self.config.screen_fps;
+                let high_quality = self.config.high_quality;
+                let max_fps = if high_quality {
+                    *SCREEN_FPS_RANGE.end()
+                } else {
+                    STANDARD_SCREEN_FPS_MAX
+                };
+                let fps = self
+                    .config
+                    .screen_fps
+                    .clamp(*SCREEN_FPS_RANGE.start(), max_fps);
                 let scale = self.config.screen_scale;
+                let include_audio = self.config.share_audio;
                 if let Some(room) = self.room_mut() {
                     room.picker = Some(SharePicker {
                         sources: Vec::new(),
                         selected: None,
                         fps,
                         scale,
+                        include_audio,
+                        high_quality,
                     });
                     self.send(UiCommand::ListScreenSources);
                 }
@@ -459,28 +492,71 @@ impl App {
             }
             Message::ShareFpsSelected(fps) => {
                 if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
-                    picker.fps = fps.clamp(*SCREEN_FPS_RANGE.start(), *SCREEN_FPS_RANGE.end());
+                    let max_fps = if picker.high_quality {
+                        *SCREEN_FPS_RANGE.end()
+                    } else {
+                        STANDARD_SCREEN_FPS_MAX
+                    };
+                    picker.fps = fps.clamp(*SCREEN_FPS_RANGE.start(), max_fps);
                 }
             }
             Message::ShareScaleSelected(scale) => {
                 if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
+                    let keep_game = picker.high_quality && picker.fps >= 90;
                     picker.fps = match scale {
                         ScreenScale::P1080 => 30,
+                        ScreenScale::P1440 | ScreenScale::P2K | ScreenScale::P4K if keep_game => {
+                            120
+                        }
                         ScreenScale::P1440 | ScreenScale::P2K | ScreenScale::P4K => 60,
                     };
                     picker.scale = scale;
                 }
             }
+            Message::ShareAudioToggled(on) => {
+                self.config.share_audio = on;
+                self.save_config();
+                if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
+                    picker.include_audio = on;
+                }
+            }
+            Message::ShareHighQualityToggled(on) => {
+                self.config.high_quality = on;
+                if !on && self.config.screen_fps > STANDARD_SCREEN_FPS_MAX {
+                    self.config.screen_fps = STANDARD_SCREEN_FPS_MAX;
+                }
+                self.save_config();
+                if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
+                    picker.high_quality = on;
+                    if !on && picker.fps > STANDARD_SCREEN_FPS_MAX {
+                        picker.fps = STANDARD_SCREEN_FPS_MAX;
+                    }
+                }
+            }
             Message::StartShare => {
-                let picked = self
-                    .room_mut()
-                    .and_then(|r| r.picker.take())
-                    .and_then(|p| p.selected.map(|s| (s.0, p.fps, p.scale)));
-                if let Some((source, fps, scale)) = picked {
+                let picked = self.room_mut().and_then(|r| r.picker.take()).and_then(|p| {
+                    p.selected
+                        .map(|s| (s.0, p.fps, p.scale, p.include_audio, p.high_quality))
+                });
+                if let Some((source, fps, scale, include_audio, high_quality)) = picked {
+                    let max_fps = if high_quality {
+                        *SCREEN_FPS_RANGE.end()
+                    } else {
+                        STANDARD_SCREEN_FPS_MAX
+                    };
+                    let fps = fps.clamp(*SCREEN_FPS_RANGE.start(), max_fps);
                     self.config.screen_fps = fps;
                     self.config.screen_scale = scale;
+                    self.config.share_audio = include_audio;
+                    self.config.high_quality = high_quality;
                     self.save_config();
-                    self.send(UiCommand::StartScreenShare { source, fps, scale });
+                    self.send(UiCommand::StartScreenShare {
+                        source,
+                        fps,
+                        scale,
+                        include_audio,
+                        high_quality,
+                    });
                 }
             }
             Message::CancelShare => {
@@ -499,7 +575,7 @@ impl App {
             }
             Message::PeerVolumeChanged(peer, volume) => {
                 if let Some(m) = self.room_mut().and_then(|r| r.model.member_mut(peer)) {
-                    m.volume = volume.clamp(0.0, 2.0);
+                    m.volume = volume.clamp(0.0, chattercrab_media::PEER_VOLUME_MAX);
                 }
             }
             Message::PeerVolumeCommitted(peer) => self.push_peer_volume(peer),
@@ -610,6 +686,7 @@ impl App {
             input_device: self.config.input_device.clone(),
             output_device: self.config.output_device.clone(),
             noise_suppression: self.config.noise_suppression,
+            input_gain: self.config.input_gain,
         });
     }
 
