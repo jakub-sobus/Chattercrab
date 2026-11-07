@@ -6,11 +6,14 @@
 //! Linux uses VA-API when libva and a driver are installed. High quality is
 //! H.264 High on both, with the same bitrate, GOP, and two-frame rate control.
 //! Otherwise the publisher uses OpenH264. Encoded access units (Annex-B) leave
-//! through a bounded channel.
+//! through a channel that holds one second of frames. A full channel blocks
+//! capture instead of dropping pictures, so a viewer can play the stream late
+//! and smooth rather than with gaps.
 //!
 //! Receiver: see [`receive`].
 
 mod hw;
+mod playout;
 pub mod receive;
 
 use std::sync::Arc;
@@ -55,11 +58,11 @@ const HQ_GAME_1440P60: u64 = 60_000_000;
 const MIN_BITRATE_BPS: u64 = 2_000_000;
 /// Ceiling for the rate-control target. High enough for 2160p60 on a one-to-one share.
 const MAX_BITRATE_BPS: u64 = 80_000_000;
-/// Encoded frames buffered towards the network.
-const VIDEO_CHANNEL_CAPACITY: usize = 8;
-/// How often a backed-up sender may ask for an IDR. Asking on every dropped
-/// frame makes the encoder fall further behind and the picture flash.
+/// How often a slow high-quality encode is logged.
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
+/// Longest presentation gap stamped onto one captured picture. A longer stall
+/// shows up as the viewer rebuffering instead of one frozen timestamp.
+const MAX_FRAME_GAP: Duration = Duration::from_secs(1);
 /// Consecutive capture failures after which publishing stops.
 const MAX_CAPTURE_FAILURES: u32 = 30;
 
@@ -296,7 +299,9 @@ impl ScreenPublisher {
     ) -> Result<Self, MediaError> {
         let fps = clamp_fps(fps, high_quality);
         let game = content.is_game();
-        let (tx, rx) = mpsc::channel(VIDEO_CHANNEL_CAPACITY);
+        // One second of encoded pictures. `blocking_send` waits when this is full
+        // instead of dropping a frame (a drop is what makes the share stutter).
+        let (tx, rx) = mpsc::channel(fps.max(1) as usize);
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), MediaError>>(1);
         let source_owned = source.clone();
@@ -325,7 +330,6 @@ impl ScreenPublisher {
                             encoder,
                             encoded,
                             keyframe,
-                            last_keyframe_request: None,
                             last_slow_encode: None,
                             tx,
                             stop: thread_stop,
@@ -523,7 +527,6 @@ struct CaptureWorker {
     encoder: ScreenEncoder,
     encoded: (u32, u32),
     keyframe: Arc<AtomicBool>,
-    last_keyframe_request: Option<Instant>,
     last_slow_encode: Option<Instant>,
     tx: mpsc::Sender<EncodedVideo>,
     stop: Arc<AtomicBool>,
@@ -541,6 +544,7 @@ impl CaptureWorker {
         let mut failures = 0u32;
         let mut pending = Some(first);
         let mut next = Instant::now();
+        let mut last_capture = Instant::now();
 
         while !self.stop.load(Ordering::Acquire) {
             let image = match pending.take().map_or_else(|| self.target.capture(), Ok) {
@@ -611,30 +615,32 @@ impl CaptureWorker {
                             self.last_slow_encode = Some(Instant::now());
                         }
                     }
+                    let captured_at = Instant::now();
+                    let gap = captured_at.saturating_duration_since(last_capture);
+                    last_capture = captured_at;
+                    // Stamp the real gap so a slow encode holds the previous picture
+                    // instead of making the next frames bunch up on the viewer.
+                    let stretched = gap.clamp(period, MAX_FRAME_GAP);
+                    let mut stamped_gap = false;
                     for unit in units {
                         if unit.data.is_empty() {
                             continue;
                         }
+                        let duration = if stamped_gap {
+                            period
+                        } else {
+                            stamped_gap = true;
+                            stretched
+                        };
                         let frame = EncodedVideo {
                             data: Bytes::from(unit.data),
-                            duration: period,
+                            duration,
                             keyframe: unit.keyframe,
                         };
-                        match self.tx.try_send(frame) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // One late IDR resyncs a dropped picture. Requesting one
-                                // on every drop makes each following frame an IDR, which
-                                // flashes and falls further behind.
-                                let due = self
-                                    .last_keyframe_request
-                                    .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
-                                if due {
-                                    self.keyframe.store(true, Ordering::Relaxed);
-                                    self.last_keyframe_request = Some(Instant::now());
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        // Blocks once a second of frames is queued. Shutdown drops
+                        // the receiver, which unblocks this send.
+                        if self.tx.blocking_send(frame).is_err() {
+                            return;
                         }
                     }
                 }

@@ -3,7 +3,9 @@
 //! The GUI never touches WebRTC or audio devices directly. It starts a [`MediaEngine`],
 //! sends [`MediaCommand`]s and reacts to [`MediaEvent`]s, all over bounded
 //! `tokio::sync::mpsc` channels. Decoded remote screen-share frames are delivered
-//! through a [`VideoFrameQueue`] (capacity 2, oldest frame dropped when full).
+//! through a [`VideoFrameQueue`]. The queue keeps the frames it already has when it
+//! is full; the screen receiver plays them on a clock up to one second behind the
+//! sender so a jittery share stays smooth.
 //!
 //! The types in this file are the public API contract shared by the media engine and
 //! the client (additive changes are recorded in `API_CHANGES.md`). The building blocks

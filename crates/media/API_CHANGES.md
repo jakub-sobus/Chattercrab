@@ -29,6 +29,12 @@ Behavior notes for the client (no type changes):
   `LocalScreenStopped`), because the server releases the screen lock when the socket drops.
 - `MediaEvent::Levels` is emitted only between `Configure` and `RemoveAllPeers`, and is
   dropped rather than queued when the event channel is full.
+- A remote screen share is played up to one second behind the sender. The
+  receiver holds encoded frames and shows them on the RTP clock, so a burst or a
+  slow upload becomes delay instead of a dropped or late picture. Past one second
+  it skips pictures until the buffer fits in that second again and keeps the
+  spacing even. `VideoFrameQueue` no longer drops the oldest frame when it is full:
+  `push` waits for a free slot and `try_push` returns the frame it could not store.
 - Local audio and video are sent to a peer only after its connection reached
   `Connected` (and while it is transiently `Disconnected`), not during negotiation.
 - `MediaEvent::RemoteScreenEnded` fires when the remote video track ends. The client

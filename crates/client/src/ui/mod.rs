@@ -9,6 +9,7 @@ mod view;
 
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chattercrab_media::{RgbaFrame, ScreenContent, ScreenScale, ScreenSource, VideoFrameQueue};
@@ -17,7 +18,7 @@ use iced::futures::stream;
 use iced::widget::image;
 use iced::{Subscription, Task, Theme, keyboard, window};
 use iced_runtime::image::Allocation;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::config::{Config, SCREEN_FPS_RANGE, STANDARD_SCREEN_FPS_MAX, ThemeChoice};
 use crate::net::{AppEvent, UiCommand};
@@ -87,6 +88,7 @@ fn clear_share_frame(room: &mut RoomScreen) {
     room.frame_memory = None;
     room.pending_frame = None;
     room.frame_loading = false;
+    room.inflight_upload = None;
 }
 
 /// Room screen state.
@@ -103,10 +105,16 @@ pub struct RoomScreen {
     /// Holds the GPU copy of [`Self::frame`]. Dropping it before the next upload
     /// finishes is what makes the picture flash blank between frames.
     frame_memory: Option<Allocation>,
-    /// A frame is uploading; newer frames wait in [`Self::pending_frame`].
+    /// A frame is uploading; the next decoded frame waits in [`Self::pending_frame`].
     frame_loading: bool,
-    /// Newest frame that arrived while an upload was in progress.
+    /// One frame that arrived while an upload was in progress.
     pending_frame: Option<RgbaFrame>,
+    /// Identifies the upload currently in flight, so a late callback is ignored.
+    inflight_upload: Option<u64>,
+    /// Bumps each time a new upload starts.
+    upload_id: u64,
+    /// Bumps when a remote share starts, so the frame subscription restarts.
+    share_epoch: u64,
 }
 
 /// Mutable UI state.
@@ -138,6 +146,8 @@ pub enum Message {
         handle: image::Handle,
         /// GPU allocation, kept alive while this frame is on screen.
         memory: Option<Allocation>,
+        /// Matches [`RoomScreen`]'s in-flight upload. A stale callback is ignored.
+        upload: u64,
     },
     /// Show or leave the fullscreen share view.
     ToggleShareFullscreen,
@@ -241,6 +251,8 @@ pub struct App {
     pending_enter: Option<PendingEnter>,
     /// The window is fullscreen for a remote share.
     share_fullscreen: bool,
+    /// Paces remote frames so one upload finishes before the next frame is taken.
+    video_gate: VideoGate,
 }
 
 impl std::fmt::Debug for App {
@@ -263,12 +275,26 @@ impl Hash for EventBridge {
 }
 
 /// Identity wrapper for the video subscription.
-struct VideoSource(VideoFrameQueue);
+struct VideoSource {
+    queue: VideoFrameQueue,
+    gate: VideoGate,
+    publisher: PeerId,
+    epoch: u64,
+}
 
 impl Hash for VideoSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
         "chattercrab-video".hash(state);
+        self.publisher.hash(state);
+        self.epoch.hash(state);
     }
+}
+
+/// Lets the UI take the next decoded frame only after the previous one is on screen.
+#[derive(Clone)]
+struct VideoGate {
+    permits: Arc<AtomicUsize>,
+    resume: Arc<Notify>,
 }
 
 impl App {
@@ -294,6 +320,10 @@ impl App {
             config_path,
             pending_enter: None,
             share_fullscreen: false,
+            video_gate: VideoGate {
+                permits: Arc::new(AtomicUsize::new(0)),
+                resume: Arc::new(Notify::new()),
+            },
         };
         app.send(UiCommand::ListDevices);
         app
@@ -347,8 +377,12 @@ impl App {
                 }
             }
             Message::VideoFrame(frame) => followup = self.queue_share_frame(frame),
-            Message::FramePresented { handle, memory } => {
-                followup = self.finish_share_frame(handle, memory);
+            Message::FramePresented {
+                handle,
+                memory,
+                upload,
+            } => {
+                followup = self.finish_share_frame(handle, memory, upload);
             }
             Message::ToggleShareFullscreen => {
                 if self.remote_share_visible() {
@@ -624,13 +658,19 @@ impl App {
 
     fn queue_share_frame(&mut self, frame: RgbaFrame) -> Task<Message> {
         let Some(room) = self.room_mut() else {
+            self.release_video_frame();
             return Task::none();
         };
         if !room.model.remote_share_active() {
+            self.release_video_frame();
             return Task::none();
         }
         if room.frame_loading {
-            room.pending_frame = Some(frame);
+            // The subscription only pulls the next frame after this upload
+            // finishes. One waiting frame covers a callback that raced ahead.
+            if room.pending_frame.is_none() {
+                room.pending_frame = Some(frame);
+            }
             return Task::none();
         }
         Self::upload_share_frame(room, frame)
@@ -640,18 +680,25 @@ impl App {
         &mut self,
         handle: image::Handle,
         memory: Option<Allocation>,
+        upload: u64,
     ) -> Task<Message> {
         let Some(room) = self.room_mut() else {
             return Task::none();
         };
+        if room.inflight_upload != Some(upload) {
+            return Task::none();
+        }
+        room.inflight_upload = None;
         room.frame_loading = false;
         if !room.model.remote_share_active() {
             clear_share_frame(room);
+            self.release_video_frame();
             return Task::none();
         }
         room.frame = Some(handle);
         room.frame_memory = memory;
         let Some(next) = room.pending_frame.take() else {
+            self.release_video_frame();
             return Task::none();
         };
         Self::upload_share_frame(room, next)
@@ -659,6 +706,9 @@ impl App {
 
     fn upload_share_frame(room: &mut RoomScreen, frame: RgbaFrame) -> Task<Message> {
         room.frame_loading = true;
+        room.upload_id = room.upload_id.wrapping_add(1);
+        let upload = room.upload_id;
+        room.inflight_upload = Some(upload);
         let handle = image::Handle::from_rgba(
             frame.width,
             frame.height,
@@ -668,7 +718,14 @@ impl App {
         iced_runtime::image::allocate(handle).map(move |result| Message::FramePresented {
             memory: result.ok(),
             handle: shown.clone(),
+            upload,
         })
+    }
+
+    /// The picture is on screen (or was discarded). The subscription may take the next frame.
+    fn release_video_frame(&self) {
+        self.video_gate.permits.fetch_add(1, Ordering::Release);
+        self.video_gate.resume.notify_one();
     }
 
     fn push_peer_volume(&mut self, peer: PeerId) {
@@ -715,6 +772,9 @@ impl App {
             frame_memory: None,
             frame_loading: false,
             pending_frame: None,
+            inflight_upload: None,
+            upload_id: 0,
+            share_epoch: 0,
         }));
     }
 
@@ -782,11 +842,18 @@ impl App {
                 {
                     room.model.apply_joined(joined);
                     clear_share_frame(room);
+                    if room.model.remote_share_active() {
+                        room.share_epoch = room.share_epoch.wrapping_add(1);
+                    }
                 }
             }
             other => {
                 if let Some(room) = self.room_mut() {
+                    let before = room.model.screen_publisher;
                     room.model.apply(&other);
+                    if room.model.screen_publisher != before && room.model.remote_share_active() {
+                        room.share_epoch = room.share_epoch.wrapping_add(1);
+                    }
                     if !room.model.remote_share_active() {
                         clear_share_frame(room);
                     }
@@ -824,14 +891,40 @@ impl App {
         });
         let mut subs = vec![backend, keys];
         if let (Screen::Room(room), Some(video)) = (&self.state.screen, &self.state.video)
+            && let Some(publisher) = room.model.screen_publisher
             && room.model.remote_share_active()
         {
+            let gate = self.video_gate.clone();
             subs.push(Subscription::run_with(
-                VideoSource(video.clone()),
+                VideoSource {
+                    queue: video.clone(),
+                    gate,
+                    publisher,
+                    epoch: room.share_epoch,
+                },
                 |source| {
-                    stream::unfold(source.0.clone(), |queue| async move {
-                        let frame = queue.next().await;
-                        Some((Message::VideoFrame(frame), queue))
+                    // The first frame is taken immediately. Each later frame waits
+                    // until the previous upload has been presented, so frames are
+                    // not dropped or drawn in a burst while the GPU is busy.
+                    source.gate.permits.store(0, Ordering::Release);
+                    let queue = source.queue.clone();
+                    let gate = source.gate.clone();
+                    stream::unfold(false, move |wait| {
+                        let queue = queue.clone();
+                        let gate = gate.clone();
+                        async move {
+                            if wait {
+                                loop {
+                                    let notified = gate.resume.notified();
+                                    if gate.permits.swap(0, Ordering::AcqRel) > 0 {
+                                        break;
+                                    }
+                                    notified.await;
+                                }
+                            }
+                            let frame = queue.next().await;
+                            Some((Message::VideoFrame(frame), true))
+                        }
                     })
                 },
             ));
