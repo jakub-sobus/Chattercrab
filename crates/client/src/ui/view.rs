@@ -1,6 +1,6 @@
 //! View functions for the three screens. Plain widgets, no animations.
 
-use chattercrab_media::{PEER_VOLUME_MAX, PeerConnectionState, ScreenScale};
+use chattercrab_media::{PEER_VOLUME_MAX, PeerConnectionState, ScreenContent, ScreenScale};
 use iced::widget::image::FilterMethod;
 use iced::widget::{
     Column, button, checkbox, column, container, image, pick_list, row, scrollable, slider, space,
@@ -14,6 +14,7 @@ use crate::config::ThemeChoice;
 
 const SPACING: u32 = 8;
 const PADDING: u16 = 12;
+const CONTENT_CHOICES: [ScreenContent; 2] = [ScreenContent::Desktop, ScreenContent::Game];
 const FPS_CHOICES: [u32; 6] = [5, 10, 15, 20, 30, 60];
 const FPS_CHOICES_HQ: [u32; 7] = [5, 10, 15, 20, 30, 60, 120];
 const SCALE_CHOICES: [ScreenScale; 4] = [
@@ -344,6 +345,12 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
     };
     let controls = row![
         sources,
+        text("mode"),
+        pick_list(
+            CONTENT_CHOICES,
+            Some(picker.content),
+            Message::ShareContentSelected,
+        ),
         text("fps"),
         pick_list(fps_choices, Some(picker.fps), Message::ShareFpsSelected),
         text("size"),
@@ -374,10 +381,17 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     ]
     .spacing(SPACING);
+    let mode_hint = match picker.content {
+        ScreenContent::Desktop => {
+            "Crisp fonts and UI. Resolution and frame rate stay as you set them."
+        }
+        ScreenContent::Game => {
+            "Less blur on moving images. Resolution and frame rate stay as you set them."
+        }
+    };
+    picker_column = picker_column.push(text(mode_hint).size(14));
     if picker.high_quality {
-        picker_column = picker_column.push(
-            text("Higher bitrate, low delay. 60 fps for desktop, 120 fps for games.").size(14),
-        );
+        picker_column = picker_column.push(text("Higher bitrate and low delay.").size(14));
     }
     picker_column.into()
 }

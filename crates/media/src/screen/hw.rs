@@ -9,7 +9,8 @@
 //! 1440p at 60 fps and 12 Mbps. High quality requests H.264 High at a higher
 //! fixed bitrate, and 4K60 or 1440p120 uses level 5.2. Linux VA-API uses that
 //! same profile, GOP, and two-frame rate-control window, with two reference
-//! frames for desktop and one at 120 fps.
+//! frames for desktop and one for game. The user picks that mode. Resolution
+//! and frame rate do not.
 //!
 //! The Windows encoder is handed a Direct3D 11 device on the adapter that
 //! registered it. Without that device, `SetOutputType` fails with
@@ -39,7 +40,9 @@ pub struct EncodeParams {
     pub gop_frames: u32,
     /// H.264 High profile, higher bitrate, IDR only on demand.
     pub high_quality: bool,
-    /// 120 fps class: keep frame rate. Otherwise keep every picture.
+    /// Game content: one reference and a faster preset, so moving images stay
+    /// less blurry. Desktop content keeps two references and a slower preset
+    /// for crisp text.
     pub game: bool,
     /// Rate-control window. About two frames when [`Self::high_quality`].
     pub rc_window_ms: u32,
@@ -169,15 +172,15 @@ mod platform {
         CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
         CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
         CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame,
-        CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIDeviceManager,
-        IMFMediaEventGenerator, IMFSample, IMFTransform, MEError, METransformHaveOutput,
-        METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
-        MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
-        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-        MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-        MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
-        MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-        MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
+        CODECAPI_AVLowLatencyMode, CODECAPI_AVScenarioInfo, ICodecAPI, IMFActivate,
+        IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform, MEError,
+        METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
+        MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+        MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+        MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
+        MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
         MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
         MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH,
         MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
@@ -186,6 +189,7 @@ mod platform {
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
         MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
         eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_High,
+        eAVScenarioInfo_DisplayRemoting, eAVScenarioInfo_LiveStreaming,
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4};
@@ -247,10 +251,10 @@ mod platform {
                 ));
             }
             let sample = unsafe { self.input_sample(rgba)? };
-            if (force_idr || self.frames_submitted == 0)
-                && let Some(api) = &self.codec_api
-            {
-                set_codec(api, &CODECAPI_AVEncVideoForceKeyFrame, variant_u32(1));
+            if let Some(api) = &self.codec_api {
+                // Some drivers leave this set, so every later picture becomes an IDR.
+                let force = u32::from(force_idr || self.frames_submitted == 0);
+                set_codec(api, &CODECAPI_AVEncVideoForceKeyFrame, variant_u32(force));
             }
             let transform = self.transform.clone();
             let mut units = Vec::new();
@@ -555,45 +559,9 @@ mod platform {
 
         let bitrate = params.bitrate;
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
-        if let Some(api) = &codec_api {
-            set_codec(
-                api,
-                &CODECAPI_AVEncCommonRateControlMode,
-                variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
-            );
-            set_codec(api, &CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate));
-            set_codec(api, &CODECAPI_AVLowLatencyMode, variant_bool(true));
-            set_codec(api, &CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0));
-            set_codec(
-                api,
-                &CODECAPI_AVEncMPVGOPSize,
-                variant_u32(params.gop_frames.max(1)),
-            );
-            if params.high_quality {
-                // VBV holds about two frames. The property is in bits.
-                let buffer_bits = bitrate.saturating_mul(2) / fps;
-                set_codec(api, &CODECAPI_AVEncCommonMaxBitRate, variant_u32(bitrate));
-                set_codec(
-                    api,
-                    &CODECAPI_AVEncCommonBufferSize,
-                    variant_u32(buffer_bits.max(1)),
-                );
-                // One reference at 120 fps, two for desktop text.
-                set_codec(
-                    api,
-                    &CODECAPI_AVEncVideoMaxNumRefFrame,
-                    variant_u32(if params.game { 1 } else { 2 }),
-                );
-                set_codec(api, &CODECAPI_AVEncCommonLowLatency, variant_bool(true));
-                // 0 is slowest, 100 is fastest. 33 ≈ NVENC P5, 50 ≈ P4.
-                set_codec(
-                    api,
-                    &CODECAPI_AVEncCommonQualityVsSpeed,
-                    variant_u32(if params.game { 50 } else { 33 }),
-                );
-            }
-        }
 
+        // Set the media types first. Media Foundation drops codec properties
+        // that were written before SetOutputType.
         set_output_type(
             &transform,
             output_stream_id,
@@ -604,6 +572,9 @@ mod platform {
             params.high_quality,
         )?;
         set_input_type(&transform, input_stream_id, width, height, fps)?;
+        if let Some(api) = &codec_api {
+            configure_codec(api, fps, bitrate, params);
+        }
 
         let info = transform
             .GetOutputStreamInfo(output_stream_id)
@@ -634,6 +605,7 @@ mod platform {
             fps,
             bitrate,
             high_quality = params.high_quality,
+            game = params.game,
             async_mft = is_async,
             "hardware h264 encoder"
         );
@@ -979,6 +951,58 @@ mod platform {
         var
     }
 
+    /// Rate control, content mode, and the high-quality VBV. Called after both
+    /// media types are set, which is when the encoder keeps the values.
+    fn configure_codec(api: &ICodecAPI, fps: u32, bitrate: u32, params: EncodeParams) {
+        set_codec(
+            api,
+            &CODECAPI_AVEncCommonRateControlMode,
+            variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+        );
+        set_codec(api, &CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate));
+        set_codec(api, &CODECAPI_AVLowLatencyMode, variant_bool(true));
+        set_codec(api, &CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0));
+        set_codec(
+            api,
+            &CODECAPI_AVEncMPVGOPSize,
+            variant_u32(params.gop_frames.max(1)),
+        );
+        // Display remoting keeps text sharp. Live streaming spends bits on motion.
+        let scenario = if params.game {
+            eAVScenarioInfo_LiveStreaming
+        } else {
+            eAVScenarioInfo_DisplayRemoting
+        };
+        set_codec(
+            api,
+            &CODECAPI_AVScenarioInfo,
+            variant_u32(scenario.0 as u32),
+        );
+        if params.high_quality {
+            // VBV holds about two frames. The property is in bits.
+            let buffer_bits = bitrate.saturating_mul(2) / fps.max(1);
+            set_codec(api, &CODECAPI_AVEncCommonMaxBitRate, variant_u32(bitrate));
+            set_codec(
+                api,
+                &CODECAPI_AVEncCommonBufferSize,
+                variant_u32(buffer_bits.max(1)),
+            );
+            // One reference for game motion, two for desktop text.
+            set_codec(
+                api,
+                &CODECAPI_AVEncVideoMaxNumRefFrame,
+                variant_u32(if params.game { 1 } else { 2 }),
+            );
+            set_codec(api, &CODECAPI_AVEncCommonLowLatency, variant_bool(true));
+            // 0 is slowest, 100 is fastest. 33 ≈ NVENC P5, 50 ≈ P4.
+            set_codec(
+                api,
+                &CODECAPI_AVEncCommonQualityVsSpeed,
+                variant_u32(if params.game { 50 } else { 33 }),
+            );
+        }
+    }
+
     fn set_codec(api: &ICodecAPI, guid: &windows::core::GUID, value: VARIANT) {
         unsafe {
             let _ = api.SetValue(guid, &value);
@@ -1105,7 +1129,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn high_quality_hardware_encoder_uses_high_profile_when_present() {
-        let params = crate::screen::encode_params(true, 320, 240, 60, true);
+        let params = crate::screen::encode_params(true, 320, 240, 60, true, false);
         let mut encoder = match HwEncoder::open(320, 240, 60, params) {
             Ok(encoder) => encoder,
             Err(error) => {

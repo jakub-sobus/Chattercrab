@@ -330,7 +330,7 @@ receiver:
   -> decoder thread (openh264) -> RGBA frame -> drop-oldest queue (capacity 2) -> UI image
 ```
 
-Frame rate defaults to 60 fps with the 1440p cap. The share picker also offers 1080p at 30 fps. Other rates from 5 to 60 remain selectable, and high quality adds 120 fps. On Windows and Linux the picture is encoded by the GPU's H.264 encoder when one is registered. High quality uses H.264 High at the fixed bitrate on both.
+Frame rate defaults to 60 fps with the 1440p cap. Other rates from 5 to 60 remain selectable, and high quality adds 120 fps. The share picker also asks for desktop mode (crisp fonts) or game mode (less blur on moving images). That choice does not change the resolution or frame rate. On Windows and Linux the picture is encoded by the GPU's H.264 encoder when one is registered. High quality uses H.264 High at the fixed bitrate on both.
 
 ### 6.4 Peer management and negotiation
 

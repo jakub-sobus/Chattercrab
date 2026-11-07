@@ -88,8 +88,10 @@ pub enum UiCommand {
         scale: chattercrab_media::ScreenScale,
         /// Mix other applications' audio into the outgoing voice.
         include_audio: bool,
-        /// H.264 High at a fixed high bitrate. 120 fps is the game preset.
+        /// H.264 High at a fixed high bitrate. Frame rate is chosen separately.
         high_quality: bool,
+        /// Desktop or game. Independent of resolution and frame rate.
+        content: chattercrab_media::ScreenContent,
     },
     /// Stop publishing the screen.
     StopScreenShare,
@@ -153,6 +155,7 @@ impl std::fmt::Debug for UiCommand {
                 scale,
                 include_audio,
                 high_quality,
+                content,
             } => f
                 .debug_struct("UiCommand::StartScreenShare")
                 .field("source", source)
@@ -160,6 +163,7 @@ impl std::fmt::Debug for UiCommand {
                 .field("scale", scale)
                 .field("include_audio", include_audio)
                 .field("high_quality", high_quality)
+                .field("content", content)
                 .finish(),
             Self::StopScreenShare => f.write_str("UiCommand::StopScreenShare"),
             Self::Shutdown => f.write_str("UiCommand::Shutdown"),

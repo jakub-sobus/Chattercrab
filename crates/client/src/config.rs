@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use chattercrab_media::{ScreenScale, clamp_input_gain};
+use chattercrab_media::{ScreenContent, ScreenScale, clamp_input_gain};
 use serde::{Deserialize, Serialize};
 
 /// Default screen-share frame rate (paired with 1440p).
@@ -59,6 +59,8 @@ pub struct Config {
     pub share_audio: bool,
     /// Last choice of the high-quality screen share toggle.
     pub high_quality: bool,
+    /// Desktop (crisp fonts) or game (less blur). Independent of size and frame rate.
+    pub screen_content: ScreenContent,
 }
 
 fn default_input_gain() -> f32 {
@@ -81,6 +83,7 @@ impl Default for Config {
             input_gain: default_input_gain(),
             share_audio: false,
             high_quality: false,
+            screen_content: ScreenContent::Desktop,
         }
     }
 }
@@ -147,6 +150,7 @@ impl std::fmt::Debug for Config {
             .field("input_gain", &self.input_gain)
             .field("share_audio", &self.share_audio)
             .field("high_quality", &self.high_quality)
+            .field("screen_content", &self.screen_content)
             .finish()
     }
 }
@@ -187,6 +191,7 @@ mod tests {
             input_gain: 2.5,
             share_audio: true,
             high_quality: true,
+            screen_content: ScreenContent::Game,
         };
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -223,6 +228,7 @@ mod tests {
         assert_eq!(config.display_name, "grace");
         assert_eq!(config.screen_fps, 120);
         assert!(!config.high_quality);
+        assert_eq!(config.screen_content, ScreenContent::Desktop);
         assert_eq!(config.screen_scale, ScreenScale::P1440);
         assert_eq!(config.server_url, Config::default().server_url);
         std::fs::remove_dir_all(dir).unwrap();
@@ -278,6 +284,7 @@ screen_fps = 15
         assert!((config.input_gain - 1.0).abs() < f32::EPSILON);
         assert!(!config.share_audio);
         assert!(!config.high_quality);
+        assert_eq!(config.screen_content, ScreenContent::Desktop);
         assert_eq!(config.display_name, "ada");
         assert_eq!(config.auth_user, "");
         assert!(config.password.is_empty());

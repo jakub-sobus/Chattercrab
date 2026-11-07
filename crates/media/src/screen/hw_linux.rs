@@ -5,8 +5,8 @@
 //!
 //! High quality matches the Windows Media Foundation path: H.264 High (CABAC,
 //! 8×8 transform) at the fixed bitrate, a GOP that only breaks on demand, about
-//! two frames of HRD buffering, and no B-frames. Desktop shares keep two
-//! reference frames; 120 fps keeps one. The quality preset uses the same speed
+//! two frames of HRD buffering, and no B-frames. Desktop mode keeps two
+//! reference frames; game mode keeps one. The quality preset uses the same speed
 //! knob as Windows (33 desktop, 50 game) when the driver reports a range.
 //! Drivers without High fall back to Constrained Baseline, then OpenH264.
 
@@ -157,6 +157,7 @@ impl HwEncoder {
                         fps,
                         bitrate = encoder.bitrate,
                         high_quality = params.high_quality,
+                        game = params.game,
                         high_profile = encoder.high_profile,
                         max_refs = encoder.max_refs,
                         quality_level = encoder.quality_level,

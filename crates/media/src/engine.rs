@@ -262,8 +262,9 @@ impl Engine {
                 scale,
                 include_audio,
                 high_quality,
+                content,
             } => {
-                self.start_screen(source, fps, scale, include_audio, high_quality)
+                self.start_screen(source, fps, scale, include_audio, high_quality, content)
                     .await;
             }
             MediaCommand::StopScreenShare => self.stop_screen().await,
@@ -369,6 +370,7 @@ impl Engine {
         scale: crate::ScreenScale,
         include_audio: bool,
         high_quality: bool,
+        content: crate::ScreenContent,
     ) {
         if self.screen.is_some() {
             self.stop_screen().await;
@@ -379,7 +381,7 @@ impl Engine {
         let fps = crate::screen::clamp_fps(fps, high_quality);
         let keyframe = self.peers.keyframe_flag();
         let started = tokio::task::spawn_blocking(move || {
-            ScreenPublisher::start(&source, fps, scale, keyframe, high_quality)
+            ScreenPublisher::start(&source, fps, scale, keyframe, high_quality, content)
         })
         .await;
         match started {
