@@ -3,8 +3,10 @@
 //! Publisher: a dedicated thread captures the selected monitor or window with `xcap`,
 //! fits it inside 3840x2160, 2560x1440, or 1920x1080 without scaling up, and encodes H.264.
 //! Windows uses the GPU's Media Foundation encoder when one is registered.
-//! Linux uses VA-API when libva and a driver are installed. Otherwise the
-//! publisher uses OpenH264. Encoded access units (Annex-B) leave through a bounded channel.
+//! Linux uses VA-API when libva and a driver are installed. High quality is
+//! H.264 High on both, with the same bitrate, GOP, and two-frame rate control.
+//! Otherwise the publisher uses OpenH264. Encoded access units (Annex-B) leave
+//! through a bounded channel.
 //!
 //! Receiver: see [`receive`].
 
@@ -417,7 +419,7 @@ fn new_encoder(
 
 /// Picture encoder. Hardware H.264 when the machine has one, otherwise OpenH264.
 enum ScreenEncoder {
-    Hardware(hw::HwEncoder),
+    Hardware(Box<hw::HwEncoder>),
     Software(Box<SoftwareEncoder>),
 }
 
@@ -469,7 +471,7 @@ impl ScreenEncoder {
     fn open(fps: u32, width: u32, height: u32, high_quality: bool) -> Result<Self, MediaError> {
         let params = encode_params(high_quality, width, height, fps, true);
         match hw::HwEncoder::open(width, height, fps, params) {
-            Ok(encoder) => Ok(Self::Hardware(encoder)),
+            Ok(encoder) => Ok(Self::Hardware(Box::new(encoder))),
             Err(error) => {
                 tracing::warn!(%error, "hardware h264 unavailable, using openh264");
                 Ok(Self::Software(Box::new(SoftwareEncoder::open(

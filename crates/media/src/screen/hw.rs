@@ -7,7 +7,9 @@
 //! link it. Both paths emit Annex-B H.264 with no B-frames, which the OpenH264
 //! decoder can read. The standard operating point is Constrained Baseline,
 //! 1440p at 60 fps and 12 Mbps. High quality requests H.264 High at a higher
-//! fixed bitrate, and 4K60 or 1440p120 uses level 5.2.
+//! fixed bitrate, and 4K60 or 1440p120 uses level 5.2. Linux VA-API uses that
+//! same profile, GOP, and two-frame rate-control window, with two reference
+//! frames for desktop and one at 120 fps.
 //!
 //! The Windows encoder is handed a Direct3D 11 device on the adapter that
 //! registered it. Without that device, `SetOutputType` fails with
@@ -1070,7 +1072,7 @@ mod tests {
         };
         let mut decoder = crate::screen::receive::new_decoder().expect("decoder");
         let mut rgba = vec![0u8; 320 * 240 * 4];
-        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i % 255) as u8;
             px[1] = 40;
             px[2] = 180;
@@ -1098,5 +1100,76 @@ mod tests {
             }
         }
         panic!("hardware encoder output did not decode");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn high_quality_hardware_encoder_uses_high_profile_when_present() {
+        let params = crate::screen::encode_params(true, 320, 240, 60, true);
+        let mut encoder = match HwEncoder::open(320, 240, 60, params) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                eprintln!("hardware encoder unavailable: {error}");
+                return;
+            }
+        };
+        let mut rgba = vec![0u8; 320 * 240 * 4];
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            px[0] = (i % 255) as u8;
+            px[1] = 16;
+            px[2] = 200;
+            px[3] = 255;
+        }
+        let expect_high = encoder.high_profile_selected();
+        let units = encoder.encode(&rgba, true).expect("encode");
+        let mut saw_idr = false;
+        let mut decoded = false;
+        let mut decoder = crate::screen::receive::new_decoder().expect("decoder");
+        for unit in units {
+            if unit.keyframe {
+                let profile = sps_profile_idc(&unit.data);
+                if expect_high {
+                    assert_eq!(
+                        profile,
+                        Some(100),
+                        "high quality VA-API output should be H.264 High"
+                    );
+                } else {
+                    assert!(
+                        profile == Some(66) || profile == Some(100),
+                        "unexpected fallback profile {profile:?}"
+                    );
+                }
+                saw_idr = true;
+            }
+            if let Some(frame) =
+                crate::screen::receive::decode_to_rgba(&mut decoder, &unit.data).expect("decode")
+            {
+                assert_eq!((frame.width, frame.height), (320, 240));
+                decoded = true;
+            }
+        }
+        assert!(saw_idr, "high quality encode did not emit an IDR");
+        assert!(decoded, "high quality hardware output did not decode");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sps_profile_idc(au: &[u8]) -> Option<u8> {
+        let mut i = 0;
+        while i + 4 < au.len() {
+            let (header, next) = if au[i..].starts_with(&[0, 0, 0, 1]) {
+                (i + 4, i + 5)
+            } else if au[i..].starts_with(&[0, 0, 1]) {
+                (i + 3, i + 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            if au[header] & 0x1f == 7 {
+                return au.get(next).copied();
+            }
+            i = next;
+        }
+        None
     }
 }
