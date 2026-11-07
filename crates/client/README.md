@@ -66,6 +66,7 @@ output_device = "Speakers (Realtek)"      # omit for the system default
 theme = "dark"                            # or "light"
 screen_fps = 60                           # 5, 10, 15, 20, 30, 60, or 120 with high quality
 screen_scale = "1440p"                    # or "1080p", "2k", "4k"
+screen_content = "desktop"                # or "game"; independent of size and frame rate
 high_quality = false                      # H.264 High, higher bitrate, low delay
 noise_suppression = false                 # RNNoise on the microphone input
 ```

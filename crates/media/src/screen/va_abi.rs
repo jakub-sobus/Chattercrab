@@ -7,12 +7,15 @@
 #![allow(dead_code)]
 
 pub(super) const PROFILE_BASELINE: i32 = 5;
+pub(super) const PROFILE_MAIN: i32 = 6;
+pub(super) const PROFILE_HIGH: i32 = 7;
 pub(super) const PROFILE_CONSTRAINED_BASELINE: i32 = 13;
 pub(super) const ENTRY_ENC_SLICE: i32 = 6;
 pub(super) const ENTRY_ENC_SLICE_LP: i32 = 8;
 pub(super) const ATTRIB_RT_FORMAT: i32 = 0;
 pub(super) const ATTRIB_RATE_CONTROL: i32 = 5;
 pub(super) const ATTRIB_PACKED_HEADERS: i32 = 10;
+pub(super) const ATTRIB_QUALITY_RANGE: i32 = 21;
 pub(super) const RT_YUV420: u32 = 1;
 pub(super) const RC_CBR: u32 = 2;
 pub(super) const RC_VBR: u32 = 4;
@@ -34,6 +37,8 @@ pub(super) const BUF_PACKED_DATA: i32 = 26;
 pub(super) const BUF_MISC: i32 = 27;
 pub(super) const MISC_FRAME_RATE: i32 = 0;
 pub(super) const MISC_RATE_CONTROL: i32 = 1;
+pub(super) const MISC_HRD: i32 = 5;
+pub(super) const MISC_QUALITY_LEVEL: i32 = 6;
 pub(super) const PACKED_TYPE_SEQUENCE: u32 = 1;
 pub(super) const PACKED_TYPE_PICTURE: u32 = 2;
 pub(super) const PACKED_TYPE_SLICE: u32 = 4;
@@ -53,6 +58,14 @@ pub(super) fn vui_fields() -> u32 {
 /// Reference picture, deblocking present, and the IDR bit when this picture is an IDR.
 pub(super) fn picture_fields(idr: bool) -> u32 {
     u32::from(idr) | (1 << 1) | (1 << 10)
+}
+
+/// High profile: one reference, CABAC, 8×8 transform, deblocking, and the IDR bit.
+///
+/// `reference_pic_flag` is two bits wide in libva, so the reference value starts at bit 1.
+/// CABAC is bit 3, the 8×8 transform is bit 8, and deblocking control is bit 9.
+pub(super) fn picture_fields_high(idr: bool) -> u32 {
+    u32::from(idr) | (1 << 1) | (1 << 3) | (1 << 8) | (1 << 9)
 }
 
 /// `disable_frame_skip`, plus a rate-control reset on the first picture.
@@ -205,6 +218,23 @@ pub(super) struct VaEncMiscParameterFrameRate {
     pub va_reserved: [u32; 4],
 }
 
+/// HRD / VBV sizes in bits. `va_reserved` matches libva's `VA_PADDING_LOW`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct VaEncMiscParameterHrd {
+    pub initial_buffer_fullness: u32,
+    pub buffer_size: u32,
+    pub va_reserved: [u32; 4],
+}
+
+/// Driver quality preset. 1 is the highest quality; 0 means the driver default.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct VaEncMiscParameterQualityLevel {
+    pub quality_level: u32,
+    pub va_reserved: [u32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct VaImageFormat {
@@ -266,6 +296,8 @@ mod tests {
         );
         assert_eq!(size_of::<VaEncMiscParameterRateControl>(), 60);
         assert_eq!(size_of::<VaEncMiscParameterFrameRate>(), 24);
+        assert_eq!(size_of::<VaEncMiscParameterHrd>(), 24);
+        assert_eq!(size_of::<VaEncMiscParameterQualityLevel>(), 20);
         assert_eq!(size_of::<VaImageFormat>(), 48);
         assert_eq!(size_of::<VaImage>(), 120);
 
@@ -328,6 +360,8 @@ mod tests {
         assert_eq!(vui_fields(), 45_191);
         assert_eq!(picture_fields(true), 1027);
         assert_eq!(picture_fields(false), 1026);
+        assert_eq!(picture_fields_high(true), 779);
+        assert_eq!(picture_fields_high(false), 778);
         assert_eq!(rate_control_flags(false), 2);
         assert_eq!(rate_control_flags(true), 3);
     }

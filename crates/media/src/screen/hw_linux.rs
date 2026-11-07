@@ -2,6 +2,13 @@
 //! machine without a GPU encoder (or without the libraries) falls back to
 //! OpenH264. A render node needs `libva2`, `libva-drm2`, and a driver:
 //! `intel-media-va-driver`, `mesa-va-drivers`, or `nvidia-vaapi-driver`.
+//!
+//! High quality matches the Windows Media Foundation path: H.264 High (CABAC,
+//! 8×8 transform) at the fixed bitrate, a GOP that only breaks on demand, about
+//! two frames of HRD buffering, and no B-frames. Desktop mode keeps two
+//! reference frames; game mode keeps one. The quality preset uses the same speed
+//! knob as Windows (33 desktop, 50 game) when the driver reports a range.
+//! Drivers without High fall back to Constrained Baseline, then OpenH264.
 
 use std::ffi::{CStr, c_void};
 use std::fs::{File, OpenOptions};
@@ -14,17 +21,19 @@ use libloading::Library;
 
 use super::h264_headers::{self, PackedNal};
 use super::va_abi::{
-    ATTRIB_NOT_SUPPORTED, ATTRIB_PACKED_HEADERS, ATTRIB_RATE_CONTROL, ATTRIB_RT_FORMAT, BUF_CODED,
-    BUF_MISC, BUF_PACKED_DATA, BUF_PACKED_HEADER, BUF_PICTURE, BUF_SEQUENCE, BUF_SLICE,
-    ENTRY_ENC_SLICE, ENTRY_ENC_SLICE_LP, FOURCC_NV12, INVALID_ID, MISC_FRAME_RATE,
-    MISC_RATE_CONTROL, PACKED_PICTURE, PACKED_SEQUENCE, PACKED_SLICE, PACKED_TYPE_PICTURE,
-    PACKED_TYPE_SEQUENCE, PACKED_TYPE_SLICE, PICTURE_INVALID, PICTURE_SHORT_TERM, PROFILE_BASELINE,
-    PROFILE_CONSTRAINED_BASELINE, PROGRESSIVE, RC_CBR, RC_VBR, RT_YUV420, STATUS_BAD_BITSTREAM,
+    ATTRIB_NOT_SUPPORTED, ATTRIB_PACKED_HEADERS, ATTRIB_QUALITY_RANGE, ATTRIB_RATE_CONTROL,
+    ATTRIB_RT_FORMAT, BUF_CODED, BUF_MISC, BUF_PACKED_DATA, BUF_PACKED_HEADER, BUF_PICTURE,
+    BUF_SEQUENCE, BUF_SLICE, ENTRY_ENC_SLICE, ENTRY_ENC_SLICE_LP, FOURCC_NV12, INVALID_ID,
+    MISC_FRAME_RATE, MISC_HRD, MISC_QUALITY_LEVEL, MISC_RATE_CONTROL, PACKED_PICTURE,
+    PACKED_SEQUENCE, PACKED_SLICE, PACKED_TYPE_PICTURE, PACKED_TYPE_SEQUENCE, PACKED_TYPE_SLICE,
+    PICTURE_INVALID, PICTURE_SHORT_TERM, PROFILE_BASELINE, PROFILE_CONSTRAINED_BASELINE,
+    PROFILE_HIGH, PROFILE_MAIN, PROGRESSIVE, RC_CBR, RC_VBR, RT_YUV420, STATUS_BAD_BITSTREAM,
     STATUS_FRAME_SIZE_OVERFLOW, VaCodedBufferSegment, VaConfigAttrib, VaEncMiscParameterFrameRate,
-    VaEncMiscParameterRateControl, VaEncPackedHeaderParameterBuffer,
-    VaEncPictureParameterBufferH264, VaEncSequenceParameterBufferH264,
-    VaEncSliceParameterBufferH264, VaImage, VaImageFormat, VaPictureH264, picture_fields,
-    rate_control_flags, sequence_fields, vui_fields,
+    VaEncMiscParameterHrd, VaEncMiscParameterQualityLevel, VaEncMiscParameterRateControl,
+    VaEncPackedHeaderParameterBuffer, VaEncPictureParameterBufferH264,
+    VaEncSequenceParameterBufferH264, VaEncSliceParameterBufferH264, VaImage, VaImageFormat,
+    VaPictureH264, picture_fields, picture_fields_high, rate_control_flags, sequence_fields,
+    vui_fields,
 };
 use super::{AccessUnit, EncodeParams, h264_level_idc};
 
@@ -41,8 +50,8 @@ pub struct HwEncoder {
     dpy: *mut c_void,
     context: u32,
     config: u32,
-    /// Source surface, then two reconstruction surfaces.
-    surfaces: [u32; 3],
+    /// Source surface, then `max_refs + 1` reconstruction surfaces.
+    surfaces: Vec<u32>,
     coded_buf: u32,
     image: VaImage,
     width: u32,
@@ -53,6 +62,14 @@ pub struct HwEncoder {
     bitrate: u32,
     gop: u32,
     rc_window_ms: u32,
+    /// H.264 High was the profile the driver accepted.
+    high_profile: bool,
+    /// 2 for a high-quality desktop share, otherwise 1.
+    max_refs: usize,
+    /// VA quality preset, or 0 when the driver has a single preset.
+    quality_level: u32,
+    /// VBV size in bits. 0 leaves buffering to the driver.
+    hrd_bits: u32,
     packed: u32,
     vendor: String,
     device: String,
@@ -62,7 +79,8 @@ pub struct HwEncoder {
     frame_num: u32,
     poc: u32,
     idr_pic_id: u32,
-    reference: Option<Reference>,
+    /// Newest reference first. Empty until the first coded picture.
+    references: [Option<Reference>; 2],
 }
 
 struct Reference {
@@ -79,31 +97,84 @@ impl HwEncoder {
                 "hardware encoder needs even dimensions, got {width}x{height}"
             ));
         }
-        let mut encoder = open_device(width, height, fps, params.bitrate)?;
-        encoder.gop = params.gop_frames.max(1);
-        encoder.rc_window_ms = params.rc_window_ms.max(1);
-        encoder.bitrate = params.bitrate;
-        let blank = vec![0u8; (width as usize) * (height as usize) * 4];
-        encoder
-            .encode(&blank, true)
-            .map_err(|error| format!("VA-API test frame failed: {error}"))?;
-        encoder.reference = None;
-        encoder.frames = 0;
-        encoder.frame_num = 0;
-        encoder.poc = 0;
-        tracing::info!(
-            encoder = %encoder.vendor,
-            device = %encoder.device,
-            profile = encoder.profile_name,
-            rate_control = encoder.rate_control,
-            packed_headers = encoder.packed,
-            width,
-            height,
-            fps,
-            bitrate = encoder.bitrate,
-            "hardware h264 encoder"
-        );
-        Ok(encoder)
+        let max_refs = if params.high_quality && !params.game {
+            2
+        } else {
+            1
+        };
+        let high = &profile_candidates(true)[..1];
+        let baseline = profile_candidates(false);
+        let plan = if params.high_quality {
+            vec![
+                Attempt {
+                    profiles: high,
+                    extras: true,
+                },
+                Attempt {
+                    profiles: high,
+                    extras: false,
+                },
+                Attempt {
+                    profiles: baseline,
+                    extras: true,
+                },
+                Attempt {
+                    profiles: baseline,
+                    extras: false,
+                },
+            ]
+        } else {
+            vec![Attempt {
+                profiles: baseline,
+                extras: false,
+            }]
+        };
+        let mut errors = Vec::new();
+        for attempt in plan {
+            match open_device(width, height, fps, params, max_refs, attempt) {
+                Ok(mut encoder) => {
+                    encoder.gop = params.gop_frames.max(1);
+                    encoder.rc_window_ms = params.rc_window_ms.max(1);
+                    encoder.bitrate = params.bitrate;
+                    encoder.max_refs = max_refs;
+                    let blank = vec![0u8; (width as usize) * (height as usize) * 4];
+                    if let Err(error) = encoder.encode(&blank, true) {
+                        errors.push(format!("VA-API test frame failed: {error}"));
+                        continue;
+                    }
+                    encoder.references = [None, None];
+                    encoder.frames = 0;
+                    encoder.frame_num = 0;
+                    encoder.poc = 0;
+                    tracing::info!(
+                        encoder = %encoder.vendor,
+                        device = %encoder.device,
+                        profile = encoder.profile_name,
+                        rate_control = encoder.rate_control,
+                        packed_headers = encoder.packed,
+                        width,
+                        height,
+                        fps,
+                        bitrate = encoder.bitrate,
+                        high_quality = params.high_quality,
+                        game = params.game,
+                        high_profile = encoder.high_profile,
+                        max_refs = encoder.max_refs,
+                        quality_level = encoder.quality_level,
+                        hrd_bits = encoder.hrd_bits,
+                        "hardware h264 encoder"
+                    );
+                    return Ok(encoder);
+                }
+                Err(error) => {
+                    if error.contains("libva") || error.contains("no DRM render node") {
+                        return Err(error);
+                    }
+                    errors.push(error);
+                }
+            }
+        }
+        Err(errors.join("; "))
     }
 
     /// Encodes one tightly packed RGBA frame. `force_idr` starts a new GOP.
@@ -116,7 +187,7 @@ impl HwEncoder {
             ));
         }
         let idr = force_idr
-            || self.reference.is_none()
+            || self.references[0].is_none()
             || self.frames.is_multiple_of(u64::from(self.gop));
         if idr {
             self.frame_num = 0;
@@ -128,21 +199,24 @@ impl HwEncoder {
         let data = match self.submit(idr, frame_num, poc) {
             Ok(data) => data,
             Err(error) => {
-                self.reference = None;
+                self.references = [None, None];
                 return Err(error);
             }
         };
         let types = nal_types(&data);
         let keyframe = types.contains(&5);
         if idr && !keyframe {
-            self.reference = None;
+            self.references = [None, None];
             return Err("hardware encoder did not emit an IDR".into());
         }
         if !keyframe && !types.contains(&1) {
-            self.reference = None;
+            self.references = [None, None];
             return Err("hardware encoder did not emit a slice".into());
         }
-        self.reference = Some(Reference {
+        if idr {
+            self.references = [None, None];
+        }
+        self.push_reference(Reference {
             surface: self.recon_surface(),
             frame_num,
             poc,
@@ -156,8 +230,46 @@ impl HwEncoder {
         Ok(vec![AccessUnit { data, keyframe }])
     }
 
+    /// Whether the opened driver accepted H.264 High.
+    #[cfg(test)]
+    pub(super) fn high_profile_selected(&self) -> bool {
+        self.high_profile
+    }
+
     fn recon_surface(&self) -> u32 {
-        self.surfaces[1 + (self.frames % 2) as usize]
+        let slots = (self.max_refs + 1) as u64;
+        let slot = (self.frames % slots) as usize;
+        self.surfaces[1 + slot]
+    }
+
+    fn push_reference(&mut self, reference: Reference) {
+        if self.max_refs >= 2 {
+            self.references[1] = self.references[0].take();
+        } else {
+            self.references[1] = None;
+        }
+        self.references[0] = Some(reference);
+    }
+
+    fn active_refs(&self, idr: bool) -> u32 {
+        if idr {
+            0
+        } else {
+            self.references.iter().flatten().count() as u32
+        }
+    }
+
+    fn reference_pictures(&self, idr: bool) -> [VaPictureH264; 2] {
+        let mut list = [invalid_picture(), invalid_picture()];
+        if !idr {
+            for (slot, reference) in self.references.iter().flatten().enumerate() {
+                if slot >= list.len() {
+                    break;
+                }
+                list[slot] = stored_picture(reference);
+            }
+        }
+        list
     }
 
     fn upload(&self, rgba: &[u8]) -> Result<(), String> {
@@ -252,6 +364,22 @@ impl HwEncoder {
         };
         ids.push(self.buffer(BUF_MISC, &misc_bytes(MISC_RATE_CONTROL, &rate))?);
         ids.push(self.buffer(BUF_MISC, &misc_bytes(MISC_FRAME_RATE, &frame_rate))?);
+        if self.hrd_bits > 0 {
+            // Same two-frame VBV the Windows encoder sets on AVEncCommonBufferSize.
+            let hrd = VaEncMiscParameterHrd {
+                initial_buffer_fullness: self.hrd_bits,
+                buffer_size: self.hrd_bits,
+                ..VaEncMiscParameterHrd::default()
+            };
+            ids.push(self.buffer(BUF_MISC, &misc_bytes(MISC_HRD, &hrd))?);
+        }
+        if self.quality_level > 0 {
+            let quality = VaEncMiscParameterQualityLevel {
+                quality_level: self.quality_level,
+                ..VaEncMiscParameterQualityLevel::default()
+            };
+            ids.push(self.buffer(BUF_MISC, &misc_bytes(MISC_QUALITY_LEVEL, &quality))?);
+        }
         Ok(())
     }
 
@@ -265,7 +393,7 @@ impl HwEncoder {
         sequence.intra_idr_period = self.gop;
         sequence.ip_period = 1;
         sequence.bits_per_second = self.bitrate;
-        sequence.max_num_ref_frames = 1;
+        sequence.max_num_ref_frames = u32::try_from(self.max_refs).unwrap_or(1);
         sequence.picture_width_in_mbs = (self.coded_w / 16) as u16;
         sequence.picture_height_in_mbs = (self.coded_h / 16) as u16;
         sequence.seq_fields = sequence_fields();
@@ -279,11 +407,18 @@ impl HwEncoder {
         sequence.time_scale = fps.saturating_mul(2);
         ids.push(self.buffer(BUF_SEQUENCE, pod_bytes(&sequence))?);
         if self.packed & PACKED_SEQUENCE != 0 {
-            self.push_packed(
-                ids,
-                PACKED_TYPE_SEQUENCE,
-                &h264_headers::sequence_header(self.width, self.height, fps),
-            )?;
+            let header = if self.high_profile || self.max_refs != 1 {
+                h264_headers::sequence_header_for(
+                    self.width,
+                    self.height,
+                    fps,
+                    self.high_profile,
+                    sequence.max_num_ref_frames,
+                )
+            } else {
+                h264_headers::sequence_header(self.width, self.height, fps)
+            };
+            self.push_packed(ids, PACKED_TYPE_SEQUENCE, &header)?;
         }
         Ok(())
     }
@@ -296,8 +431,10 @@ impl HwEncoder {
         poc: u32,
     ) -> Result<(), String> {
         let mut reference_frames = [invalid_picture(); 16];
-        if !idr && let Some(reference) = &self.reference {
-            reference_frames[0] = stored_picture(reference);
+        let listed = self.reference_pictures(idr);
+        let active = self.active_refs(idr);
+        for (slot, picture) in listed.into_iter().enumerate() {
+            reference_frames[slot] = picture;
         }
         let picture = VaEncPictureParameterBufferH264 {
             curr_pic: VaPictureH264 {
@@ -312,12 +449,22 @@ impl HwEncoder {
             coded_buf: self.coded_buf,
             frame_num: frame_num as u16,
             pic_init_qp: 26,
-            pic_fields: picture_fields(idr),
+            num_ref_idx_l0_active_minus1: active.saturating_sub(1) as u8,
+            pic_fields: if self.high_profile {
+                picture_fields_high(idr)
+            } else {
+                picture_fields(idr)
+            },
             ..VaEncPictureParameterBufferH264::default()
         };
         ids.push(self.buffer(BUF_PICTURE, pod_bytes(&picture))?);
         if self.packed & PACKED_PICTURE != 0 {
-            self.push_packed(ids, PACKED_TYPE_PICTURE, &h264_headers::picture_header())?;
+            let header = if self.high_profile {
+                h264_headers::picture_header_for(true)
+            } else {
+                h264_headers::picture_header()
+            };
+            self.push_packed(ids, PACKED_TYPE_PICTURE, &header)?;
         }
         Ok(())
     }
@@ -331,9 +478,11 @@ impl HwEncoder {
     ) -> Result<(), String> {
         let mut list0 = [invalid_picture(); 32];
         let list1 = [invalid_picture(); 32];
-        if !idr && let Some(reference) = &self.reference {
-            list0[0] = stored_picture(reference);
+        let listed = self.reference_pictures(idr);
+        for (slot, picture) in listed.into_iter().enumerate() {
+            list0[slot] = picture;
         }
+        let active = self.active_refs(idr);
         let macroblocks = (self.coded_w / 16) * (self.coded_h / 16);
         let slice = VaEncSliceParameterBufferH264 {
             num_macroblocks: macroblocks,
@@ -341,17 +490,27 @@ impl HwEncoder {
             slice_type: if idr { 2 } else { 0 },
             idr_pic_id: self.idr_pic_id as u16,
             pic_order_cnt_lsb: poc as u16,
+            num_ref_idx_active_override_flag: u8::from(!idr && active != 1),
+            num_ref_idx_l0_active_minus1: active.saturating_sub(1) as u8,
             ref_pic_list0: list0,
             ref_pic_list1: list1,
             ..VaEncSliceParameterBufferH264::default()
         };
         ids.push(self.buffer(BUF_SLICE, pod_bytes(&slice))?);
         if self.packed & PACKED_SLICE != 0 {
-            self.push_packed(
-                ids,
-                PACKED_TYPE_SLICE,
-                &h264_headers::slice_header(idr, frame_num, poc, self.idr_pic_id),
-            )?;
+            let header = if self.high_profile || active > 1 {
+                h264_headers::slice_header_for(
+                    idr,
+                    frame_num,
+                    poc,
+                    self.idr_pic_id,
+                    self.high_profile,
+                    active.max(1),
+                )
+            } else {
+                h264_headers::slice_header(idr, frame_num, poc, self.idr_pic_id)
+            };
+            self.push_packed(ids, PACKED_TYPE_SLICE, &header)?;
         }
         Ok(())
     }
@@ -403,8 +562,9 @@ impl Drop for HwEncoder {
             let _ = (self.va.destroy_context)(self.dpy, self.context);
             let _ = (self.va.destroy_image)(self.dpy, self.image.image_id);
             let _ = (self.va.destroy_buffer)(self.dpy, self.coded_buf);
-            let mut surfaces = self.surfaces;
-            let _ = (self.va.destroy_surfaces)(self.dpy, surfaces.as_mut_ptr(), 3);
+            let mut surfaces = std::mem::take(&mut self.surfaces);
+            let count = i32::try_from(surfaces.len()).unwrap_or(0);
+            let _ = (self.va.destroy_surfaces)(self.dpy, surfaces.as_mut_ptr(), count);
             let _ = (self.va.destroy_config)(self.dpy, self.config);
             let _ = (self.va.terminate)(self.dpy);
         }
@@ -420,7 +580,7 @@ struct Session {
     dpy: *mut c_void,
     context: u32,
     config: u32,
-    surfaces: [u32; 3],
+    surfaces: Vec<u32>,
     coded_buf: u32,
     image: VaImage,
     width: u32,
@@ -432,30 +592,53 @@ struct Session {
     packed: u32,
     vendor: String,
     device: String,
+    profile: i32,
     profile_name: &'static str,
     rate_control: &'static str,
+    max_refs: usize,
+    quality_level: u32,
+    hrd_bits: u32,
 }
 
-fn open_device(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<HwEncoder, String> {
+#[derive(Clone, Copy)]
+struct Attempt {
+    /// Profiles to try, in order. High quality tries High before baseline.
+    profiles: &'static [i32],
+    /// Two-frame HRD and the quality preset. Dropped if a driver rejects them.
+    extras: bool,
+}
+
+fn open_device(
+    width: u32,
+    height: u32,
+    fps: u32,
+    params: EncodeParams,
+    max_refs: usize,
+    attempt: Attempt,
+) -> Result<HwEncoder, String> {
     let va = Va::load()?;
     let nodes = render_nodes()?;
     let mut errors = Vec::new();
     for node in nodes {
-        match try_node(&va, &node, width, height, fps, bitrate) {
-            Ok(built) => return Ok(built.encoder(va)),
+        match try_node(&va, &node, width, height, fps, params, max_refs, attempt) {
+            Ok(built) => return built.encoder(va),
             Err(error) => {
                 tracing::debug!(device = %node.display(), %error, "skipping vaapi device");
                 errors.push(format!("{}: {error}", node.display()));
             }
         }
     }
-    Err(errors.join("; "))
+    if errors.is_empty() {
+        Err("no H.264 encode entrypoint".into())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 impl Built {
-    fn encoder(self, va: Va) -> HwEncoder {
+    fn encoder(self, va: Va) -> Result<HwEncoder, String> {
         let session = self.session;
-        HwEncoder {
+        Ok(HwEncoder {
             va,
             file: self.file,
             dpy: session.dpy,
@@ -472,6 +655,10 @@ impl Built {
             bitrate: session.bitrate,
             gop: session.fps.saturating_mul(2).max(1),
             rc_window_ms: 1_000,
+            high_profile: session.profile == PROFILE_HIGH,
+            max_refs: session.max_refs,
+            quality_level: session.quality_level,
+            hrd_bits: session.hrd_bits,
             packed: session.packed,
             vendor: session.vendor,
             device: session.device,
@@ -481,18 +668,21 @@ impl Built {
             frame_num: 0,
             poc: 0,
             idr_pic_id: 0,
-            reference: None,
-        }
+            references: [None, None],
+        })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_node(
     va: &Va,
     path: &Path,
     width: u32,
     height: u32,
     fps: u32,
-    bitrate: u32,
+    params: EncodeParams,
+    max_refs: usize,
+    attempt: Attempt,
 ) -> Result<Built, String> {
     let file = OpenOptions::new()
         .read(true)
@@ -513,7 +703,9 @@ fn try_node(
         dpy,
         active: true,
     };
-    let session = setup(va, dpy, path, width, height, fps, bitrate, major, minor)?;
+    let session = setup(
+        va, dpy, path, width, height, fps, params, max_refs, attempt, major, minor,
+    )?;
     cleanup.active = false;
     drop(cleanup);
     Ok(Built { file, session })
@@ -543,26 +735,74 @@ fn setup(
     width: u32,
     height: u32,
     fps: u32,
-    bitrate: u32,
+    params: EncodeParams,
+    max_refs: usize,
+    attempt: Attempt,
     major: i32,
     minor: i32,
 ) -> Result<Session, String> {
     let vendor = vendor_string(va, dpy);
     tracing::debug!(%vendor, major, minor, device = %path.display(), "vaapi display");
-    let (profile, entry) = find_entrypoint(va, dpy)?;
-    let (rate_bits, mut packed) = encoder_attributes(va, dpy, profile, entry)?;
-    let (rate_control, rate_flag) = choose_rate_control(rate_bits)?;
-    let config = match create_config(va, dpy, profile, entry, rate_flag, packed) {
-        Ok(config) => config,
-        Err(error) if packed != 0 => {
-            tracing::debug!(%error, "retrying VA-API config without packed headers");
-            packed = 0;
-            create_config(va, dpy, profile, entry, rate_flag, 0)?
+    let mut chosen = None;
+    let mut last_error = if attempt.profiles == [PROFILE_HIGH] {
+        String::from("no H.264 High encode entrypoint")
+    } else {
+        String::from("no H.264 encode entrypoint")
+    };
+    for profile in attempt.profiles {
+        let supported = entrypoints(va, dpy, *profile);
+        for entry in [ENTRY_ENC_SLICE, ENTRY_ENC_SLICE_LP] {
+            if !supported.contains(&entry) {
+                continue;
+            }
+            let (rate_bits, mut packed) = match encoder_attributes(va, dpy, *profile, entry) {
+                Ok(attributes) => attributes,
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            let (rate_control, rate_flag) = match choose_rate_control(rate_bits) {
+                Ok(rate) => rate,
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            let config = match create_config(va, dpy, *profile, entry, rate_flag, packed) {
+                Ok(config) => config,
+                Err(error) if packed != 0 => {
+                    tracing::debug!(%error, "retrying VA-API config without packed headers");
+                    packed = 0;
+                    match create_config(va, dpy, *profile, entry, rate_flag, 0) {
+                        Ok(config) => config,
+                        Err(error) => {
+                            last_error = error;
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    last_error = error;
+                    continue;
+                }
+            };
+            chosen = Some((*profile, entry, config, packed, rate_control));
+            break;
         }
-        Err(error) => return Err(error),
+        if chosen.is_some() {
+            break;
+        }
+    }
+    let Some((profile, entry, config, packed, rate_control)) = chosen else {
+        return Err(last_error);
     };
     let grid = h264_headers::frame_grid(width, height);
-    let mut surfaces = [0u32; 3];
+    // One source surface, plus a reconstruction slot for the picture in flight
+    // and one per retained reference.
+    let surface_count = max_refs.saturating_add(2);
+    let mut surfaces = vec![0u32; surface_count];
+    let count = u32::try_from(surface_count).unwrap_or(u32::MAX);
     va.check("vaCreateSurfaces", unsafe {
         (va.create_surfaces)(
             dpy,
@@ -570,7 +810,7 @@ fn setup(
             grid.coded_w,
             grid.coded_h,
             surfaces.as_mut_ptr(),
-            3,
+            count,
             ptr::null_mut(),
             0,
         )
@@ -584,14 +824,15 @@ fn setup(
             grid.coded_h as i32,
             PROGRESSIVE,
             surfaces.as_mut_ptr(),
-            3,
+            i32::try_from(surface_count).unwrap_or(i32::MAX),
             &mut context,
         )
     })?;
-    let coded_bytes = (grid.coded_w as usize)
+    let pixels = (grid.coded_w as usize)
         .saturating_mul(grid.coded_h as usize)
         .max(1 << 20);
-    let coded_bytes = u32::try_from(coded_bytes).unwrap_or(u32::MAX);
+    let per_second = (params.bitrate as usize / 8).max(1);
+    let coded_bytes = u32::try_from(pixels.max(per_second)).unwrap_or(u32::MAX);
     let mut coded_buf = 0u32;
     va.check("coded buffer", unsafe {
         (va.create_buffer)(
@@ -617,12 +858,24 @@ fn setup(
         coded_w: grid.coded_w,
         coded_h: grid.coded_h,
         fps,
-        bitrate,
+        bitrate: params.bitrate,
         packed,
         vendor,
         device: path.display().to_string(),
+        profile,
         profile_name: profile_name(profile),
         rate_control,
+        max_refs,
+        quality_level: if attempt.extras {
+            va_quality_level(quality_range(va, dpy, profile, entry), params.game)
+        } else {
+            0
+        },
+        hrd_bits: if attempt.extras {
+            params.bitrate.saturating_mul(2) / fps.max(1)
+        } else {
+            0
+        },
     })
 }
 
@@ -637,18 +890,45 @@ fn vendor_string(va: &Va, dpy: *mut c_void) -> String {
     }
 }
 
-fn find_entrypoint(va: &Va, dpy: *mut c_void) -> Result<(i32, i32), String> {
-    let profiles = [PROFILE_CONSTRAINED_BASELINE, PROFILE_BASELINE];
-    let entries = [ENTRY_ENC_SLICE, ENTRY_ENC_SLICE_LP];
-    for profile in profiles {
-        let supported = entrypoints(va, dpy, profile);
-        for entry in entries {
-            if supported.contains(&entry) {
-                return Ok((profile, entry));
-            }
-        }
+/// High quality tries H.264 High first. Every share can still use baseline.
+fn profile_candidates(high_quality: bool) -> &'static [i32] {
+    if high_quality {
+        &[PROFILE_HIGH, PROFILE_CONSTRAINED_BASELINE, PROFILE_BASELINE]
+    } else {
+        &[PROFILE_CONSTRAINED_BASELINE, PROFILE_BASELINE]
     }
-    Err("no H.264 encode entrypoint".into())
+}
+
+/// Windows quality-vs-speed is 0 for slowest and 100 for fastest. VA-API's
+/// range runs the other way: 1 is the highest quality. 33 and 50 are the
+/// desktop and game knobs from the Media Foundation encoder.
+fn va_quality_level(range: u32, game: bool) -> u32 {
+    if range <= 1 {
+        return 0;
+    }
+    let speed = if game { 50 } else { 33 };
+    let level = 1 + ((range - 1) * speed + 50) / 100;
+    level.clamp(1, range)
+}
+
+fn quality_range(va: &Va, dpy: *mut c_void, profile: i32, entry: i32) -> u32 {
+    let mut attrib = VaConfigAttrib {
+        type_: ATTRIB_QUALITY_RANGE,
+        value: 0,
+    };
+    if va
+        .check("vaGetConfigAttributes", unsafe {
+            (va.get_config_attributes)(dpy, profile, entry, &mut attrib, 1)
+        })
+        .is_err()
+    {
+        return 0;
+    }
+    if attrib.value & ATTRIB_NOT_SUPPORTED != 0 {
+        0
+    } else {
+        attrib.value
+    }
 }
 
 fn entrypoints(va: &Va, dpy: *mut c_void, profile: i32) -> Vec<i32> {
@@ -779,10 +1059,11 @@ fn nv12_image(va: &Va, dpy: *mut c_void, coded_w: u32, coded_h: u32) -> Result<V
 }
 
 fn profile_name(profile: i32) -> &'static str {
-    if profile == PROFILE_CONSTRAINED_BASELINE {
-        "constrained baseline"
-    } else {
-        "baseline"
+    match profile {
+        PROFILE_HIGH => "high",
+        PROFILE_MAIN => "main",
+        PROFILE_CONSTRAINED_BASELINE => "constrained baseline",
+        _ => "baseline",
     }
 }
 
@@ -1091,5 +1372,33 @@ fn symbol<T: Copy>(library: &Library, name: &str) -> Result<T, String> {
             .get(&raw)
             .map(|symbol| *symbol)
             .map_err(|error| format!("libva is missing {name}: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_level_matches_the_windows_speed_knob() {
+        assert_eq!(va_quality_level(0, false), 0);
+        assert_eq!(va_quality_level(1, true), 0);
+        // Range of 7: 33 → level 3 (about NVENC P5), 50 → level 4 (about P4).
+        assert_eq!(va_quality_level(7, false), 3);
+        assert_eq!(va_quality_level(7, true), 4);
+        assert_eq!(va_quality_level(2, false), 1);
+        assert_eq!(va_quality_level(2, true), 2);
+    }
+
+    #[test]
+    fn high_quality_tries_high_before_baseline() {
+        assert_eq!(
+            profile_candidates(true),
+            [PROFILE_HIGH, PROFILE_CONSTRAINED_BASELINE, PROFILE_BASELINE]
+        );
+        assert_eq!(
+            profile_candidates(false),
+            [PROFILE_CONSTRAINED_BASELINE, PROFILE_BASELINE]
+        );
     }
 }

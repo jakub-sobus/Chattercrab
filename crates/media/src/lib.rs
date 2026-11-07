@@ -144,6 +144,34 @@ impl std::fmt::Display for ScreenScale {
     }
 }
 
+/// What the share is showing. The user picks this before the share starts.
+/// Resolution and frame rate stay independent of the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenContent {
+    /// Crisp text and UI: screen-content tools, two references in high quality.
+    #[default]
+    Desktop,
+    /// Moving images: motion tools and, in high quality, more bits per frame.
+    Game,
+}
+
+impl ScreenContent {
+    /// Whether this choice uses the game operating point.
+    pub fn is_game(self) -> bool {
+        matches!(self, Self::Game)
+    }
+}
+
+impl std::fmt::Display for ScreenContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Desktop => "Desktop",
+            Self::Game => "Game",
+        })
+    }
+}
+
 /// A capturable monitor or window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenSource {
@@ -282,10 +310,12 @@ pub enum MediaCommand {
         scale: ScreenScale,
         /// Mix other applications' audio into the outgoing voice for this share.
         include_audio: bool,
-        /// H.264 High at a fixed high bitrate. 60 fps is the desktop preset
-        /// (keep resolution); 120 fps is the game preset (keep frame rate).
-        /// IDR frames are sent only when a viewer asks, at most once a second.
+        /// H.264 High at a fixed high bitrate, with IDR frames only when a
+        /// viewer asks, at most once a second. Frame rate stays 5..=120.
         high_quality: bool,
+        /// Desktop (crisp fonts) or game (less blur on moving images).
+        /// Independent of `scale` and `fps`.
+        content: ScreenContent,
     },
     /// Stop publishing the screen share.
     StopScreenShare,

@@ -221,11 +221,17 @@ impl Backend {
                 scale,
                 include_audio,
                 high_quality,
+                content,
             } => {
                 if let Some(room) = self.room.as_mut() {
-                    let effects =
-                        room.session
-                            .request_share(source, fps, scale, include_audio, high_quality);
+                    let effects = room.session.request_share(
+                        source,
+                        fps,
+                        scale,
+                        include_audio,
+                        high_quality,
+                        content,
+                    );
                     self.apply(effects).await;
                 }
             }

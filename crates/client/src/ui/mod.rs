@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chattercrab_media::{RgbaFrame, ScreenScale, ScreenSource, VideoFrameQueue};
+use chattercrab_media::{RgbaFrame, ScreenContent, ScreenScale, ScreenSource, VideoFrameQueue};
 use chattercrab_protocol::{DisplayName, PeerId, RoomId, RoomName, RoomSummary};
 use iced::futures::stream;
 use iced::widget::image;
@@ -62,8 +62,10 @@ pub struct SharePicker {
     pub scale: ScreenScale,
     /// Mix other applications' audio into the outgoing voice.
     pub include_audio: bool,
-    /// H.264 High, higher fixed bitrate, low delay. 120 fps is the game preset.
+    /// H.264 High, higher fixed bitrate, low delay.
     pub high_quality: bool,
+    /// Desktop (crisp fonts) or game (less blur). Independent of size and frame rate.
+    pub content: ScreenContent,
 }
 
 /// A [`ScreenSource`] with a display label, for pick lists.
@@ -191,6 +193,8 @@ pub enum Message {
     ShareFpsSelected(u32),
     /// Resolution picked.
     ShareScaleSelected(ScreenScale),
+    /// Desktop or game mode picked.
+    ShareContentSelected(ScreenContent),
     /// "Share audio from other apps" toggled.
     ShareAudioToggled(bool),
     /// High-quality screen share toggled.
@@ -473,6 +477,7 @@ impl App {
                     .clamp(*SCREEN_FPS_RANGE.start(), max_fps);
                 let scale = self.config.screen_scale;
                 let include_audio = self.config.share_audio;
+                let content = self.config.screen_content;
                 if let Some(room) = self.room_mut() {
                     room.picker = Some(SharePicker {
                         sources: Vec::new(),
@@ -481,6 +486,7 @@ impl App {
                         scale,
                         include_audio,
                         high_quality,
+                        content,
                     });
                     self.send(UiCommand::ListScreenSources);
                 }
@@ -502,15 +508,14 @@ impl App {
             }
             Message::ShareScaleSelected(scale) => {
                 if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
-                    let keep_game = picker.high_quality && picker.fps >= 90;
-                    picker.fps = match scale {
-                        ScreenScale::P1080 => 30,
-                        ScreenScale::P1440 | ScreenScale::P2K | ScreenScale::P4K if keep_game => {
-                            120
-                        }
-                        ScreenScale::P1440 | ScreenScale::P2K | ScreenScale::P4K => 60,
-                    };
                     picker.scale = scale;
+                }
+            }
+            Message::ShareContentSelected(content) => {
+                self.config.screen_content = content;
+                self.save_config();
+                if let Some(picker) = self.room_mut().and_then(|r| r.picker.as_mut()) {
+                    picker.content = content;
                 }
             }
             Message::ShareAudioToggled(on) => {
@@ -535,10 +540,18 @@ impl App {
             }
             Message::StartShare => {
                 let picked = self.room_mut().and_then(|r| r.picker.take()).and_then(|p| {
-                    p.selected
-                        .map(|s| (s.0, p.fps, p.scale, p.include_audio, p.high_quality))
+                    p.selected.map(|s| {
+                        (
+                            s.0,
+                            p.fps,
+                            p.scale,
+                            p.include_audio,
+                            p.high_quality,
+                            p.content,
+                        )
+                    })
                 });
-                if let Some((source, fps, scale, include_audio, high_quality)) = picked {
+                if let Some((source, fps, scale, include_audio, high_quality, content)) = picked {
                     let max_fps = if high_quality {
                         *SCREEN_FPS_RANGE.end()
                     } else {
@@ -549,6 +562,7 @@ impl App {
                     self.config.screen_scale = scale;
                     self.config.share_audio = include_audio;
                     self.config.high_quality = high_quality;
+                    self.config.screen_content = content;
                     self.save_config();
                     self.send(UiCommand::StartScreenShare {
                         source,
@@ -556,6 +570,7 @@ impl App {
                         scale,
                         include_audio,
                         high_quality,
+                        content,
                     });
                 }
             }
@@ -894,6 +909,38 @@ mod tests {
         app.on_backend(entering("room1"));
         app.on_backend(joined("room1"));
         assert!(matches!(app.state.screen, Screen::Lobby(_)));
+    }
+
+    #[test]
+    fn share_mode_does_not_change_resolution_or_frame_rate() {
+        let mut app = app();
+        app.state.screen = Screen::Lobby(Lobby::default());
+        app.pending_enter = Some(PendingEnter::Created);
+        app.on_backend(entering("room1"));
+        app.on_backend(joined("room1"));
+        app.config.high_quality = true;
+        app.config.screen_fps = 120;
+        app.config.screen_scale = ScreenScale::P1440;
+        let _ = app.update(Message::OpenSharePicker);
+        let _ = app.update(Message::ShareFpsSelected(120));
+        let _ = app.update(Message::ShareScaleSelected(ScreenScale::P1080));
+        let _ = app.update(Message::ShareContentSelected(ScreenContent::Game));
+        let picker = match &app.state.screen {
+            Screen::Room(room) => room.picker.as_ref().unwrap(),
+            _ => panic!("expected the room"),
+        };
+        assert_eq!(picker.fps, 120);
+        assert_eq!(picker.scale, ScreenScale::P1080);
+        assert_eq!(picker.content, ScreenContent::Game);
+        let _ = app.update(Message::ShareContentSelected(ScreenContent::Desktop));
+        let _ = app.update(Message::ShareScaleSelected(ScreenScale::P4K));
+        let picker = match &app.state.screen {
+            Screen::Room(room) => room.picker.as_ref().unwrap(),
+            _ => panic!("expected the room"),
+        };
+        assert_eq!(picker.fps, 120);
+        assert_eq!(picker.scale, ScreenScale::P4K);
+        assert_eq!(picker.content, ScreenContent::Desktop);
     }
 
     #[test]
