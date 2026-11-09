@@ -321,16 +321,19 @@ The mixer measures each iteration; if one exceeds 20 ms it logs a rate-limited w
 
 ```text
 publisher: capture thread
-  xcap (monitor or window) -> RGBA
-  -> fast_image_resize to fit 2560x1440 (1440p) or 1920x1080 (1080p), never scaled up
-  -> hardware H.264 (Windows Media Foundation, Linux VA-API), otherwise OpenH264
-  -> Annex-B access unit + duration -> bounded channel -> H.264 TrackLocalStaticSample
+  Windows: Windows Graphics Capture texture -> GPU NV12 -> Media Foundation H.264
+           (falls back to an xcap RGBA screenshot + the same encoder)
+  Linux: xcap RGBA -> VA-API H.264, otherwise OpenH264
+  -> Annex-B access unit, duration exactly 1/fps
+  -> channel of a few frames; a full channel skips the next capture
+  -> H.264 TrackLocalStaticSample
 receiver:
   on_track(video) -> RTP reader -> H.264 depacketizer -> access unit
-  -> decoder thread (openh264) -> RGBA frame -> drop-oldest queue (capacity 2) -> UI image
+  -> decoder thread (Windows DXVA H.264, otherwise OpenH264) -> NV12
+  -> queue (capacity 2) -> shader, color conversion on the GPU
 ```
 
-Frame rate defaults to 60 fps with the 1440p cap. Other rates from 5 to 60 remain selectable, and high quality adds 120 fps. The share picker also asks for desktop mode (crisp fonts) or game mode (less blur on moving images). That choice does not change the resolution or frame rate. On Windows and Linux the picture is encoded by the GPU's H.264 encoder when one is registered. High quality uses H.264 High at the fixed bitrate on both.
+Frame rate defaults to 60 fps with the 1440p cap. Other rates from 5 to 60 remain selectable, and high quality adds 120 fps. The share picker also asks for desktop mode (crisp fonts) or game mode (less blur on moving images). That choice does not change the resolution or frame rate. On Windows and Linux the picture is encoded by the GPU's H.264 encoder when one is registered. High quality uses H.264 High at the fixed bitrate on both, with an IDR only when a viewer asks for one and a 100 ms rate-control window. The viewer still plays up to one second behind the newest picture.
 
 ### 6.4 Peer management and negotiation
 

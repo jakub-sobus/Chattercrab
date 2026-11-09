@@ -1,14 +1,15 @@
 //! View functions for the three screens. Plain widgets, no animations.
 
 use chattercrab_media::{PEER_VOLUME_MAX, PeerConnectionState, ScreenContent, ScreenScale};
-use iced::widget::image::FilterMethod;
+use iced::widget::shader::Shader;
 use iced::widget::{
-    Column, button, checkbox, column, container, image, pick_list, row, scrollable, slider, space,
-    text, text_input, toggler,
+    Column, button, checkbox, column, container, pick_list, row, scrollable, slider, space, text,
+    text_input, toggler,
 };
-use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Theme};
+use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 
 use super::room_model::MemberView;
+use super::share_view::ShareView;
 use super::{App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, selectable};
 use crate::config::ThemeChoice;
 
@@ -443,12 +444,12 @@ fn bottom_bar(room: &RoomScreen, noise_suppression: bool, input_gain: f32) -> El
 
 fn share_stage(room: &RoomScreen) -> Element<'_, Message> {
     match &room.frame {
-        Some(handle) => image(handle.clone())
-            .filter_method(FilterMethod::Nearest)
-            .content_fit(ContentFit::Contain)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+        Some(frame) => Shader::new(ShareView {
+            frame: frame.clone(),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into(),
         None => container(text("Waiting for the first frame..."))
             .center(Length::Fill)
             .into(),

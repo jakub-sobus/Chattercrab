@@ -12,15 +12,30 @@ use tokio::sync::Notify;
 /// Number of decoded frames the UI may have queued.
 pub const VIDEO_QUEUE_CAPACITY: usize = 2;
 
-/// A decoded RGBA8 frame.
-#[derive(Debug, Clone)]
-pub struct RgbaFrame {
+/// A decoded NV12 picture. The UI uploads the two planes and converts them on the GPU.
+#[derive(Clone)]
+pub struct Nv12Frame {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Tightly packed RGBA8 pixels, `width * height * 4` bytes.
-    pub pixels: Arc<[u8]>,
+    /// Bytes from one luma row to the next.
+    pub y_stride: u32,
+    /// Bytes from one chroma row to the next. Each row holds `width` bytes of interleaved UV.
+    pub uv_stride: u32,
+    /// Luma plane.
+    pub y: Arc<[u8]>,
+    /// Interleaved chroma plane.
+    pub uv: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for Nv12Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Nv12Frame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Bounded queue of decoded frames (capacity [`VIDEO_QUEUE_CAPACITY`]).
@@ -31,7 +46,7 @@ pub struct VideoFrameQueue {
 
 #[derive(Debug)]
 struct Inner {
-    frames: Mutex<VecDeque<RgbaFrame>>,
+    frames: Mutex<VecDeque<Nv12Frame>>,
     /// Wakes [`VideoFrameQueue::push`] when a slot frees up.
     space: Condvar,
     /// Wakes [`VideoFrameQueue::next`].
@@ -65,7 +80,7 @@ impl VideoFrameQueue {
     }
 
     /// Queues `frame`, waiting while the queue is full.
-    pub fn push(&self, frame: RgbaFrame) {
+    pub fn push(&self, frame: Nv12Frame) {
         let mut frame = Some(frame);
         let mut guard = lock(&self.inner.frames);
         loop {
@@ -86,7 +101,7 @@ impl VideoFrameQueue {
     }
 
     /// Queues `frame` if there is room. Returns the frame when the queue is full.
-    pub fn try_push(&self, frame: RgbaFrame) -> Result<(), RgbaFrame> {
+    pub fn try_push(&self, frame: Nv12Frame) -> Result<(), Nv12Frame> {
         let mut guard = lock(&self.inner.frames);
         if guard.len() >= VIDEO_QUEUE_CAPACITY {
             return Err(frame);
@@ -104,14 +119,14 @@ impl VideoFrameQueue {
     }
 
     /// Takes the oldest frame without waiting.
-    pub fn try_pop(&self) -> Option<RgbaFrame> {
+    pub fn try_pop(&self) -> Option<Nv12Frame> {
         let frame = lock(&self.inner.frames).pop_front()?;
         self.inner.space.notify_one();
         Some(frame)
     }
 
     /// Waits for the next frame.
-    pub async fn next(&self) -> RgbaFrame {
+    pub async fn next(&self) -> Nv12Frame {
         loop {
             let notified = self.inner.notify.notified();
             if let Some(frame) = self.try_pop() {
@@ -122,7 +137,7 @@ impl VideoFrameQueue {
     }
 }
 
-fn lock(frames: &Mutex<VecDeque<RgbaFrame>>) -> MutexGuard<'_, VecDeque<RgbaFrame>> {
+fn lock(frames: &Mutex<VecDeque<Nv12Frame>>) -> MutexGuard<'_, VecDeque<Nv12Frame>> {
     frames
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -132,11 +147,14 @@ fn lock(frames: &Mutex<VecDeque<RgbaFrame>>) -> MutexGuard<'_, VecDeque<RgbaFram
 mod tests {
     use super::*;
 
-    fn frame(width: u32) -> RgbaFrame {
-        RgbaFrame {
+    fn frame(width: u32) -> Nv12Frame {
+        Nv12Frame {
             width,
-            height: 1,
-            pixels: Arc::from(vec![0u8; width as usize * 4]),
+            height: 2,
+            y_stride: width,
+            uv_stride: width,
+            y: Arc::from(vec![0u8; width as usize * 2]),
+            uv: Arc::from(vec![128u8; width as usize]),
         }
     }
 

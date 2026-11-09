@@ -3,9 +3,9 @@
 //! The GUI never touches WebRTC or audio devices directly. It starts a [`MediaEngine`],
 //! sends [`MediaCommand`]s and reacts to [`MediaEvent`]s, all over bounded
 //! `tokio::sync::mpsc` channels. Decoded remote screen-share frames are delivered
-//! through a [`VideoFrameQueue`]. The queue keeps the frames it already has when it
-//! is full; the screen receiver plays them on a clock up to one second behind the
-//! sender so a jittery share stays smooth.
+//! through a [`VideoFrameQueue`] of NV12 pictures. The queue keeps the frames it
+//! already has when it is full; the screen receiver plays them on a clock up to
+//! one second behind the sender so a jittery share stays smooth.
 //!
 //! The types in this file are the public API contract shared by the media engine and
 //! the client (additive changes are recorded in `API_CHANGES.md`). The building blocks
@@ -27,7 +27,7 @@ mod video_queue;
 
 pub use audio::{INPUT_GAIN_MAX, INPUT_GAIN_MIN, clamp_input_gain};
 pub use mixer::PEER_VOLUME_MAX;
-pub use video_queue::{RgbaFrame, VideoFrameQueue};
+pub use video_queue::{Nv12Frame, VideoFrameQueue};
 
 use chattercrab_protocol::{IceServers, PeerId};
 use tokio::sync::mpsc;
