@@ -46,6 +46,20 @@ Behavior notes for the client (no type changes):
   The delay starts at 50 ms (at least three frames) and grows with jitter and
   underruns. After 5 s without an underrun or increase it decays back toward the
   jitter target by skipping (still decoding) one picture at most every 250 ms.
+- A screen share encodes only captures that changed: on Windows a new Windows
+  Graphics Capture frame (cursor moves included), otherwise a screenshot that is
+  not byte-identical to the last one. A keyframe request always encodes, and an
+  idle share still sends a picture about once a second. Each picture is an
+  `EncodedVideo` with one frame period as `duration`. Time that produced no
+  picture (unchanged, dropped, or rate-control-skipped captures, and ticks late
+  by half a period or more) goes out just before the next picture as an
+  `EncodedVideo` with empty `data` and the skipped time as `duration`;
+  `video_pump` writes it as an empty sample, which sends no packet and only
+  advances the RTP timestamp. So screen RTP timestamps follow wall time, and a
+  viewer sees gaps of up to about one second between pictures. A gap is not an
+  underrun: a picture is late only if it arrives after its RTP due time. The
+  standard two-second IDR period counts encoded pictures, so an idle share gets
+  periodic IDRs much less often; a joining viewer's keyframe request covers that.
 - Every screen-share encoder (Media Foundation, D3D11 video processor, VA-API,
   OpenH264) produces BT.709 limited-range YCbCr and signals it in the SPS VUI
   where the encoder allows, matching the viewer's BT.709 shader.

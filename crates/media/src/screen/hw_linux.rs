@@ -273,20 +273,31 @@ impl HwEncoder {
     }
 
     fn upload(&self, rgba: &[u8]) -> Result<(), String> {
-        let nv12 = nv12_frame(rgba, self.width, self.height, self.coded_w, self.coded_h);
-        let mut mapped = ptr::null_mut();
+        let mut mapped: *mut c_void = ptr::null_mut();
         self.va.check("mapping the NV12 image", unsafe {
             (self.va.map_buffer)(self.dpy, self.image.buf, &mut mapped)
         })?;
-        let copied = copy_nv12(
-            &self.image,
-            mapped.cast(),
-            &nv12,
-            self.coded_w as usize,
-            self.coded_h as usize,
-        );
+        let written = nv12_layout(&self.image, self.coded_w, self.coded_h).and_then(|layout| {
+            if mapped.is_null() {
+                return Err("VA-API mapped the NV12 image at null".to_owned());
+            }
+            let base = mapped.cast::<u8>();
+            // SAFETY: the mapping is `data_size` bytes, and `nv12_layout` checked
+            // that both planes lie inside it and do not overlap.
+            let (y, uv) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(base.add(layout.y_offset), layout.y_len),
+                    std::slice::from_raw_parts_mut(base.add(layout.uv_offset), layout.uv_len),
+                )
+            };
+            let (w, h) = (self.width as usize, self.height as usize);
+            let coded = (self.coded_w as usize, self.coded_h as usize);
+            super::rgba_to_nv12(rgba, w, h, y, layout.y_pitch, uv, layout.uv_pitch);
+            super::fill_nv12_padding((w, h), coded, y, layout.y_pitch, uv, layout.uv_pitch);
+            Ok(())
+        });
         let _ = unsafe { (self.va.unmap_buffer)(self.dpy, self.image.buf) };
-        copied?;
+        written?;
         self.va.check("vaPutImage", unsafe {
             (self.va.put_image)(
                 self.dpy,
@@ -1045,19 +1056,48 @@ fn nv12_image(va: &Va, dpy: *mut c_void, coded_w: u32, coded_h: u32) -> Result<V
     if u32::from(image.width) < coded_w || u32::from(image.height) < coded_h {
         return Err("VA-API image is smaller than the coded frame".into());
     }
-    if image.pitches[0] < coded_w
-        || image.pitches[1] < coded_w
-        || image.offsets[1] <= image.offsets[0]
-    {
+    nv12_layout(&image, coded_w, coded_h)?;
+    Ok(image)
+}
+
+/// Where the planes of a mapped NV12 image are. Byte offsets and lengths, each
+/// plane ending at the coded width of its last row.
+struct Nv12Layout {
+    y_offset: usize,
+    y_pitch: usize,
+    y_len: usize,
+    uv_offset: usize,
+    uv_pitch: usize,
+    uv_len: usize,
+}
+
+/// Checks that both planes of `image` fit in its buffer, luma before chroma
+/// with no overlap, and that each row holds the coded width.
+fn nv12_layout(image: &VaImage, coded_w: u32, coded_h: u32) -> Result<Nv12Layout, String> {
+    let (cw, ch) = (coded_w as usize, coded_h as usize);
+    let y_pitch = image.pitches[0] as usize;
+    let uv_pitch = image.pitches[1] as usize;
+    let y_offset = image.offsets[0] as usize;
+    let uv_offset = image.offsets[1] as usize;
+    if cw == 0 || ch < 2 || y_pitch < cw || uv_pitch < cw {
         return Err("VA-API NV12 image layout is unusable".into());
     }
-    let rows = u64::from(coded_h / 2).saturating_sub(1);
-    let last =
-        u64::from(image.offsets[1]) + rows * u64::from(image.pitches[1]) + u64::from(coded_w);
-    if last > u64::from(image.data_size) {
+    let y_len = (ch - 1) * y_pitch + cw;
+    let uv_len = (ch / 2 - 1) * uv_pitch + cw;
+    if y_offset + y_len > uv_offset {
+        return Err("VA-API NV12 image layout is unusable".into());
+    }
+    if uv_offset + uv_len > image.data_size as usize {
         return Err("VA-API NV12 image is smaller than the frame".into());
     }
-    Ok(image)
+    Ok(Nv12Layout {
+        y_offset,
+        y_pitch,
+        y_len,
+        uv_offset,
+        uv_pitch,
+        uv_len,
+    })
 }
 
 fn profile_name(profile: i32) -> &'static str {
@@ -1102,59 +1142,6 @@ fn stored_picture(reference: &Reference) -> VaPictureH264 {
         bottom_field_order_cnt: reference.poc as i32,
         ..VaPictureH264::default()
     }
-}
-
-fn nv12_frame(rgba: &[u8], width: u32, height: u32, coded_w: u32, coded_h: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let cw = coded_w as usize;
-    let ch = coded_h as usize;
-    let mut tight = vec![0u8; w * h * 3 / 2];
-    let (y_plane, uv_plane) = tight.split_at_mut(w * h);
-    super::rgba_to_nv12(rgba, w, h, y_plane, uv_plane);
-    let mut out = vec![16u8; cw * ch + cw * ch / 2];
-    out[cw * ch..].fill(128);
-    for row in 0..h {
-        out[row * cw..row * cw + w].copy_from_slice(&y_plane[row * w..(row + 1) * w]);
-    }
-    let uv_base = cw * ch;
-    for row in 0..h / 2 {
-        let dst = uv_base + row * cw;
-        out[dst..dst + w].copy_from_slice(&uv_plane[row * w..(row + 1) * w]);
-    }
-    out
-}
-
-fn copy_nv12(
-    image: &VaImage,
-    base: *mut u8,
-    nv12: &[u8],
-    coded_w: usize,
-    coded_h: usize,
-) -> Result<(), String> {
-    let y_bytes = coded_w * coded_h;
-    if nv12.len() < y_bytes + y_bytes / 2 {
-        return Err("NV12 frame is short".into());
-    }
-    let data_size = image.data_size as usize;
-    unsafe {
-        for row in 0..coded_h {
-            let dst_off = image.offsets[0] as usize + row * image.pitches[0] as usize;
-            if dst_off + coded_w > data_size {
-                return Err("NV12 image is smaller than the frame".into());
-            }
-            ptr::copy_nonoverlapping(nv12[row * coded_w..].as_ptr(), base.add(dst_off), coded_w);
-        }
-        let uv = &nv12[y_bytes..];
-        for row in 0..coded_h / 2 {
-            let dst_off = image.offsets[1] as usize + row * image.pitches[1] as usize;
-            if dst_off + coded_w > data_size {
-                return Err("NV12 image is smaller than the frame".into());
-            }
-            ptr::copy_nonoverlapping(uv[row * coded_w..].as_ptr(), base.add(dst_off), coded_w);
-        }
-    }
-    Ok(())
 }
 
 fn normalize(data: Vec<u8>) -> Vec<u8> {
