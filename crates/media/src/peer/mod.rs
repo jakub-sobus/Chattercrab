@@ -19,7 +19,7 @@ mod rtcp;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -173,11 +173,16 @@ pub struct SendTarget {
     ssrc: u32,
     /// Negotiated payload type, `u16::MAX` until known.
     payload_type: AtomicU16,
+    /// Last RTCP `fraction_lost` (0..=255) the peer reported for this track. Audio only.
+    fraction_lost: Arc<AtomicU8>,
 }
 
 impl SendTarget {
     /// Packetizes and sends one encoded sample. Fails (harmlessly) until negotiation has
     /// bound the track.
+    ///
+    /// An empty `data` sends nothing but advances the RTP timestamp by `duration`
+    /// without a sequence-number gap; the audio pump uses it for DTX frames.
     pub async fn write(&self, data: Bytes, duration: Duration) -> Result<(), MediaError> {
         let pt = match self.payload_type.load(Ordering::Relaxed) {
             u16::MAX => {
@@ -195,6 +200,7 @@ impl SendTarget {
             }
             pt => pt as u8,
         };
+        let empty = data.is_empty();
         let sample = Sample {
             data,
             duration,
@@ -205,11 +211,16 @@ impl SendTarget {
             .sample_writer(self.ssrc, pt)
             .write_sample(&sample)
             .await;
-        if result.is_err() {
+        if result.is_err() && !empty {
             // Re-resolve the payload type next time in case negotiation changed it.
             self.payload_type.store(u16::MAX, Ordering::Relaxed);
         }
         result.map_err(|e| MediaError::WebRtc(e.to_string()))
+    }
+
+    /// Last RTCP `fraction_lost` (0..=255) the peer reported for this audio track.
+    pub fn fraction_lost(&self) -> u8 {
+        self.fraction_lost.load(Ordering::Relaxed)
     }
 }
 
@@ -218,14 +229,12 @@ pub type SendTargets = Arc<[Arc<SendTarget>]>;
 
 struct LocalSender {
     target: Arc<SendTarget>,
-    rtcp_task: Option<JoinHandle<()>>,
+    rtcp_task: JoinHandle<()>,
 }
 
 impl Drop for LocalSender {
     fn drop(&mut self) {
-        if let Some(t) = self.rtcp_task.take() {
-            t.abort();
-        }
+        self.rtcp_task.abort();
     }
 }
 
@@ -438,7 +447,8 @@ impl PeerManager {
         self.peers.keys().copied().collect()
     }
 
-    /// Audio send targets; the audio pump writes every encoded frame to each of them.
+    /// Audio send targets; the audio pump writes every encoded frame to each of them
+    /// (DTX frames as empty samples).
     pub fn audio_targets(&self) -> watch::Receiver<SendTargets> {
         self.audio_targets.subscribe()
     }
@@ -501,7 +511,7 @@ impl PeerManager {
             )
             .with(
                 Slot::from(rtcp::RTCP_FORWARDER_SLOT),
-                rtcp::KeyframeRequestForwarder::default(),
+                rtcp::RtcpFeedbackForwarder::default(),
             );
 
         let config = RTCConfigurationBuilder::new()
@@ -948,8 +958,9 @@ impl PeerManager {
     }
 }
 
-/// Creates a local track, adds it to `pc`, and (for video) starts a task that watches
-/// for keyframe requests from the remote peer.
+/// Creates a local track, adds it to `pc`, and starts a task that reads the remote
+/// peer's RTCP feedback for it: keyframe requests for video (`keyframe`), receiver
+/// report packet loss for audio.
 async fn attach_track(
     peer: PeerId,
     pc: &Arc<dyn PeerConnection>,
@@ -963,9 +974,10 @@ async fn attach_track(
         .add_track(track.clone() as Arc<dyn TrackLocal>)
         .await
         .map_err(webrtc_err)?;
-    let rtcp_task = keyframe.map(|flag| {
-        let watched = track.clone();
-        tokio::spawn(async move {
+    let fraction_lost = Arc::new(AtomicU8::new(0));
+    let watched = track.clone();
+    let rtcp_task = match keyframe {
+        Some(flag) => tokio::spawn(async move {
             while let Some(event) = watched.poll().await {
                 if let TrackLocalEvent::OnRtcpPacket(packets) = event
                     && packets
@@ -975,8 +987,23 @@ async fn attach_track(
                     flag.store(true, Ordering::Relaxed);
                 }
             }
-        })
-    });
+        }),
+        None => {
+            let lost = fraction_lost.clone();
+            tokio::spawn(async move {
+                while let Some(event) = watched.poll().await {
+                    if let TrackLocalEvent::OnRtcpPacket(packets) = event {
+                        for f in packets
+                            .iter()
+                            .filter_map(|p| rtcp::fraction_lost(p.as_ref(), ssrc))
+                        {
+                            lost.store(f, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        }
+    };
     Ok(LocalSender {
         target: Arc::new(SendTarget {
             peer,
@@ -984,6 +1011,7 @@ async fn attach_track(
             sender,
             ssrc,
             payload_type: AtomicU16::new(u16::MAX),
+            fraction_lost,
         }),
         rtcp_task,
     })

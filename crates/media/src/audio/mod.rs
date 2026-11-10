@@ -3,7 +3,7 @@
 //! * [`AudioInput`]: cpal input stream, mono downmix in the callback, lock-free SPSC
 //!   ring to a dedicated encoder thread that resamples to 48 kHz, applies microphone
 //!   gain, optionally mixes system audio, cuts 20 ms frames and encodes them with Opus
-//!   (VoIP, 96 kbps, DTX, in-band FEC, complexity 5).
+//!   (VoIP, 96 kbps, DTX, in-band FEC tuned to the reported packet loss, complexity 5).
 //! * [`AudioOutput`]: cpal output stream fed from an SPSC ring of mono `f32` samples at
 //!   the device rate; the matching [`OutputSink`] is handed to the mixer thread.
 //! * Device enumeration and lookup by name.
@@ -35,6 +35,13 @@ pub const MAX_OPUS_PACKET: usize = crate::jitter::MAX_PACKET;
 pub const OPUS_BITRATE: i32 = 96_000;
 /// Capacity of the encoded frame channel (16 x 20 ms = 320 ms).
 pub const FRAME_CHANNEL_CAPACITY: usize = 16;
+/// Opus packets this short are DTX frames that need not be transmitted (libopus emits
+/// a bare TOC byte). The periodic comfort-noise updates are larger and are sent.
+pub const DTX_MAX_BYTES: usize = 2;
+/// Highest packet loss, in percent, the encoder is told to expect.
+pub const MAX_PACKET_LOSS_PERC: u8 = 20;
+/// Time constant of the decay of the smoothed packet loss.
+const LOSS_DECAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// One encoded 20 ms Opus frame. Fixed-size so it can be passed through channels
 /// without a heap allocation per frame.
@@ -195,10 +202,29 @@ pub fn new_opus_encoder() -> Result<opus::Encoder, MediaError> {
         .map_err(codec)?;
     enc.set_dtx(true).map_err(codec)?;
     enc.set_inband_fec(true).map_err(codec)?;
-    // In-band FEC is only emitted when the encoder expects loss.
-    enc.set_packet_loss_perc(10).map_err(codec)?;
+    // In-band FEC is only emitted when the encoder expects loss. The encoder thread
+    // follows the receivers' reports from here (see `loss_percent`).
+    enc.set_packet_loss_perc(0).map_err(codec)?;
     enc.set_complexity(5).map_err(codec)?;
     Ok(enc)
+}
+
+/// Smooths the RTCP `fraction_lost` (0..=255) reported by the receivers: rises at once
+/// to a higher report, decays towards a lower one with a 3 s time constant (FEC is off
+/// again about 10 s after 10 % loss stops). `elapsed` is the time since the last call.
+pub(crate) fn smooth_loss(smoothed: f32, reported: u8, elapsed: std::time::Duration) -> f32 {
+    let reported = f32::from(reported);
+    if reported >= smoothed {
+        return reported;
+    }
+    let step = (elapsed.as_secs_f32() / LOSS_DECAY.as_secs_f32()).min(1.0);
+    smoothed - (smoothed - reported) * step
+}
+
+/// Packet loss percentage for the encoder from a smoothed `fraction_lost`: 0 on a clean
+/// link, capped at [`MAX_PACKET_LOSS_PERC`].
+pub(crate) fn loss_percent(smoothed: f32) -> u8 {
+    ((smoothed * 100.0 / 256.0).round() as u8).min(MAX_PACKET_LOSS_PERC)
 }
 
 /// Creates a 48 kHz mono Opus decoder.
@@ -256,6 +282,50 @@ mod tests {
             last = enc.encode_float(&zeros, &mut out).unwrap();
         }
         assert!(last <= 3, "silent frame was {last} bytes");
+    }
+
+    #[test]
+    fn loss_rises_at_once_and_decays_slowly_to_zero() {
+        let frame = std::time::Duration::from_millis(20);
+        assert_eq!(loss_percent(0.0), 0);
+        // Below 0.5 % (1/256) counts as clean.
+        assert_eq!(loss_percent(smooth_loss(0.0, 1, frame)), 0);
+        // 10 % loss (26/256) is taken over immediately.
+        let mut s = smooth_loss(0.0, 26, frame);
+        assert_eq!(loss_percent(s), 10);
+        // Heavy loss is capped.
+        assert_eq!(
+            loss_percent(smooth_loss(s, 255, frame)),
+            MAX_PACKET_LOSS_PERC
+        );
+        // After the loss stops, FEC stays on for a while ...
+        for _ in 0..50 {
+            s = smooth_loss(s, 0, frame);
+        }
+        assert!((7..10).contains(&loss_percent(s)), "{}", loss_percent(s));
+        // ... and is off again after about 10 s.
+        for _ in 0..500 {
+            s = smooth_loss(s, 0, frame);
+        }
+        assert_eq!(loss_percent(s), 0);
+        // A long gap between calls does not overshoot below the report.
+        assert_eq!(
+            smooth_loss(200.0, 13, std::time::Duration::from_secs(60)),
+            13.0
+        );
+    }
+
+    #[test]
+    fn dtx_frames_are_not_worth_sending() {
+        let mut enc = new_opus_encoder().unwrap();
+        let zeros = [0f32; FRAME_SAMPLES];
+        let mut out = [0u8; MAX_OPUS_PACKET];
+        let sizes: Vec<usize> = (0..60)
+            .map(|_| enc.encode_float(&zeros, &mut out).unwrap())
+            .collect();
+        // Mostly DTX frames, with periodic comfort-noise updates that must be sent.
+        assert!(sizes.iter().filter(|&&n| n <= DTX_MAX_BYTES).count() > 30);
+        assert!(sizes[20..].iter().any(|&n| n > DTX_MAX_BYTES));
     }
 
     #[test]

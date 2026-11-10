@@ -10,6 +10,13 @@
 //! The playout delay adapts between [`MIN_TARGET_FRAMES`] (40 ms) and [`MAX_FRAMES`]
 //! (120 ms) from an RFC 3550 interarrival jitter estimate and observed underruns.
 //! All storage is a fixed array of slots; nothing allocates after construction.
+//!
+//! Senders do not transmit Opus DTX frames, so a pause shows up as a jump in the RTP
+//! timestamp with contiguous sequence numbers. When the buffer runs dry, playout holds
+//! its position and conceals (PLC) instead of skipping ahead. The first packet after
+//! the hold tells the two cases apart by its timestamp: a packet that is later than its
+//! media time is an underrun and raises the target; a packet after skipped (DTX) frames
+//! starts a new talk spurt, which buffers up to the target again before playing.
 
 use std::time::Instant;
 
@@ -21,10 +28,20 @@ pub const FRAME_TS: u32 = 960;
 pub const MAX_PACKET: usize = 1276;
 /// Minimum (and initial) playout target: 2 frames = 40 ms.
 pub const MIN_TARGET_FRAMES: u16 = 2;
-/// Maximum buffered span: 6 frames = 120 ms.
+/// Maximum playout target: 6 frames = 120 ms.
 pub const MAX_FRAMES: u16 = 6;
-/// Number of slots (power of two, larger than `MAX_FRAMES` plus reorder headroom).
+/// Number of slots (power of two, larger than `MAX_FRAMES` plus burst headroom).
 const SLOTS: usize = 16;
+/// A packet this many frames ahead of the playout point is a stream jump, not a burst:
+/// the buffer resynchronises to it.
+const RESYNC_AHEAD: i32 = SLOTS as i32 - 2;
+/// Buffered frames above the target at which latency control starts dropping frames.
+const EXCESS_FRAMES: i32 = 2;
+/// Latency control drops at most one frame per this many pops (0.5 s).
+const DROP_INTERVAL_POPS: u16 = 25;
+/// Packets after the playout point that latency control searches for a DTX packet to
+/// drop instead of the head.
+const DROP_LOOKAHEAD: u16 = 3;
 /// Consecutive concealed frames after which the buffer stops and re-buffers.
 const MAX_CONSECUTIVE_PLC: u16 = 5;
 /// Good pops (about 5 s) after which an underrun-raised target decays by one frame.
@@ -66,6 +83,7 @@ pub struct JitterStats {
 struct Slot {
     occupied: bool,
     seq: u16,
+    timestamp: u32,
     len: u16,
     data: [u8; MAX_PACKET],
 }
@@ -73,6 +91,7 @@ struct Slot {
 const EMPTY_SLOT: Slot = Slot {
     occupied: false,
     seq: 0,
+    timestamp: 0,
     len: 0,
     data: [0; MAX_PACKET],
 };
@@ -93,6 +112,12 @@ pub struct JitterBuffer {
     underrun_floor: u16,
     good_pops: u32,
     consecutive_plc: u16,
+    /// Pops concealed while holding the playout point on an empty buffer.
+    held: u16,
+    /// RTP timestamp of the frame the next pop plays.
+    expected_ts: u32,
+    /// Pops since latency control last dropped a frame.
+    pops_since_drop: u16,
     /// RFC 3550 jitter estimate in RTP timestamp units (48 kHz), scaled by 16.
     jitter_q4: u32,
     last_transit: Option<i64>,
@@ -116,6 +141,9 @@ impl JitterBuffer {
             underrun_floor: MIN_TARGET_FRAMES,
             good_pops: 0,
             consecutive_plc: 0,
+            held: 0,
+            expected_ts: 0,
+            pops_since_drop: 0,
             jitter_q4: 0,
             last_transit: None,
             epoch: None,
@@ -173,13 +201,16 @@ impl JitterBuffer {
         if let Some(next) = self.next_seq {
             let ahead = seq_diff(seq, next);
             if ahead < 0 {
+                // Arrived after its playout time: a real underrun.
                 self.stats.late += 1;
+                self.raise_floor();
                 return;
             }
-            if ahead >= i32::from(MAX_FRAMES) {
-                // The stream is further ahead than we may buffer: drop what we have,
+            if ahead >= RESYNC_AHEAD {
+                // The stream jumped further ahead than a burst: drop what we have,
                 // move the playout point so this packet sits at the newest end.
                 self.stats.resyncs += 1;
+                self.held = 0;
                 let keep_from = seq.wrapping_sub(MAX_FRAMES - 1);
                 for slot in self.slots.iter_mut() {
                     if slot.occupied && seq_diff(slot.seq, keep_from) < 0 {
@@ -188,6 +219,8 @@ impl JitterBuffer {
                     }
                 }
                 self.next_seq = Some(keep_from);
+            } else if self.held > 0 {
+                self.end_hold(ahead, timestamp);
             }
         } else if let Some(oldest) = self.oldest_seq() {
             // Buffering: a packet far away from what we hold means the stream restarted.
@@ -207,9 +240,32 @@ impl JitterBuffer {
         }
         slot.occupied = true;
         slot.seq = seq;
+        slot.timestamp = timestamp;
         slot.len = payload.len() as u16;
         slot.data[..payload.len()].copy_from_slice(payload);
         self.stats.received += 1;
+    }
+
+    /// Judges the first packet after playout held on an empty buffer. `ahead` is its
+    /// distance from the playout point in sequence numbers.
+    fn end_hold(&mut self, ahead: i32, timestamp: u32) {
+        // Frames of media between the held position and this packet. Lost packets
+        // account for `ahead` of them, frames the sender skipped (DTX) for the rest.
+        let media_gap = timestamp.wrapping_sub(self.expected_ts) as i32 / FRAME_TS as i32;
+        if i32::from(self.held) > media_gap {
+            // Later than its media time: we ran dry, so raise the playout target.
+            self.raise_floor();
+        } else if media_gap > ahead {
+            // A new talk spurt after a pause: buffer up to the target before playing.
+            self.next_seq = None;
+            self.consecutive_plc = 0;
+        }
+        self.held = 0;
+    }
+
+    fn raise_floor(&mut self) {
+        self.underrun_floor = (self.underrun_floor + 1).min(MAX_FRAMES);
+        self.good_pops = 0;
     }
 
     fn update_jitter(&mut self, timestamp: u32, arrival: Instant) {
@@ -262,6 +318,16 @@ impl JitterBuffer {
         self.target = self.computed_target();
     }
 
+    /// Whether latency control should drop the packet at `head` now, rather than wait
+    /// for a DTX packet that is about to reach the head.
+    fn drop_head_now(&self, head: u16) -> bool {
+        let is_dtx = |seq: u16| {
+            self.get(seq)
+                .is_some_and(|s| usize::from(s.len) <= crate::audio::DTX_MAX_BYTES)
+        };
+        is_dtx(head) || !(1..=DROP_LOOKAHEAD).any(|i| is_dtx(head.wrapping_add(i)))
+    }
+
     /// Returns what to play for the next 20 ms frame.
     pub fn pop(&mut self) -> Playout<'_> {
         self.recompute_target();
@@ -280,16 +346,23 @@ impl JitterBuffer {
             }
         };
 
-        // Latency control: if 60 ms more than the target is buffered, skip one frame.
+        // Latency control: while 40 ms or more above the target is buffered, skip one
+        // frame at most every 0.5 s, preferably a DTX packet.
         let mut next = next;
+        self.pops_since_drop = self.pops_since_drop.saturating_add(1);
         if let Some(newest) = self.newest_seq() {
             let span = seq_diff(newest, next) + 1;
-            if span > i32::from(self.target) + 3 {
+            if span >= i32::from(self.target) + EXCESS_FRAMES
+                && self.pops_since_drop >= DROP_INTERVAL_POPS
+                && self.drop_head_now(next)
+            {
                 let idx = Self::slot_index(next);
                 if self.slots[idx].occupied && self.slots[idx].seq == next {
                     self.slots[idx].occupied = false;
                 }
                 self.stats.dropped += 1;
+                self.pops_since_drop = 0;
+                self.expected_ts = self.expected_ts.wrapping_add(FRAME_TS);
                 next = next.wrapping_add(1);
             }
         }
@@ -301,6 +374,7 @@ impl JitterBuffer {
         if self.slots[idx].occupied && self.slots[idx].seq == next {
             self.slots[idx].occupied = false;
             self.consecutive_plc = 0;
+            self.expected_ts = self.slots[idx].timestamp.wrapping_add(FRAME_TS);
             self.good_pops += 1;
             if self.good_pops >= TARGET_DECAY_POPS {
                 self.good_pops = 0;
@@ -311,21 +385,25 @@ impl JitterBuffer {
         }
 
         // Missing frame.
-        self.good_pops = 0;
         if self.buffered() == 0 {
+            // Nothing to play: a pause (DTX) or a late packet. Hold the playout point
+            // so the next packet still plays; `end_hold` decides which it was.
+            self.next_seq = Some(next);
             self.consecutive_plc += 1;
             if self.consecutive_plc > MAX_CONSECUTIVE_PLC {
                 // The stream went quiet: stop and re-buffer when packets return.
                 self.next_seq = None;
                 self.consecutive_plc = 0;
+                self.held = 0;
                 return Playout::Silence;
             }
-            // Underrun: we ran dry, so raise the playout target.
-            self.underrun_floor = (self.underrun_floor + 1).min(MAX_FRAMES);
+            self.held += 1;
             self.stats.plc += 1;
             return Playout::Plc;
         }
 
+        self.good_pops = 0;
+        self.expected_ts = self.expected_ts.wrapping_add(FRAME_TS);
         self.consecutive_plc += 1;
         if self.get(following).is_some() {
             self.stats.fec += 1;
@@ -427,6 +505,8 @@ mod tests {
         // Packet 0 again (late, already played).
         jb.push(0, 0, &pkt(0), t0 + Duration::from_millis(100));
         assert_eq!(jb.stats().late, 1);
+        // Arriving after its playout time is a real underrun.
+        assert!(jb.target_frames() > MIN_TARGET_FRAMES);
         assert_eq!(seq_of(&jb.pop()), Some(2));
     }
 
@@ -487,15 +567,18 @@ mod tests {
         assert!(jb.target_frames() <= MAX_FRAMES);
     }
 
+    // Running dry used to raise the target. Without DTX transmission every pause runs the
+    // buffer dry, so only a packet that turns out to be late counts as an underrun now
+    // (see `late_packet_after_hold_raises_target`).
     #[test]
-    fn underrun_raises_target_and_idle_stream_stops() {
+    fn idle_stream_conceals_then_stops_without_raising_target() {
         let mut jb = JitterBuffer::new();
         let t0 = Instant::now();
         feed(&mut jb, t0, [0, 1]);
         jb.pop();
         jb.pop();
         assert_eq!(jb.pop(), Playout::Plc);
-        assert!(jb.target_frames() > MIN_TARGET_FRAMES);
+        assert_eq!(jb.target_frames(), MIN_TARGET_FRAMES);
         // Keep popping with nothing arriving: the buffer stops and returns silence.
         let mut saw_silence = false;
         for _ in 0..10 {
@@ -505,6 +588,153 @@ mod tests {
         }
         assert!(saw_silence);
         assert!(!jb.is_playing());
+        assert_eq!(jb.target_frames(), MIN_TARGET_FRAMES);
+    }
+
+    /// Pushes `packets` (sequence number, media frame) arriving at `tick`, then pops once.
+    fn tick(
+        jb: &mut JitterBuffer,
+        t0: Instant,
+        tick: u32,
+        packets: &[(u16, u32)],
+    ) -> Playout<'static> {
+        let at = t0 + Duration::from_millis(u64::from(tick) * 20);
+        for &(seq, frame) in packets {
+            jb.push(seq, frame.wrapping_mul(FRAME_TS), &pkt(seq), at);
+        }
+        match jb.pop() {
+            Playout::Packet(_) => Playout::Packet(&[]),
+            Playout::Fec(_) => Playout::Fec(&[]),
+            Playout::Plc => Playout::Plc,
+            Playout::Silence => Playout::Silence,
+        }
+    }
+
+    #[test]
+    fn dtx_gap_does_not_raise_target() {
+        let mut jb = JitterBuffer::new();
+        let t0 = Instant::now();
+        for i in 0..20u16 {
+            tick(&mut jb, t0, u32::from(i), &[(i, u32::from(i))]);
+        }
+        // The sender skips media frames 20..=22 (DTX): sequence numbers stay contiguous,
+        // the timestamp jumps. Playout conceals while the buffer is dry.
+        assert_eq!(tick(&mut jb, t0, 20, &[]), Playout::Packet(&[]));
+        assert_eq!(tick(&mut jb, t0, 21, &[]), Playout::Plc);
+        assert_eq!(tick(&mut jb, t0, 22, &[]), Playout::Plc);
+        // The next talk spurt re-buffers to the target, then plays every packet.
+        assert_eq!(tick(&mut jb, t0, 23, &[(20, 23)]), Playout::Silence);
+        let mut played = 0;
+        for i in 21..60u16 {
+            let frame = u32::from(i) + 3;
+            if tick(&mut jb, t0, frame, &[(i, frame)]) == Playout::Packet(&[]) {
+                played += 1;
+            }
+        }
+        assert_eq!(played, 39);
+        assert_eq!(jb.target_frames(), MIN_TARGET_FRAMES);
+        assert_eq!(jb.stats().late, 0);
+        // A pause longer than the concealment limit also leaves the target alone.
+        for t in 63..80 {
+            tick(&mut jb, t0, t, &[]);
+        }
+        assert!(!jb.is_playing());
+        for i in 60..70u16 {
+            let frame = u32::from(i) + 20;
+            tick(&mut jb, t0, frame, &[(i, frame)]);
+        }
+        assert!(jb.is_playing());
+        assert_eq!(jb.target_frames(), MIN_TARGET_FRAMES);
+    }
+
+    #[test]
+    fn late_packet_after_hold_raises_target() {
+        let mut jb = JitterBuffer::new();
+        let t0 = Instant::now();
+        for i in 0..20u16 {
+            tick(&mut jb, t0, u32::from(i), &[(i, u32::from(i))]);
+        }
+        // Packets 20..=22 are delayed by 60 ms and arrive in one burst.
+        assert_eq!(tick(&mut jb, t0, 20, &[]), Playout::Packet(&[]));
+        assert_eq!(tick(&mut jb, t0, 21, &[]), Playout::Plc);
+        assert_eq!(tick(&mut jb, t0, 22, &[]), Playout::Plc);
+        let burst = [(20, 20), (21, 21), (22, 22), (23, 23)];
+        // Nothing is lost: playout continues from the held position.
+        assert_eq!(tick(&mut jb, t0, 23, &burst), Playout::Packet(&[]));
+        assert!(jb.target_frames() > MIN_TARGET_FRAMES);
+        assert_eq!(jb.stats().late, 0);
+    }
+
+    #[test]
+    fn bursty_arrivals_at_high_target_do_not_resync() {
+        let mut jb = JitterBuffer::new();
+        jb.underrun_floor = 5;
+        let t0 = Instant::now();
+        let mut played = 0;
+        // Packets arrive in bursts of four every 80 ms.
+        for t in 0..400u32 {
+            let burst: Vec<(u16, u32)> = if t % 4 == 3 {
+                (t - 3..=t).map(|f| (f as u16, f)).collect()
+            } else {
+                Vec::new()
+            };
+            if tick(&mut jb, t0, t, &burst) == Playout::Packet(&[]) {
+                played += 1;
+            }
+        }
+        assert!(jb.target_frames() >= 5);
+        assert_eq!(jb.stats().resyncs, 0);
+        assert_eq!(jb.stats().plc, 0);
+        // At most one frame per latency-control interval is skipped.
+        assert!(jb.stats().dropped <= 400 / u64::from(DROP_INTERVAL_POPS));
+        assert!(played >= 380, "played {played}");
+    }
+
+    #[test]
+    fn standing_excess_drains_gradually_across_wraparound() {
+        let mut jb = JitterBuffer::new();
+        let t0 = Instant::now();
+        let start = 65_500u16;
+        // A 12-frame backlog arrives at once, then one packet per tick.
+        let backlog: Vec<(u16, u32)> = (0..12u16)
+            .map(|i| (start.wrapping_add(i), u32::from(i)))
+            .collect();
+        tick(&mut jb, t0, 0, &backlog);
+        for t in 1..400u32 {
+            let i = 11 + t as u16;
+            tick(&mut jb, t0, t, &[(start.wrapping_add(i), u32::from(i))]);
+            if t + 1 < u32::from(DROP_INTERVAL_POPS) {
+                assert_eq!(jb.stats().dropped, 0, "dropped too early at tick {t}");
+            }
+        }
+        let stats = jb.stats();
+        assert_eq!(stats.resyncs, 0);
+        assert_eq!(stats.plc, 0);
+        assert!(stats.dropped <= 400 / u64::from(DROP_INTERVAL_POPS));
+        // Drained back to within the latency-control margin.
+        let span = seq_diff(jb.newest_seq().unwrap(), jb.next_seq.unwrap()) + 1;
+        assert!(
+            span < i32::from(jb.target_frames()) + EXCESS_FRAMES,
+            "span {span}"
+        );
+    }
+
+    #[test]
+    fn latency_control_prefers_dtx_packets() {
+        let mut jb = JitterBuffer::new();
+        let t0 = Instant::now();
+        jb.pops_since_drop = DROP_INTERVAL_POPS;
+        // Frames 0..8 buffered; 2 is a DTX packet (as old senders still transmit them).
+        for seq in 0..8u16 {
+            let normal = pkt(seq);
+            let payload: &[u8] = if seq == 2 { &[0xF8] } else { &normal };
+            jb.push(seq, u32::from(seq) * FRAME_TS, payload, t0);
+        }
+        // 0 and 1 play while the DTX packet is in sight; then 2 is skipped.
+        assert_eq!(seq_of(&jb.pop()), Some(0));
+        assert_eq!(seq_of(&jb.pop()), Some(1));
+        assert_eq!(seq_of(&jb.pop()), Some(3));
+        assert_eq!(jb.stats().dropped, 1);
     }
 
     #[test]

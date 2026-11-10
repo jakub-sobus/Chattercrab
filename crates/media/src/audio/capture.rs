@@ -1,7 +1,7 @@
 //! Microphone capture and the Opus encoder thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,9 @@ pub struct AudioInput {
     pub device_rate: u32,
     /// Shared counters.
     pub stats: Arc<CaptureStats>,
+    /// Packet loss in percent the encoder tunes in-band FEC for, read every frame.
+    /// Starts at 0; the media engine feeds it from the receivers' RTCP reports.
+    pub packet_loss: Arc<AtomicU8>,
     stream: Option<cpal::Stream>,
     /// Synthetic tone thread standing in for the device callback (diagnostics only).
     generator: Option<JoinHandle<()>>,
@@ -157,6 +160,7 @@ impl AudioInput {
                 denoise,
                 gain,
                 share,
+                packet_loss: Arc::default(),
             },
             level,
             stats,
@@ -199,6 +203,7 @@ impl AudioInput {
                 denoise,
                 gain,
                 share,
+                packet_loss: Arc::default(),
             },
             level,
             stats.clone(),
@@ -226,6 +231,7 @@ impl AudioInput {
     ) -> Result<Self, MediaError> {
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
+        let packet_loss = flags.packet_loss.clone();
         let worker = EncoderWorker::new(
             cons,
             rate,
@@ -245,6 +251,7 @@ impl AudioInput {
             device_name: name,
             device_rate: rate,
             stats,
+            packet_loss,
             stream: None,
             generator: None,
             stop,
@@ -372,6 +379,8 @@ struct Flags {
     gain: Arc<AtomicU32>,
     /// System audio mixed in after the microphone is processed.
     share: Arc<ShareMix>,
+    /// Expected packet loss in percent.
+    packet_loss: Arc<AtomicU8>,
 }
 
 /// State owned by the encoder thread.
@@ -442,6 +451,8 @@ impl EncoderWorker {
         let mut denoiser = Denoiser::new();
         let mut denoise_was_on = false;
         let mut was_muted = false;
+        // `new_opus_encoder` starts at 0 % expected loss.
+        let mut packet_loss = 0u8;
         let mut packet = [0u8; MAX_OPUS_PACKET];
         let mut index = 0u64;
         let mut latency_sum_us = 0u64;
@@ -493,6 +504,14 @@ impl EncoderWorker {
                 self.level.store(rms.to_bits(), Ordering::Relaxed);
                 // Mute silences the microphone only. Shared application audio still goes out.
                 self.flags.share.mix_into(&mut frame_buf);
+                let loss = self.flags.packet_loss.load(Ordering::Relaxed);
+                if loss != packet_loss {
+                    match self.encoder.set_packet_loss_perc(i32::from(loss)) {
+                        Ok(()) => tracing::debug!(percent = loss, "opus expected packet loss"),
+                        Err(e) => tracing::warn!("opus packet loss: {e}"),
+                    }
+                    packet_loss = loss;
+                }
                 match self.encoder.encode_float(&frame_buf, &mut packet) {
                     Ok(len) => {
                         if let Some(f) = OpusFrame::new(&packet[..len], index) {

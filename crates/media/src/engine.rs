@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
-use crate::audio::{AudioInput, AudioOutput, OpusFrame, ShareMix, SystemCapture};
+use crate::audio::{
+    AudioInput, AudioOutput, DTX_MAX_BYTES, OpusFrame, ShareMix, SystemCapture, loss_percent,
+    smooth_loss,
+};
 use crate::clamp_input_gain;
 use crate::mixer::{MixerControl, MixerHandle, PeerAudioControls, PeerSlot, RtpAudioPacket};
 use crate::peer::{InternalEvent, PeerEvent, PeerManager, PeerSettings, SendTargets};
@@ -196,8 +199,11 @@ impl Engine {
             Ok(Ok(mut input)) => {
                 let (_, dummy) = mpsc::channel(1);
                 let frames = std::mem::replace(&mut input.frames, dummy);
-                self.audio_pump =
-                    Some(tokio::spawn(audio_pump(frames, self.peers.audio_targets())));
+                self.audio_pump = Some(tokio::spawn(audio_pump(
+                    frames,
+                    self.peers.audio_targets(),
+                    input.packet_loss.clone(),
+                )));
                 self.input = Some(input);
             }
             Ok(Err(e)) => self.error(format!("microphone unavailable: {e}")).await,
@@ -492,17 +498,34 @@ impl Engine {
     }
 }
 
-/// Writes every encoded audio frame to all audio send targets.
+/// Writes every encoded audio frame to all audio send targets. DTX frames are written
+/// as empty samples, which send nothing but keep the RTP timestamps right.
+///
+/// Also feeds the encoder's expected packet loss (`packet_loss`, percent) from the
+/// worst loss the connected peers report, smoothed.
 async fn audio_pump(
     mut frames: mpsc::Receiver<OpusFrame>,
     mut targets: watch::Receiver<SendTargets>,
+    packet_loss: Arc<AtomicU8>,
 ) {
+    let mut loss = 0.0f32;
     while let Some(frame) = frames.recv().await {
         let snapshot = targets.borrow_and_update().clone();
+        let reported = snapshot
+            .iter()
+            .map(|t| t.fraction_lost())
+            .max()
+            .unwrap_or(0);
+        loss = smooth_loss(loss, reported, AUDIO_FRAME);
+        packet_loss.store(loss_percent(loss), Ordering::Relaxed);
         if snapshot.is_empty() {
             continue;
         }
-        let data = Bytes::copy_from_slice(frame.bytes());
+        let data = if frame.bytes().len() <= DTX_MAX_BYTES {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(frame.bytes())
+        };
         for t in snapshot.iter() {
             let _ = t.write(data.clone(), AUDIO_FRAME).await;
         }
