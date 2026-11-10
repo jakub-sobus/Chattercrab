@@ -7,9 +7,13 @@
 //! screenshot otherwise. Linux captures with `xcap` and encodes with VA-API when
 //! a driver is installed. High quality is H.264 High on both, with the same
 //! bitrate, a two-second GOP, and a 100 ms rate-control window. Otherwise the
-//! publisher uses OpenH264. Every encoded picture is stamped with exactly one
-//! frame period. The channel holds a few frames; when it is full the next capture
-//! is skipped instead of blocking, so the clock does not stretch.
+//! publisher uses OpenH264. A capture that did not change (no new Windows
+//! Graphics Capture frame, or a screenshot equal to the last one) is not
+//! encoded, except for a keyframe request or a refresh once a second. Every
+//! encoded picture is stamped with one frame period; time that produced no
+//! picture is sent as an empty unit, so the RTP clock follows wall time. The
+//! channel holds a few frames; when it is full the next capture is skipped
+//! instead of blocking, so the clock does not stretch.
 //!
 //! Receiver: see [`receive`].
 
@@ -76,13 +80,18 @@ const MAX_BITRATE_BPS: u64 = 80_000_000;
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 /// Consecutive capture failures after which publishing stops.
 const MAX_CAPTURE_FAILURES: u32 = 30;
+/// Longest time without an encoded picture while the screen does not change.
+/// Keeps the viewer's clock and loss recovery going on an idle share.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// One encoded access unit.
+/// One encoded access unit, or skipped time.
 #[derive(Debug, Clone)]
 pub struct EncodedVideo {
-    /// Annex-B NAL units of one picture.
+    /// Annex-B NAL units of one picture. Empty when the unit only carries
+    /// skipped time: nothing is sent and the RTP clock advances by `duration`.
     pub data: Bytes,
-    /// Presentation duration (1 / fps).
+    /// Presentation duration: one frame period (1 / fps) for a picture, the
+    /// skipped wall time for an empty unit.
     pub duration: Duration,
     /// Whether this is an IDR picture.
     pub keyframe: bool,
@@ -354,6 +363,8 @@ impl ScreenPublisher {
                             encoded_ok: 0,
                             last_encode: Duration::ZERO,
                             pace_at: Instant::now(),
+                            dirty: true,
+                            stamped_until: None,
                             tx,
                             stop: thread_stop,
                         }
@@ -557,6 +568,18 @@ impl ScreenEncoder {
         }
     }
 
+    /// Pictures the encoder finished since the last call, without new input.
+    /// Only the Windows hardware encoder (an async MFT) can have any.
+    fn drain(&mut self) -> Result<Vec<hw::AccessUnit>, MediaError> {
+        #[cfg(windows)]
+        {
+            if let Self::Hardware(encoder) = self {
+                return encoder.drain().map_err(MediaError::Codec);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Encodes an NV12 texture from the Windows hardware encoder's device.
     #[cfg(windows)]
     fn encode_dxgi(
@@ -601,6 +624,10 @@ struct CaptureWorker {
     encoded_ok: u64,
     last_encode: Duration,
     pace_at: Instant,
+    /// The newest capture has not come out of the encoder yet.
+    dirty: bool,
+    /// Wall time covered by the durations sent so far. `None` before the first picture.
+    stamped_until: Option<Instant>,
     tx: mpsc::Sender<EncodedVideo>,
     stop: Arc<AtomicBool>,
 }
@@ -628,13 +655,22 @@ impl CaptureWorker {
         let mut scaled: Option<Image<'static>> = None;
         let mut failures = 0u32;
         let mut pending = Some(first);
+        // Newest distinct capture. An identical screenshot replaces nothing.
+        let mut latest: Option<xcap::image::RgbaImage> = None;
         let mut next = Instant::now();
 
         while !self.stop.load(Ordering::Acquire) {
-            let image = match pending.take().map_or_else(|| self.target.capture(), Ok) {
+            let tick = Instant::now();
+            match pending.take().map_or_else(|| self.target.capture(), Ok) {
                 Ok(img) => {
                     failures = 0;
-                    img
+                    let same = latest.as_ref().is_some_and(|prev| {
+                        prev.dimensions() == img.dimensions() && prev.as_raw() == img.as_raw()
+                    });
+                    if !same {
+                        latest = Some(img);
+                        self.dirty = true;
+                    }
                 }
                 Err(e) => {
                     failures += 1;
@@ -645,7 +681,17 @@ impl CaptureWorker {
                     std::thread::sleep(period);
                     continue;
                 }
+            }
+            let Some(image) = latest.as_ref() else {
+                continue;
             };
+            if !self.should_encode(tick, period) {
+                if !self.drain_encoder(period, tick) {
+                    return;
+                }
+                sleep_until_next(&mut next, period);
+                continue;
+            }
             let (sw, sh) = image.dimensions();
             let (tw, th) = encode_dimensions(sw, sh, self.scale);
             if (tw, th) != self.encoded {
@@ -680,7 +726,7 @@ impl CaptureWorker {
                 }
                 dst.buffer()
             };
-            if self.tx.capacity() == 0 {
+            if !self.has_room(tick, period) {
                 self.note_drop();
             } else {
                 let force_idr = self.keyframe.swap(false, Ordering::Relaxed);
@@ -689,20 +735,48 @@ impl CaptureWorker {
                 match self.encoder.encode(rgba, force_idr, elapsed_ms) {
                     Ok(units) => {
                         self.note_encode(encode_started.elapsed(), period);
-                        if !self.send_units(units, period) {
+                        // OpenH264 rate control can skip a picture: encode it again.
+                        self.dirty = units.iter().all(|unit| unit.data.is_empty());
+                        if !self.send_units(units, period, tick) {
                             return;
                         }
                     }
                     Err(e) => tracing::warn!("h264 encode: {e}"),
                 }
             }
+            sleep_until_next(&mut next, period);
+        }
+    }
 
-            next += period;
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
-            } else {
-                next = now;
+    /// Whether the tick at `tick` encodes: content the encoder has not emitted
+    /// yet, a keyframe request, or the refresh of an idle share (a second after
+    /// the last picture started).
+    fn should_encode(&self, tick: Instant, period: Duration) -> bool {
+        self.dirty
+            || self.keyframe.load(Ordering::Relaxed)
+            || self
+                .stamped_until
+                .is_none_or(|t| (tick + period).saturating_duration_since(t) >= REFRESH_INTERVAL)
+    }
+
+    /// The channel has room for one picture and the gap unit before it.
+    fn has_room(&self, tick: Instant, period: Duration) -> bool {
+        let needed = if skipped_time(self.stamped_until, tick, period, 1).is_zero() {
+            1
+        } else {
+            2
+        };
+        self.tx.capacity() >= needed
+    }
+
+    /// Sends pictures the encoder finished without new input. Returns false
+    /// when the receiver has gone away.
+    fn drain_encoder(&mut self, period: Duration, tick: Instant) -> bool {
+        match self.encoder.drain() {
+            Ok(units) => self.send_units(units, period, tick),
+            Err(e) => {
+                tracing::debug!("h264 drain: {e}");
+                true
             }
         }
     }
@@ -752,9 +826,35 @@ impl CaptureWorker {
         }
     }
 
-    /// Sends `units` stamped with exactly one frame period. Returns false when the
-    /// receiver has gone away.
-    fn send_units(&mut self, units: Vec<hw::AccessUnit>, period: Duration) -> bool {
+    /// Sends `units` captured at `tick`, each stamped with one frame period.
+    /// Time that produced no picture (unchanged, dropped, or skipped captures,
+    /// or a late tick) goes first as an empty unit, so the RTP clock follows
+    /// wall time. Returns false when the receiver has gone away.
+    fn send_units(&mut self, units: Vec<hw::AccessUnit>, period: Duration, tick: Instant) -> bool {
+        let pictures = units.iter().filter(|unit| !unit.data.is_empty()).count();
+        if pictures == 0 {
+            return true;
+        }
+        let gap = skipped_time(self.stamped_until, tick, period, pictures as u32);
+        let mut stamped = self.stamped_until.unwrap_or(tick);
+        if !gap.is_zero() {
+            let skipped = EncodedVideo {
+                data: Bytes::new(),
+                duration: gap,
+                keyframe: false,
+            };
+            match self.tx.try_send(skipped) {
+                Ok(()) => stamped += gap,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // The pictures are dropped and the gap goes out before the
+                    // next one. That one has to be an IDR, as below.
+                    self.keyframe.store(true, Ordering::Relaxed);
+                    self.note_drop();
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
         for unit in units {
             if unit.data.is_empty() {
                 continue;
@@ -765,7 +865,7 @@ impl CaptureWorker {
                 keyframe: unit.keyframe,
             };
             match self.tx.try_send(frame) {
-                Ok(()) => {}
+                Ok(()) => stamped += period,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // The encoder already advanced. The next picture has to be an
                     // IDR or the viewer would reference a frame it never received.
@@ -775,7 +875,41 @@ impl CaptureWorker {
                 Err(mpsc::error::TrySendError::Closed(_)) => return false,
             }
         }
+        self.stamped_until = Some(stamped);
         true
+    }
+}
+
+/// Skipped time to send before `pictures` pictures captured at `tick`: the wall
+/// time not covered by the units up to `stamped_until`, beyond the pictures'
+/// own periods. Less than half a period is capture jitter and is not sent.
+fn skipped_time(
+    stamped_until: Option<Instant>,
+    tick: Instant,
+    period: Duration,
+    pictures: u32,
+) -> Duration {
+    let Some(stamped) = stamped_until else {
+        return Duration::ZERO;
+    };
+    let gap = (tick + period)
+        .saturating_duration_since(stamped)
+        .saturating_sub(period * pictures);
+    if gap < period / 2 {
+        Duration::ZERO
+    } else {
+        gap
+    }
+}
+
+/// Sleeps until the next frame tick. A tick that is already late starts now.
+fn sleep_until_next(next: &mut Instant, period: Duration) {
+    *next += period;
+    let now = Instant::now();
+    if *next > now {
+        std::thread::sleep(*next - now);
+    } else {
+        *next = now;
     }
 }
 
@@ -882,6 +1016,35 @@ mod tests {
         assert!(standard.game);
         assert_eq!(standard.gop_frames, 120);
         assert_eq!(standard.bitrate, hw::hardware_bitrate(2560, 1440, 60));
+    }
+
+    #[test]
+    fn skipped_time_keeps_the_rtp_clock_on_wall_time() {
+        let period = Duration::from_millis(20);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let ms = Duration::from_millis;
+        // The first picture has nothing before it.
+        assert_eq!(skipped_time(None, at(0), period, 1), Duration::ZERO);
+        // After the first picture the units cover up to 20 ms.
+        let stamped = Some(at(20));
+        // The next tick, a little late: jitter, no gap.
+        assert_eq!(skipped_time(stamped, at(23), period, 1), Duration::ZERO);
+        // Ticks at 20 and 40 were unchanged (or dropped); the picture at 60 follows 40 ms.
+        assert_eq!(skipped_time(stamped, at(60), period, 1), ms(40));
+        // A pipelined encoder: nothing at 20, two pictures at 40. No gap.
+        assert_eq!(skipped_time(stamped, at(40), period, 2), Duration::ZERO);
+        // A tick more than half a period late is sent as skipped time.
+        assert_eq!(skipped_time(stamped, at(35), period, 1), ms(15));
+        // Units ahead of wall time never produce a gap.
+        assert_eq!(
+            skipped_time(Some(at(100)), at(40), period, 1),
+            Duration::ZERO
+        );
+        // An idle second at 60 fps: one gap carries all of it.
+        let p60 = Duration::from_secs_f64(1.0 / 60.0);
+        let gap = skipped_time(Some(at(1_000)), at(2_000), p60, 1);
+        assert_eq!(gap, ms(1_000));
     }
 
     #[test]

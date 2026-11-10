@@ -62,7 +62,8 @@ pub(super) fn try_run(mut worker: CaptureWorker) -> Result<(), Box<CaptureWorker
     let period = std::time::Duration::from_secs_f64(1.0 / f64::from(worker.fps.max(1)));
     match worker.encoder.encode_dxgi(&nv12, true) {
         Ok(units) => {
-            if !worker.send_units(units, period) {
+            worker.dirty = units.iter().all(|unit| unit.data.is_empty());
+            if !worker.send_units(units, period, Instant::now()) {
                 return Ok(());
             }
         }
@@ -90,39 +91,40 @@ impl CaptureWorker {
         let period = Duration::from_secs_f64(1.0 / f64::from(self.fps.max(1)));
         let mut next = Instant::now();
         while !self.stop.load(std::sync::atomic::Ordering::Acquire) {
-            session.pull_latest();
-            if session.bgra.is_some() {
-                if self.tx.capacity() == 0 {
-                    self.note_drop();
-                } else if let Err(error) = session.convert() {
-                    tracing::warn!(%error, "gpu color conversion");
-                } else {
-                    let Some(nv12) = session.nv12.clone() else {
-                        continue;
-                    };
-                    let force_idr = self
-                        .keyframe
-                        .swap(false, std::sync::atomic::Ordering::Relaxed);
-                    let started = Instant::now();
-                    match self.encoder.encode_dxgi(&nv12, force_idr) {
-                        Ok(units) => {
-                            let took = started.elapsed();
-                            self.note_encode(took, period);
-                            if !self.send_units(units, period) {
-                                return;
-                            }
+            let tick = Instant::now();
+            // WGC delivers a frame only when the picture (or cursor) changed.
+            if session.pull_latest() {
+                self.dirty = true;
+            }
+            if session.bgra.is_none() || !self.should_encode(tick, period) {
+                if !self.drain_encoder(period, tick) {
+                    return;
+                }
+            } else if !self.has_room(tick, period) {
+                self.note_drop();
+            } else if let Err(error) = session.convert() {
+                tracing::warn!(%error, "gpu color conversion");
+            } else {
+                let Some(nv12) = session.nv12.clone() else {
+                    continue;
+                };
+                let force_idr = self
+                    .keyframe
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                let started = Instant::now();
+                match self.encoder.encode_dxgi(&nv12, force_idr) {
+                    Ok(units) => {
+                        let took = started.elapsed();
+                        self.note_encode(took, period);
+                        self.dirty = units.iter().all(|unit| unit.data.is_empty());
+                        if !self.send_units(units, period, tick) {
+                            return;
                         }
-                        Err(error) => tracing::warn!(%error, "gpu h264 encode"),
                     }
+                    Err(error) => tracing::warn!(%error, "gpu h264 encode"),
                 }
             }
-            next += period;
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
-            } else {
-                next = now;
-            }
+            super::sleep_until_next(&mut next, period);
         }
     }
 }
@@ -197,17 +199,21 @@ impl GpuSession {
         Ok(gpu)
     }
 
-    fn pull_latest(&mut self) {
+    /// Copies the newest captured frame, if any. Returns whether one arrived.
+    fn pull_latest(&mut self) -> bool {
+        let mut fresh = false;
         loop {
             let frame = match self.pool.TryGetNextFrame() {
                 Ok(frame) => frame,
                 Err(_) => break,
             };
-            if let Err(error) = self.copy_frame(&frame) {
-                tracing::debug!(%error, "gpu capture frame");
+            match self.copy_frame(&frame) {
+                Ok(()) => fresh = true,
+                Err(error) => tracing::debug!(%error, "gpu capture frame"),
             }
             let _ = frame.Close();
         }
+        fresh
     }
 
     fn copy_frame(&mut self, frame: &Direct3D11CaptureFrame) -> Result<(), String> {

@@ -107,12 +107,29 @@ mod h264_headers;
 #[path = "va_abi.rs"]
 mod va_abi;
 
-/// BT.709 limited-range RGBA to tightly packed NV12.
-fn rgba_to_nv12(src: &[u8], width: usize, height: usize, y_plane: &mut [u8], uv_plane: &mut [u8]) {
-    rgba_to_yuv420(src, width, height, y_plane, |i, cb, cr| {
-        uv_plane[2 * i] = cb;
-        uv_plane[2 * i + 1] = cr;
-    });
+/// Pictures at least this large are converted on several threads.
+const THREADED_PIXELS: usize = 1920 * 1080;
+/// Most threads one conversion uses.
+const MAX_CONVERT_THREADS: usize = 4;
+
+/// BT.709 limited-range RGBA to NV12. `y_stride` and `uv_stride` are the bytes
+/// between row starts, at least `width`.
+pub(super) fn rgba_to_nv12(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    y_plane: &mut [u8],
+    y_stride: usize,
+    uv_plane: &mut [u8],
+    uv_stride: usize,
+) {
+    let planes = Planes {
+        y: y_plane,
+        y_stride,
+        chroma: Chroma::Nv12(uv_plane),
+        chroma_stride: uv_stride,
+    };
+    rgba_to_yuv420(src, width, height, planes, convert_threads(width, height));
 }
 
 /// BT.709 limited-range RGBA to tightly packed I420 (separate U and V planes).
@@ -124,65 +141,199 @@ pub(super) fn rgba_to_i420(
     u_plane: &mut [u8],
     v_plane: &mut [u8],
 ) {
-    rgba_to_yuv420(src, width, height, y_plane, |i, cb, cr| {
-        u_plane[i] = cb;
-        v_plane[i] = cr;
+    let planes = Planes {
+        y: y_plane,
+        y_stride: width,
+        chroma: Chroma::I420(u_plane, v_plane),
+        chroma_stride: width / 2,
+    };
+    rgba_to_yuv420(src, width, height, planes, convert_threads(width, height));
+}
+
+/// Fills the coded area right of and below a `picture` inside `coded` with
+/// black (Y 16, UV 128). The planes are NV12 with the given row strides.
+#[cfg(any(target_os = "linux", test))]
+fn fill_nv12_padding(
+    picture: (usize, usize),
+    coded: (usize, usize),
+    y_plane: &mut [u8],
+    y_stride: usize,
+    uv_plane: &mut [u8],
+    uv_stride: usize,
+) {
+    let ((w, h), (cw, ch)) = (picture, coded);
+    for row in 0..ch {
+        let from = if row < h { w } else { 0 };
+        y_plane[row * y_stride + from..row * y_stride + cw].fill(16);
+    }
+    for row in 0..ch / 2 {
+        let from = if row < h / 2 { w } else { 0 };
+        uv_plane[row * uv_stride + from..row * uv_stride + cw].fill(128);
+    }
+}
+
+/// Threads for one conversion: up to four for 1080p and larger, otherwise one.
+fn convert_threads(width: usize, height: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if width * height < THREADED_PIXELS {
+        return 1;
+    }
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+    cores.min(MAX_CONVERT_THREADS)
+}
+
+/// Destination planes of one 4:2:0 picture. Strides are bytes between row starts.
+struct Planes<'a> {
+    y: &'a mut [u8],
+    y_stride: usize,
+    chroma: Chroma<'a>,
+    chroma_stride: usize,
+}
+
+/// Chroma layout of a 4:2:0 picture.
+enum Chroma<'a> {
+    /// Interleaved Cb and Cr (NV12).
+    Nv12(&'a mut [u8]),
+    /// Separate Cb and Cr planes (I420).
+    I420(&'a mut [u8], &'a mut [u8]),
+}
+
+impl<'a> Planes<'a> {
+    /// Splits off the planes of the first `pairs` luma row pairs.
+    fn split_rows(&mut self, pairs: usize) -> Planes<'a> {
+        let stride = self.chroma_stride;
+        let chroma = match &mut self.chroma {
+            Chroma::Nv12(uv) => Chroma::Nv12(take_rows(uv, pairs, stride)),
+            Chroma::I420(u, v) => {
+                Chroma::I420(take_rows(u, pairs, stride), take_rows(v, pairs, stride))
+            }
+        };
+        Planes {
+            y: take_rows(&mut self.y, 2 * pairs, self.y_stride),
+            y_stride: self.y_stride,
+            chroma,
+            chroma_stride: stride,
+        }
+    }
+}
+
+/// Removes the first `rows` rows from `plane` and returns them. The last row
+/// of a plane may be shorter than `stride`.
+fn take_rows<'a>(plane: &mut &'a mut [u8], rows: usize, stride: usize) -> &'a mut [u8] {
+    let len = (rows * stride).min(plane.len());
+    let (head, tail) = std::mem::take(plane).split_at_mut(len);
+    *plane = tail;
+    head
+}
+
+/// Even-sized RGBA to BT.709 limited-range 4:2:0. Each 2×2 block's chroma is
+/// the average of its four pixels. Row pairs are split across `threads`.
+fn rgba_to_yuv420(src: &[u8], width: usize, height: usize, mut planes: Planes<'_>, threads: usize) {
+    let pairs = height / 2;
+    let pair_bytes = 2 * width * 4;
+    let src = &src[..pairs * pair_bytes];
+    let threads = threads.clamp(1, pairs.max(1));
+    if threads == 1 {
+        convert_rows(src, width, planes);
+        return;
+    }
+    let per_band = pairs.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut rest = src;
+        let mut left = pairs;
+        while left > 0 {
+            let n = per_band.min(left);
+            left -= n;
+            let (band, tail) = rest.split_at(n * pair_bytes);
+            rest = tail;
+            let out = planes.split_rows(n);
+            if left == 0 {
+                convert_rows(band, width, out);
+            } else {
+                scope.spawn(move || convert_rows(band, width, out));
+            }
+        }
     });
 }
 
-/// Writes the luma plane and hands each 2×2 block's (Cb, Cr) to `put_chroma`
-/// in raster order. The viewer decodes BT.709 limited range.
-fn rgba_to_yuv420(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    y_plane: &mut [u8],
-    mut put_chroma: impl FnMut(usize, u8, u8),
-) {
-    for y in 0..height {
-        let src_row = &src[y * width * 4..(y + 1) * width * 4];
-        let y_row = &mut y_plane[y * width..(y + 1) * width];
-        for (x, y_px) in y_row.iter_mut().enumerate() {
-            let i = x * 4;
-            *y_px = luma(src_row[i], src_row[i + 1], src_row[i + 2]);
+/// Converts the row pairs in `src` into `planes`, whose first row is the
+/// first row of `src`.
+fn convert_rows(src: &[u8], width: usize, mut planes: Planes<'_>) {
+    let row = width * 4;
+    for (k, pair) in src.chunks_exact(2 * row).enumerate() {
+        let (s0, s1) = pair.split_at(row);
+        let (y0, y1) = planes.y[2 * k * planes.y_stride..].split_at_mut(planes.y_stride);
+        let (y0, y1) = (&mut y0[..width], &mut y1[..width]);
+        let c = k * planes.chroma_stride;
+        match &mut planes.chroma {
+            Chroma::Nv12(uv) => row_pair_nv12(s0, s1, y0, y1, &mut uv[c..c + width]),
+            Chroma::I420(u, v) => row_pair_i420(
+                s0,
+                s1,
+                y0,
+                y1,
+                &mut u[c..c + width / 2],
+                &mut v[c..c + width / 2],
+            ),
         }
     }
-    let mut uv_i = 0;
-    for y in (0..height).step_by(2) {
-        for x in (0..width).step_by(2) {
-            let mut r = 0i32;
-            let mut g = 0i32;
-            let mut b = 0i32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = ((y + dy) * width + (x + dx)) * 4;
-                    r += i32::from(src[i]);
-                    g += i32::from(src[i + 1]);
-                    b += i32::from(src[i + 2]);
-                }
-            }
-            let (r, g, b) = (r / 4, g / 4, b / 4);
-            put_chroma(
-                uv_i,
-                chroma(-26, -86, 112, r, g, b),
-                chroma(112, -102, -10, r, g, b),
-            );
-            uv_i += 1;
-        }
+}
+
+fn row_pair_nv12(s0: &[u8], s1: &[u8], y0: &mut [u8], y1: &mut [u8], uv: &mut [u8]) {
+    let src = s0.as_chunks::<8>().0.iter().zip(s1.as_chunks::<8>().0);
+    let luma = y0
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(y1.as_chunks_mut::<2>().0);
+    for (((a, b), (ya, yb)), c) in src.zip(luma).zip(uv.as_chunks_mut::<2>().0) {
+        *c = block(a, b, ya, yb);
     }
+}
+
+fn row_pair_i420(s0: &[u8], s1: &[u8], y0: &mut [u8], y1: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+    let src = s0.as_chunks::<8>().0.iter().zip(s1.as_chunks::<8>().0);
+    let luma = y0
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(y1.as_chunks_mut::<2>().0);
+    for (((a, b), (ya, yb)), (cu, cv)) in src.zip(luma).zip(u.iter_mut().zip(v)) {
+        [*cu, *cv] = block(a, b, ya, yb);
+    }
+}
+
+/// One 2×2 block: two RGBA pixels from each of two rows. Writes the four luma
+/// samples and returns `[Cb, Cr]` of the block average.
+#[inline(always)]
+fn block(a: &[u8; 8], b: &[u8; 8], ya: &mut [u8; 2], yb: &mut [u8; 2]) -> [u8; 2] {
+    *ya = [luma(a[0], a[1], a[2]), luma(a[4], a[5], a[6])];
+    *yb = [luma(b[0], b[1], b[2]), luma(b[4], b[5], b[6])];
+    let avg = |i: usize| {
+        let sum = u16::from(a[i]) + u16::from(a[i + 4]) + u16::from(b[i]) + u16::from(b[i + 4]);
+        (sum >> 2) as i16
+    };
+    let (r, g, b) = (avg(0), avg(1), avg(2));
+    [
+        chroma(-26, -86, 112, r, g, b),
+        chroma(112, -102, -10, r, g, b),
+    ]
 }
 
 /// BT.709 luma in 16..=235: `219/255 * (0.2126 R + 0.7152 G + 0.0722 B)`, ×256.
+/// The weighted sum is at most 56 228, so 16-bit lanes are enough.
+#[inline(always)]
 fn luma(r: u8, g: u8, b: u8) -> u8 {
-    let y = (47 * i32::from(r) + 157 * i32::from(g) + 16 * i32::from(b) + 128) >> 8;
-    (y + 16).clamp(0, 255) as u8
+    let y = (47 * u16::from(r) + 157 * u16::from(g) + 16 * u16::from(b) + 128) >> 8;
+    (y + 16) as u8
 }
 
 /// BT.709 chroma in 16..=240, ×256. Each coefficient row sums to zero so grey
-/// stays exactly at 128.
-fn chroma(cr: i32, cg: i32, cb: i32, r: i32, g: i32, b: i32) -> u8 {
+/// stays exactly at 128. The weighted sum stays within ±28 688, inside `i16`.
+#[inline(always)]
+fn chroma(cr: i16, cg: i16, cb: i16, r: i16, g: i16, b: i16) -> u8 {
     let c = (cr * r + cg * g + cb * b + 128) >> 8;
-    (c + 128).clamp(0, 255) as u8
+    (c + 128) as u8
 }
 
 #[cfg(windows)]
@@ -213,8 +364,8 @@ mod platform {
         CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
         CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame,
         CODECAPI_AVLowLatencyMode, CODECAPI_AVScenarioInfo, ICodecAPI, IMFActivate,
-        IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform, MEError,
-        METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+        IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator, IMFSample, IMFTransform,
+        MEError, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
         MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
         MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
         MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
@@ -237,13 +388,49 @@ mod platform {
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4};
-    use windows::core::Interface;
+    use windows::core::{IUnknown, Interface};
 
     use super::{AccessUnit, EncodeParams, to_annex_b};
     use crate::screen::receive::contains_idr;
 
     /// How long to wait for the encoder to accept a frame.
     const NEED_INPUT_TIMEOUT: Duration = Duration::from_millis(500);
+    /// CPU input buffers kept for reuse. More than one, because an async encoder
+    /// can still hold the previous picture when the next one arrives.
+    const INPUT_RING: usize = 3;
+
+    /// One reusable NV12 input picture.
+    struct InputSlot {
+        sample: IMFSample,
+        buffer: IMFMediaBuffer,
+    }
+
+    impl InputSlot {
+        unsafe fn new(len: u32) -> Result<Self, String> {
+            let buffer = MFCreateMemoryBuffer(len).map_err(|e| format!("input buffer: {e}"))?;
+            let sample = MFCreateSample().map_err(|e| format!("input sample: {e}"))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|e| format!("attaching input buffer: {e}"))?;
+            Ok(Self { sample, buffer })
+        }
+
+        /// The encoder has released it: only this slot holds the sample, and
+        /// only this slot and the sample hold the buffer.
+        unsafe fn is_free(&self) -> bool {
+            ref_count(&self.sample) == 1 && ref_count(&self.buffer) == 2
+        }
+    }
+
+    /// Current COM reference count of `object`.
+    unsafe fn ref_count<T: Interface>(object: &T) -> u32 {
+        let raw = object.as_raw();
+        let Some(unknown) = IUnknown::from_raw_borrowed(&raw) else {
+            return u32::MAX;
+        };
+        (unknown.vtable().AddRef)(raw);
+        (unknown.vtable().Release)(raw)
+    }
 
     /// GPU H.264 encoder. Touched only from the capture thread that created it.
     pub struct HwEncoder {
@@ -262,6 +449,8 @@ mod platform {
         output_stream_id: u32,
         need_input_credits: u32,
         frames_submitted: u64,
+        /// CPU input pictures, reused once the encoder releases them.
+        inputs: Vec<InputSlot>,
     }
 
     impl HwEncoder {
@@ -310,6 +499,17 @@ mod platform {
             self.submit(sample, force_idr)
         }
 
+        /// Pictures an async encoder finished since the last call, collected
+        /// without new input. A synchronous encoder never has any.
+        pub fn drain(&mut self) -> Result<Vec<AccessUnit>, String> {
+            let mut units = Vec::new();
+            if let Some(events) = self.event_gen.clone() {
+                let transform = self.transform.clone();
+                while self.poll(&events, &transform, &mut units)? {}
+            }
+            Ok(units)
+        }
+
         fn submit(
             &mut self,
             sample: IMFSample,
@@ -356,12 +556,23 @@ mod platform {
             Err(errors.join("; "))
         }
 
-        unsafe fn input_sample(&self, rgba: &[u8]) -> Result<IMFSample, String> {
+        unsafe fn input_sample(&mut self, rgba: &[u8]) -> Result<IMFSample, String> {
             let w = self.width as usize;
             let h = self.height as usize;
             let nv12_len = w * h * 3 / 2;
-            let buffer =
-                MFCreateMemoryBuffer(nv12_len as u32).map_err(|e| format!("input buffer: {e}"))?;
+            // A fresh multi-megabyte buffer per frame costs page faults. Reuse
+            // one the encoder has let go of; past the ring, allocate as before.
+            let (sample, buffer) = match self.inputs.iter().find(|slot| slot.is_free()) {
+                Some(slot) => (slot.sample.clone(), slot.buffer.clone()),
+                None => {
+                    let slot = InputSlot::new(nv12_len as u32)?;
+                    let pair = (slot.sample.clone(), slot.buffer.clone());
+                    if self.inputs.len() < INPUT_RING {
+                        self.inputs.push(slot);
+                    }
+                    pair
+                }
+            };
             let mut data_ptr: *mut u8 = ptr::null_mut();
             buffer
                 .Lock(&mut data_ptr, None, None)
@@ -369,7 +580,7 @@ mod platform {
             {
                 let dst = std::slice::from_raw_parts_mut(data_ptr, nv12_len);
                 let (y_plane, uv_plane) = dst.split_at_mut(w * h);
-                super::rgba_to_nv12(rgba, w, h, y_plane, uv_plane);
+                super::rgba_to_nv12(rgba, w, h, y_plane, w, uv_plane, w);
             }
             buffer
                 .Unlock()
@@ -377,10 +588,6 @@ mod platform {
             buffer
                 .SetCurrentLength(nv12_len as u32)
                 .map_err(|e| format!("input length: {e}"))?;
-            let sample = MFCreateSample().map_err(|e| format!("input sample: {e}"))?;
-            sample
-                .AddBuffer(&buffer)
-                .map_err(|e| format!("attaching input buffer: {e}"))?;
             let time = (self.frames_submitted as i64) * 10_000_000 / i64::from(self.fps);
             let duration = 10_000_000 / i64::from(self.fps);
             sample
@@ -697,6 +904,7 @@ mod platform {
             output_stream_id,
             need_input_credits: 0,
             frames_submitted: 0,
+            inputs: Vec::new(),
         })
     }
 
@@ -1169,7 +1377,7 @@ mod tests {
         let rgba: Vec<u8> = (0..4).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
         let mut y = [0u8; 4];
         let mut uv = [0u8; 2];
-        rgba_to_nv12(&rgba, 2, 2, &mut y, &mut uv);
+        rgba_to_nv12(&rgba, 2, 2, &mut y, 2, &mut uv, 2);
         assert!(y.iter().all(|&v| v == y[0]));
         let (mut y2, mut u, mut v) = ([0u8; 4], [0u8; 1], [0u8; 1]);
         rgba_to_i420(&rgba, 2, 2, &mut y2, &mut u, &mut v);
@@ -1202,6 +1410,137 @@ mod tests {
         // Pure blue and red reach the top of the chroma range, not past it.
         assert_eq!(convert_solid([0, 0, 255]).0[1], 240);
         assert_eq!(convert_solid([255, 0, 0]).0[2], 240);
+    }
+
+    /// The scalar conversion the optimized one must match exactly: luma per
+    /// pixel, chroma from the truncated 2×2 average, all in `i32`.
+    fn reference_nv12(src: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
+        let luma = |p: &[u8; 4]| {
+            let y =
+                (47 * i32::from(p[0]) + 157 * i32::from(p[1]) + 16 * i32::from(p[2]) + 128) >> 8;
+            (y + 16).clamp(0, 255) as u8
+        };
+        let chroma = |c: [i32; 3], rgb: [i32; 3]| {
+            let v = (c[0] * rgb[0] + c[1] * rgb[1] + c[2] * rgb[2] + 128) >> 8;
+            (v + 128).clamp(0, 255) as u8
+        };
+        let y: Vec<u8> = src.as_chunks::<4>().0.iter().map(luma).collect();
+        let mut uv = Vec::with_capacity(w * h / 2);
+        for row in (0..h).step_by(2) {
+            for col in (0..w).step_by(2) {
+                let mut sum = [0i32; 3];
+                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let i = ((row + dy) * w + col + dx) * 4;
+                    for (s, &v) in sum.iter_mut().zip(&src[i..i + 3]) {
+                        *s += i32::from(v);
+                    }
+                }
+                let rgb = sum.map(|v| v / 4);
+                uv.push(chroma([-26, -86, 112], rgb));
+                uv.push(chroma([112, -102, -10], rgb));
+            }
+        }
+        (y, uv)
+    }
+
+    fn test_picture(w: usize, h: usize) -> Vec<u8> {
+        (0..w * h * 4)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn threaded_conversion_matches_the_scalar_reference() {
+        let (w, h) = (642usize, 362usize);
+        let rgba = test_picture(w, h);
+        let (want_y, want_uv) = reference_nv12(&rgba, w, h);
+        for threads in [1, 3, 4] {
+            let mut y = vec![0u8; w * h];
+            let mut uv = vec![0u8; w * h / 2];
+            let planes = Planes {
+                y: &mut y,
+                y_stride: w,
+                chroma: Chroma::Nv12(&mut uv),
+                chroma_stride: w,
+            };
+            rgba_to_yuv420(&rgba, w, h, planes, threads);
+            assert!(y == want_y, "nv12 luma differs with {threads} threads");
+            assert!(uv == want_uv, "nv12 chroma differs with {threads} threads");
+
+            let (mut u, mut v) = (vec![0u8; w * h / 4], vec![0u8; w * h / 4]);
+            let planes = Planes {
+                y: &mut y,
+                y_stride: w,
+                chroma: Chroma::I420(&mut u, &mut v),
+                chroma_stride: w / 2,
+            };
+            rgba_to_yuv420(&rgba, w, h, planes, threads);
+            assert!(y == want_y, "i420 luma differs with {threads} threads");
+            let interleaved: Vec<u8> = u.iter().zip(&v).flat_map(|(&cb, &cr)| [cb, cr]).collect();
+            assert!(
+                interleaved == want_uv,
+                "i420 chroma differs with {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn strided_nv12_fills_the_coded_padding() {
+        let (w, h, cw, ch) = (6usize, 4usize, 16usize, 16usize);
+        let (y_stride, uv_stride) = (20usize, 24usize);
+        let rgba = test_picture(w, h);
+        let (want_y, want_uv) = reference_nv12(&rgba, w, h);
+        // The last row of each plane ends at the coded width, like a mapped VA image.
+        let mut y = vec![0xAAu8; (ch - 1) * y_stride + cw];
+        let mut uv = vec![0xAAu8; (ch / 2 - 1) * uv_stride + cw];
+        rgba_to_nv12(&rgba, w, h, &mut y, y_stride, &mut uv, uv_stride);
+        fill_nv12_padding((w, h), (cw, ch), &mut y, y_stride, &mut uv, uv_stride);
+        for row in 0..ch {
+            let line = &y[row * y_stride..row * y_stride + cw];
+            if row < h {
+                assert_eq!(&line[..w], &want_y[row * w..(row + 1) * w]);
+                assert!(line[w..].iter().all(|&v| v == 16), "y row {row}");
+            } else {
+                assert!(line.iter().all(|&v| v == 16), "y row {row}");
+            }
+            if row < h - 1 {
+                assert_eq!(y[row * y_stride + cw], 0xAA, "y stride gap was written");
+            }
+        }
+        for row in 0..ch / 2 {
+            let line = &uv[row * uv_stride..row * uv_stride + cw];
+            if row < h / 2 {
+                assert_eq!(&line[..w], &want_uv[row * w..(row + 1) * w]);
+                assert!(line[w..].iter().all(|&v| v == 128), "uv row {row}");
+            } else {
+                assert!(line.iter().all(|&v| v == 128), "uv row {row}");
+            }
+        }
+    }
+
+    /// `cargo test -p chattercrab-media rgba_conversion_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn rgba_conversion_speed() {
+        let (w, h) = (2560usize, 1440usize);
+        let rgba = test_picture(w, h);
+        let mut y = vec![0u8; w * h];
+        let mut uv = vec![0u8; w * h / 2];
+        let runs = 20;
+        for threads in [1, convert_threads(w, h)] {
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let planes = Planes {
+                    y: &mut y,
+                    y_stride: w,
+                    chroma: Chroma::Nv12(&mut uv),
+                    chroma_stride: w,
+                };
+                rgba_to_yuv420(&rgba, w, h, planes, threads);
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+            println!("rgba to nv12 2560x1440, {threads} thread(s): {ms:.2} ms/frame");
+        }
     }
 
     #[test]
