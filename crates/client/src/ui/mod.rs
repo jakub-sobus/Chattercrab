@@ -9,7 +9,6 @@ mod share_view;
 mod view;
 
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chattercrab_media::{Nv12Frame, ScreenContent, ScreenScale, ScreenSource, VideoFrameQueue};
@@ -18,7 +17,7 @@ use iced::futures::stream;
 use iced::{Subscription, Task, Theme, keyboard, window};
 use tokio::sync::mpsc;
 
-use crate::config::{Config, SCREEN_FPS_RANGE, STANDARD_SCREEN_FPS_MAX, ThemeChoice};
+use crate::config::{Config, ConfigWriter, SCREEN_FPS_RANGE, STANDARD_SCREEN_FPS_MAX, ThemeChoice};
 use crate::net::{AppEvent, UiCommand};
 use room_model::RoomModel;
 
@@ -219,7 +218,7 @@ pub struct App {
     /// Commands to the backend.
     pub net_tx: mpsc::Sender<UiCommand>,
     bridge: EventBridge,
-    config_path: Option<PathBuf>,
+    config_writer: Option<ConfigWriter>,
     /// Set by Create or Join, cleared once that room is shown or the user leaves.
     pending_enter: Option<PendingEnter>,
     /// The window is fullscreen for a remote share.
@@ -262,10 +261,11 @@ impl Hash for VideoSource {
 
 impl App {
     /// Creates the app. The backend must already be running behind `net_tx`; its
-    /// event receiver sits in `events` until the subscription takes it.
+    /// event receiver sits in `events` until the subscription takes it. Without a
+    /// `config_writer` settings are not persisted.
     pub fn new(
         config: Config,
-        config_path: Option<PathBuf>,
+        config_writer: Option<ConfigWriter>,
         net_tx: mpsc::Sender<UiCommand>,
         events: EventSlot,
     ) -> Self {
@@ -280,7 +280,7 @@ impl App {
             config,
             net_tx,
             bridge: EventBridge(events),
-            config_path,
+            config_writer,
             pending_enter: None,
             share_fullscreen: false,
         };
@@ -305,16 +305,24 @@ impl App {
     }
 
     fn send(&self, cmd: UiCommand) {
-        if let Err(e) = self.net_tx.try_send(cmd) {
-            tracing::warn!(error = %e, "backend command dropped");
+        self.try_send(cmd);
+    }
+
+    /// Like [`Self::send`], but tells whether the backend got the command.
+    fn try_send(&self, cmd: UiCommand) -> bool {
+        match self.net_tx.try_send(cmd) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "backend command dropped");
+                false
+            }
         }
     }
 
-    fn save_config(&mut self) {
-        if let Some(path) = &self.config_path
-            && let Err(e) = self.config.save(path)
-        {
-            self.state.notice = Some(format!("Could not save settings: {e:#}"));
+    /// Queues the config for the background writer, which reports failures as notices.
+    fn save_config(&self) {
+        if let Some(writer) = &self.config_writer {
+            writer.save(self.config.clone());
         }
     }
 
@@ -436,18 +444,28 @@ impl App {
                     }
                 }
             }
+            // The toggle only shows once the backend has the command, so the UI never
+            // claims "muted" while the microphone is live.
             Message::ToggleMute => {
-                if let Some(room) = self.room_mut() {
-                    room.model.muted = !room.model.muted;
-                    let muted = room.model.muted;
-                    self.send(UiCommand::SetMuted(muted));
+                if let Some(muted) = self.room_mut().map(|room| !room.model.muted) {
+                    if self.try_send(UiCommand::SetMuted(muted)) {
+                        if let Some(room) = self.room_mut() {
+                            room.model.muted = muted;
+                        }
+                    } else {
+                        self.state.notice = Some("Could not change mute. Try again.".into());
+                    }
                 }
             }
             Message::ToggleDeafen => {
-                if let Some(room) = self.room_mut() {
-                    room.model.deafened = !room.model.deafened;
-                    let deaf = room.model.deafened;
-                    self.send(UiCommand::SetDeafened(deaf));
+                if let Some(deaf) = self.room_mut().map(|room| !room.model.deafened) {
+                    if self.try_send(UiCommand::SetDeafened(deaf)) {
+                        if let Some(room) = self.room_mut() {
+                            room.model.deafened = deaf;
+                        }
+                    } else {
+                        self.state.notice = Some("Could not change deafen. Try again.".into());
+                    }
                 }
             }
             Message::OpenSharePicker => {
@@ -813,8 +831,41 @@ mod tests {
     use crate::net::JoinedRoom;
 
     fn app() -> App {
-        let (tx, _rx) = mpsc::channel(8);
-        App::new(Config::default(), None, tx, Arc::new(Mutex::new(None)))
+        app_with_backend(8).0
+    }
+
+    /// The app and the backend end of its command channel.
+    fn app_with_backend(capacity: usize) -> (App, mpsc::Receiver<UiCommand>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let app = App::new(Config::default(), None, tx, Arc::new(Mutex::new(None)));
+        (app, rx)
+    }
+
+    fn muted(app: &App) -> (bool, bool) {
+        match &app.state.screen {
+            Screen::Room(room) => (room.model.muted, room.model.deafened),
+            _ => panic!("expected the room"),
+        }
+    }
+
+    #[test]
+    fn mute_and_deafen_show_only_when_the_backend_takes_them() {
+        // Room for ListDevices and one toggle.
+        let (mut app, mut rx) = app_with_backend(2);
+        app.enter_room(RoomId::new("room1").unwrap(), RoomName::new("1").unwrap());
+        let _ = app.update(Message::ToggleMute);
+        assert_eq!(muted(&app), (true, false));
+        assert!(app.state.notice.is_none());
+        // The queue is full now: the toggles are reverted and explained.
+        let _ = app.update(Message::ToggleMute);
+        let _ = app.update(Message::ToggleDeafen);
+        assert_eq!(muted(&app), (true, false));
+        assert!(app.state.notice.is_some());
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::ListDevices)));
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::SetMuted(true))));
+        let _ = app.update(Message::ToggleDeafen);
+        assert_eq!(muted(&app), (true, true));
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::SetDeafened(true))));
     }
 
     fn peer() -> PeerId {

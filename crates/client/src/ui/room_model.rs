@@ -11,6 +11,10 @@ use crate::net::{AppEvent, JoinedRoom};
 pub const SPEAKING_THRESHOLD: f32 = 0.02;
 /// Chat lines kept in memory for display (never written to disk).
 pub const MAX_CHAT_LINES: usize = 1000;
+/// Oldest lines dropped at once when the log is full. Chat rows are positional
+/// widgets, so dropping the oldest line hands every row's state to a different
+/// message and re-shapes all of them; batching does that once per batch, not per line.
+const CHAT_TRIM_BATCH: usize = 100;
 /// Default per-peer playback volume.
 pub const DEFAULT_VOLUME: f32 = 1.0;
 
@@ -115,8 +119,9 @@ impl RoomModel {
     }
 
     fn trim_chat(&mut self) {
-        while self.chat.len() > MAX_CHAT_LINES {
-            self.chat.pop_front();
+        if self.chat.len() > MAX_CHAT_LINES {
+            let excess = self.chat.len() - (MAX_CHAT_LINES - CHAT_TRIM_BATCH);
+            self.chat.drain(..excess);
         }
     }
 
@@ -254,11 +259,16 @@ mod tests {
         let mut m = joined_model();
         m.apply(&AppEvent::Chat(chat(2, 1)));
         assert_eq!(m.chat.back().unwrap().text, "m2");
-        for i in 0..(MAX_CHAT_LINES as u64 + 10) {
+        // History line and "m2", then fill the log exactly.
+        for i in 0..(MAX_CHAT_LINES as u64 - 2) {
             m.apply(&AppEvent::Chat(chat(10 + i, 2)));
         }
         assert_eq!(m.chat.len(), MAX_CHAT_LINES);
-        assert_eq!(m.chat.back().unwrap().id, 10 + MAX_CHAT_LINES as u64 + 9);
+        // One more line drops a whole batch of the oldest ones.
+        m.apply(&AppEvent::Chat(chat(5000, 2)));
+        assert_eq!(m.chat.len(), MAX_CHAT_LINES - CHAT_TRIM_BATCH);
+        assert_eq!(m.chat.back().unwrap().id, 5000);
+        assert_eq!(m.chat.front().unwrap().id, 10 + CHAT_TRIM_BATCH as u64 - 1);
     }
 
     #[test]

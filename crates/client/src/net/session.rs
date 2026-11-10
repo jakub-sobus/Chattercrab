@@ -2,16 +2,18 @@
 //!
 //! No I/O happens here, which keeps the protocol choreography unit testable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chattercrab_media::{
     MediaCommand, MediaEvent, OutgoingSignal, ScreenContent, ScreenScale, ScreenSource,
 };
 use chattercrab_protocol::{
-    ClientMsg, DisplayName, ErrorCode, IceServers, PeerId, PeerInfo, RoomId, RoomName, ServerMsg,
+    CHAT_HISTORY_LEN, ClientMsg, DisplayName, ErrorCode, IceServers, PeerId, PeerInfo, RoomId,
+    RoomName, ServerMsg,
 };
 
 use super::{AppEvent, JoinedRoom};
+use crate::ui::room_model::SPEAKING_THRESHOLD;
 
 /// A screen share waiting for the server to grant the lock.
 #[derive(Debug, Clone)]
@@ -52,6 +54,9 @@ pub struct Session {
     /// Last `welcome`, kept current so joining the same room again can refresh
     /// the UI without dropping the socket (which would delete a one-person room).
     joined: Option<JoinedRoom>,
+    /// Who was speaking (local, peers) in the last levels forwarded to the UI. The UI
+    /// only shows speaking dots, so levels that flip nobody are not forwarded.
+    speaking: Option<(bool, BTreeSet<PeerId>)>,
 }
 
 impl Session {
@@ -73,6 +78,7 @@ impl Session {
             pending_share: None,
             local_sharing: false,
             joined: None,
+            speaking: None,
         }
     }
 
@@ -180,6 +186,8 @@ impl Session {
             ServerMsg::Chat { msg } => {
                 if let Some(joined) = &mut self.joined {
                     joined.history.push(msg.clone());
+                    let excess = joined.history.len().saturating_sub(CHAT_HISTORY_LEN);
+                    joined.history.drain(..excess);
                 }
                 vec![Effect::Ui(AppEvent::Chat(msg))]
             }
@@ -268,6 +276,18 @@ impl Session {
                 vec![Effect::Ui(AppEvent::PeerState { peer, state })]
             }
             MediaEvent::Levels { local, peers } => {
+                let speaking = (
+                    local >= SPEAKING_THRESHOLD,
+                    peers
+                        .iter()
+                        .filter(|(_, level)| *level >= SPEAKING_THRESHOLD)
+                        .map(|(peer, _)| *peer)
+                        .collect(),
+                );
+                if self.speaking.as_ref() == Some(&speaking) {
+                    return Vec::new();
+                }
+                self.speaking = Some(speaking);
                 vec![Effect::Ui(AppEvent::Levels { local, peers })]
             }
             MediaEvent::RemoteScreenStarted { .. } | MediaEvent::RemoteScreenEnded { .. } => {
@@ -334,6 +354,7 @@ impl Session {
         self.screen_publisher = None;
         self.pending_share = None;
         self.joined = None;
+        self.speaking = None;
         let mut effects = vec![Effect::Media(MediaCommand::RemoveAllPeers)];
         if self.local_sharing {
             // The server releases the lock when we disconnect.
@@ -496,6 +517,62 @@ mod tests {
             sdp_mline_index: None,
         }));
         assert!(matches!(&effects[0], Effect::Send(ClientMsg::Ice { to, .. }) if *to == peer(3)));
+    }
+
+    fn chat(id: u64) -> ChatMessage {
+        ChatMessage {
+            id,
+            from: peer(2),
+            display_name: DisplayName::new("p2").unwrap(),
+            text: "hi".into(),
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn history_is_capped_at_the_server_length() {
+        let mut s = session();
+        welcome(&mut s, vec![]);
+        for id in 0..CHAT_HISTORY_LEN as u64 + 5 {
+            s.on_server_msg(ServerMsg::Chat { msg: chat(id) });
+        }
+        let history = s.joined_snapshot().unwrap().history;
+        assert_eq!(history.len(), CHAT_HISTORY_LEN);
+        assert_eq!(history[0].id, 5);
+        assert_eq!(history.last().unwrap().id, CHAT_HISTORY_LEN as u64 + 4);
+    }
+
+    fn levels(s: &mut Session, local: f32, peers: &[(u8, f32)]) -> bool {
+        let effects = s.on_media_event(MediaEvent::Levels {
+            local,
+            peers: peers.iter().map(|&(n, level)| (peer(n), level)).collect(),
+        });
+        match effects.as_slice() {
+            [] => false,
+            [Effect::Ui(AppEvent::Levels { .. })] => true,
+            other => panic!("unexpected effects {other:?}"),
+        }
+    }
+
+    #[test]
+    fn levels_are_forwarded_only_when_someone_starts_or_stops_speaking() {
+        let quiet = SPEAKING_THRESHOLD / 2.0;
+        let loud = SPEAKING_THRESHOLD * 2.0;
+        let mut s = session();
+        assert!(levels(&mut s, 0.0, &[(2, quiet)]));
+        // Level changes on the same side of the threshold are dropped.
+        assert!(!levels(&mut s, quiet, &[(2, 0.0)]));
+        assert!(levels(&mut s, quiet, &[(2, loud)]));
+        assert!(!levels(&mut s, quiet, &[(2, loud * 2.0)]));
+        assert!(levels(&mut s, loud, &[(2, loud)]));
+        assert!(levels(&mut s, loud, &[(2, loud), (3, loud)]));
+        assert!(!levels(&mut s, loud, &[(3, loud), (2, loud)]));
+        assert!(levels(&mut s, loud, &[(2, quiet), (3, loud)]));
+        // A peer that leaves while speaking flips the set.
+        assert!(levels(&mut s, loud, &[(2, quiet)]));
+        // After a reconnect the UI starts from scratch, so the next levels go through.
+        s.on_disconnected();
+        assert!(levels(&mut s, loud, &[(2, quiet)]));
     }
 
     #[test]

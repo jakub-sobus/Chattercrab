@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use chattercrab_media::{MediaCommand, MediaConfig, MediaEngine, MediaEvent};
-use chattercrab_protocol::{DisplayName, RoomId, RoomName};
+use chattercrab_protocol::{DisplayName, IceServers, RoomId, RoomName, RoomSummary};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -16,6 +16,8 @@ use super::{AppEvent, UiCommand};
 
 /// Capacity of the signaling task to backend channel.
 const SIGNAL_EVENT_CAPACITY: usize = 256;
+/// Capacity of the channel carrying finished REST requests back to the backend loop.
+const REST_DONE_CAPACITY: usize = 16;
 
 /// Spawns a dedicated OS thread running a Tokio runtime with the backend task.
 ///
@@ -55,13 +57,52 @@ struct ActiveRoom {
     retry_at: Option<Instant>,
 }
 
+/// A connect request whose REST calls are in flight.
+struct PendingConnect {
+    request: u64,
+    display_name: DisplayName,
+    media: MediaConfig,
+}
+
+/// A REST request spawned off the backend loop finished. `request` ties the answer to
+/// its request, so answers that arrive after Disconnect, Leave or a newer request are
+/// dropped.
+enum RestDone {
+    /// Health check, room list and ICE servers of a connect request.
+    Connect {
+        request: u64,
+        result: Result<(Rest, Vec<RoomSummary>, Option<IceServers>), String>,
+    },
+    /// Room creation.
+    CreateRoom {
+        request: u64,
+        result: Result<RoomSummary, String>,
+    },
+    /// ICE servers fetched again because the connect-time request failed.
+    Ice {
+        request: u64,
+        ice: Option<IceServers>,
+    },
+}
+
 /// Backend state. Lives on the runtime thread.
 pub struct Backend {
     commands: mpsc::Receiver<UiCommand>,
     events: mpsc::Sender<AppEvent>,
     signal_tx: mpsc::Sender<SignalEvent>,
     signal_rx: mpsc::Receiver<SignalEvent>,
+    rest_done_tx: mpsc::Sender<RestDone>,
+    rest_done_rx: mpsc::Receiver<RestDone>,
     rest: Option<Rest>,
+    /// Request number of the connect that produced `rest`.
+    rest_request: u64,
+    /// ICE servers fetched on connect, reused by every join and reconnect.
+    ice: Option<IceServers>,
+    fetching_ice: bool,
+    connecting: Option<PendingConnect>,
+    /// Request number of the room creation in flight.
+    creating: Option<u64>,
+    last_request: u64,
     media: Option<MediaEngine>,
     display_name: Option<DisplayName>,
     room: Option<ActiveRoom>,
@@ -72,12 +113,21 @@ impl Backend {
     /// Creates a backend bound to the UI channels.
     pub fn new(commands: mpsc::Receiver<UiCommand>, events: mpsc::Sender<AppEvent>) -> Self {
         let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_EVENT_CAPACITY);
+        let (rest_done_tx, rest_done_rx) = mpsc::channel(REST_DONE_CAPACITY);
         Self {
             commands,
             events,
             signal_tx,
             signal_rx,
+            rest_done_tx,
+            rest_done_rx,
             rest: None,
+            rest_request: 0,
+            ice: None,
+            fetching_ice: false,
+            connecting: None,
+            creating: None,
+            last_request: 0,
             media: None,
             display_name: None,
             room: None,
@@ -102,7 +152,8 @@ impl Backend {
                     }
                 },
                 Some(event) = self.signal_rx.recv() => self.on_signal_event(event).await,
-                () = sleep_until_opt(retry_at) => self.reconnect().await,
+                Some(done) = self.rest_done_rx.recv() => self.on_rest_done(done).await,
+                () = sleep_until_opt(retry_at) => self.reconnect(),
             }
         }
         self.leave_room().await;
@@ -168,6 +219,10 @@ impl Backend {
                     .await;
             }
             UiCommand::Disconnect => {
+                self.connecting = None;
+                self.creating = None;
+                self.ice = None;
+                self.fetching_ice = false;
                 self.leave_room().await;
                 self.rest = None;
             }
@@ -176,13 +231,20 @@ impl Backend {
                 let Some(rest) = self.rest.clone() else {
                     return;
                 };
-                match rest.create_room(name).await {
-                    Ok(room) => self.join(room.id, room.name).await,
-                    Err(e) => self.ui(AppEvent::Notice(format!("{e:#}"))).await,
-                }
+                let request = self.next_request();
+                self.creating = Some(request);
+                let done = self.rest_done_tx.clone();
+                tokio::spawn(async move {
+                    let result = rest.create_room(name).await.map_err(|e| format!("{e:#}"));
+                    let _ = done.send(RestDone::CreateRoom { request, result }).await;
+                });
             }
-            UiCommand::JoinRoom { id, name } => self.join(id, name).await,
+            UiCommand::JoinRoom { id, name } => {
+                self.creating = None;
+                self.join(id, name).await;
+            }
             UiCommand::LeaveRoom => {
+                self.creating = None;
                 self.leave_room().await;
                 self.ui(AppEvent::Left).await;
                 self.refresh_rooms();
@@ -245,25 +307,85 @@ impl Backend {
         }
     }
 
+    fn next_request(&mut self) -> u64 {
+        self.last_request += 1;
+        self.last_request
+    }
+
+    /// Starts the connect requests; [`Self::connected`] finishes once they succeed.
     async fn connect(
         &mut self,
         server_url: &str,
         auth_user: String,
         password: String,
         display_name: DisplayName,
-        media_config: MediaConfig,
+        media: MediaConfig,
     ) {
         let rest = match Rest::new(server_url, &auth_user, &password) {
             Ok(rest) => rest,
             Err(e) => return self.ui(AppEvent::ConnectFailed(format!("{e:#}"))).await,
         };
-        if let Err(e) = rest.health().await {
-            return self.ui(AppEvent::ConnectFailed(format!("{e:#}"))).await;
+        let request = self.next_request();
+        self.connecting = Some(PendingConnect {
+            request,
+            display_name,
+            media,
+        });
+        let done = self.rest_done_tx.clone();
+        tokio::spawn(async move {
+            let result = connect_requests(rest).await;
+            let _ = done.send(RestDone::Connect { request, result }).await;
+        });
+    }
+
+    async fn on_rest_done(&mut self, done: RestDone) {
+        match done {
+            RestDone::Connect { request, result } => {
+                let Some(pending) = self.connecting.take_if(|p| p.request == request) else {
+                    return;
+                };
+                match result {
+                    Ok((rest, rooms, ice)) => self.connected(pending, rest, rooms, ice).await,
+                    Err(e) => self.ui(AppEvent::ConnectFailed(e)).await,
+                }
+            }
+            RestDone::CreateRoom { request, result } => {
+                if self.creating != Some(request) {
+                    return;
+                }
+                self.creating = None;
+                match result {
+                    Ok(room) => self.join(room.id, room.name).await,
+                    Err(e) => self.ui(AppEvent::Notice(e)).await,
+                }
+            }
+            RestDone::Ice { request, ice } => {
+                if request != self.rest_request || self.rest.is_none() {
+                    return;
+                }
+                self.fetching_ice = false;
+                if let Some(ice) = ice {
+                    if let Some(room) = self.room.as_mut() {
+                        room.session.set_ice(Some(ice.clone()));
+                    }
+                    self.ice = Some(ice);
+                }
+            }
         }
-        let rooms = match rest.rooms().await {
-            Ok(rooms) => rooms,
-            Err(e) => return self.ui(AppEvent::ConnectFailed(format!("{e:#}"))).await,
-        };
+    }
+
+    async fn connected(
+        &mut self,
+        pending: PendingConnect,
+        rest: Rest,
+        rooms: Vec<RoomSummary>,
+        ice: Option<IceServers>,
+    ) {
+        let PendingConnect {
+            request,
+            display_name,
+            media: media_config,
+        } = pending;
         match &self.media {
             Some(_) => {
                 let MediaConfig {
@@ -289,6 +411,9 @@ impl Backend {
         }
         tracing::info!(server = rest.base(), "connected");
         self.rest = Some(rest);
+        self.rest_request = request;
+        self.ice = ice;
+        self.fetching_ice = false;
         self.display_name = Some(display_name);
         let video = match &self.media {
             Some(media) => media.video.clone(),
@@ -311,15 +436,22 @@ impl Backend {
         });
     }
 
-    async fn ice_servers(&self) -> Option<chattercrab_protocol::IceServers> {
-        let rest = self.rest.as_ref()?;
-        match rest.ice_servers().await {
-            Ok(ice) => Some(ice),
-            Err(e) => {
-                tracing::warn!(error = %e, "ICE server request failed; using host candidates only");
-                None
-            }
+    /// The cached ICE servers. When the connect-time request failed, fetches them in
+    /// the background for later joins.
+    fn cached_ice(&mut self) -> Option<IceServers> {
+        if self.ice.is_none()
+            && !self.fetching_ice
+            && let Some(rest) = self.rest.clone()
+        {
+            self.fetching_ice = true;
+            let request = self.rest_request;
+            let done = self.rest_done_tx.clone();
+            tokio::spawn(async move {
+                let ice = fetch_ice(&rest).await;
+                let _ = done.send(RestDone::Ice { request, ice }).await;
+            });
         }
+        self.ice.clone()
     }
 
     async fn join(&mut self, id: RoomId, name: RoomName) {
@@ -342,7 +474,7 @@ impl Backend {
         })
         .await;
         self.leave_room().await;
-        let ice = self.ice_servers().await;
+        let ice = self.cached_ice();
         self.room = Some(ActiveRoom {
             session: Session::new(id, name, display_name, ice),
             backoff: Backoff::new(),
@@ -380,8 +512,8 @@ impl Backend {
         ));
     }
 
-    async fn reconnect(&mut self) {
-        let ice = self.ice_servers().await;
+    fn reconnect(&mut self) {
+        let ice = self.cached_ice();
         if let Some(room) = self.room.as_mut() {
             room.session.set_ice(ice);
         }
@@ -441,11 +573,15 @@ impl Backend {
                 room.conn = None;
                 let effects = room.session.on_disconnected();
                 match reason {
-                    CloseReason::RoomNotFound => {
+                    CloseReason::RoomNotFound | CloseReason::AuthFailed => {
+                        let why = if reason == CloseReason::AuthFailed {
+                            "Authentication failed."
+                        } else {
+                            "The room no longer exists."
+                        };
                         self.room = None;
                         self.apply(effects).await;
-                        self.ui(AppEvent::RoomClosed("The room no longer exists.".into()))
-                            .await;
+                        self.ui(AppEvent::RoomClosed(why.into())).await;
                         self.refresh_rooms();
                     }
                     CloseReason::Failed(why) => {
@@ -486,6 +622,27 @@ impl Backend {
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Health check, then the room list and ICE servers in parallel.
+async fn connect_requests(
+    rest: Rest,
+) -> Result<(Rest, Vec<RoomSummary>, Option<IceServers>), String> {
+    rest.health().await.map_err(|e| format!("{e:#}"))?;
+    let (rooms, ice) = tokio::join!(rest.rooms(), fetch_ice(&rest));
+    let rooms = rooms.map_err(|e| format!("{e:#}"))?;
+    Ok((rest, rooms, ice))
+}
+
+/// `None` (host candidates only) when the request fails.
+async fn fetch_ice(rest: &Rest) -> Option<IceServers> {
+    match rest.ice_servers().await {
+        Ok(ice) => Some(ice),
+        Err(e) => {
+            tracing::warn!(error = %e, "ICE server request failed; using host candidates only");
+            None
         }
     }
 }
