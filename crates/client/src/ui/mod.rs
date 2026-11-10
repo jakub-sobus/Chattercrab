@@ -11,7 +11,7 @@ mod view;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-use chattercrab_media::{Nv12Frame, ScreenContent, ScreenScale, ScreenSource, VideoFrameQueue};
+use chattercrab_media::{ScreenContent, ScreenScale, ScreenSource, VideoFrameQueue};
 use chattercrab_protocol::{DisplayName, PeerId, RoomId, RoomName, RoomSummary};
 use iced::futures::stream;
 use iced::{Subscription, Task, Theme, keyboard, window};
@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::config::{Config, ConfigWriter, SCREEN_FPS_RANGE, STANDARD_SCREEN_FPS_MAX, ThemeChoice};
 use crate::net::{AppEvent, UiCommand};
 use room_model::RoomModel;
+use share_view::LatestFrame;
 
 /// Label for the "use the system default device" choice.
 pub const SYSTEM_DEFAULT: &str = "System default";
@@ -81,7 +82,7 @@ impl std::fmt::Display for SourceOption {
 }
 
 fn clear_share_frame(room: &mut RoomScreen) {
-    room.frame = None;
+    room.share_frame.clear();
 }
 
 /// Room screen state.
@@ -93,10 +94,9 @@ pub struct RoomScreen {
     pub chat_input: String,
     /// Open share picker, if any.
     pub picker: Option<SharePicker>,
-    /// Latest remote screen frame. The shader uploads it on the next draw.
-    pub frame: Option<Nv12Frame>,
-    /// Bumps when a remote share starts, so the frame subscription restarts.
-    share_epoch: u64,
+    /// Newest remote screen picture, filled by the video subscription and drawn
+    /// by the share view. Pictures never pass through [`App::update`].
+    pub share_frame: LatestFrame,
 }
 
 /// Mutable UI state.
@@ -119,8 +119,9 @@ pub struct UiState {
 pub enum Message {
     /// Event from the backend.
     Backend(AppEvent),
-    /// A decoded remote screen frame.
-    VideoFrame(Nv12Frame),
+    /// The first picture of a share arrived. Only rebuilds the view, which then
+    /// swaps the "waiting" placeholder for the share view.
+    ShareFrameArrived,
     /// Show or leave the fullscreen share view.
     ToggleShareFullscreen,
     /// Leave fullscreen (Escape, or the share ended).
@@ -244,18 +245,16 @@ impl Hash for EventBridge {
     }
 }
 
-/// Identity wrapper for the video subscription.
+/// Identity and data of the video subscription.
 struct VideoSource {
     queue: VideoFrameQueue,
-    publisher: PeerId,
-    epoch: u64,
+    latest: LatestFrame,
 }
 
 impl Hash for VideoSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
         "chattercrab-video".hash(state);
-        self.publisher.hash(state);
-        self.epoch.hash(state);
+        self.latest.id().hash(state);
     }
 }
 
@@ -343,7 +342,7 @@ impl App {
                     followup = self.set_share_fullscreen(false);
                 }
             }
-            Message::VideoFrame(frame) => followup = self.queue_share_frame(frame),
+            Message::ShareFrameArrived => {}
             Message::ToggleShareFullscreen => {
                 if self.remote_share_visible() {
                     followup = self.set_share_fullscreen(!self.share_fullscreen);
@@ -626,17 +625,6 @@ impl App {
         })
     }
 
-    fn queue_share_frame(&mut self, frame: Nv12Frame) -> Task<Message> {
-        let Some(room) = self.room_mut() else {
-            return Task::none();
-        };
-        if !room.model.remote_share_active() {
-            return Task::none();
-        }
-        room.frame = Some(frame);
-        Task::none()
-    }
-
     fn push_peer_volume(&mut self, peer: PeerId) {
         let volume = self
             .room_mut()
@@ -677,8 +665,7 @@ impl App {
             model: RoomModel::joining(id, name, self.config.display_name.clone()),
             chat_input: String::new(),
             picker: None,
-            frame: None,
-            share_epoch: 0,
+            share_frame: LatestFrame::default(),
         }));
     }
 
@@ -746,19 +733,13 @@ impl App {
                 {
                     room.model.apply_joined(joined);
                     clear_share_frame(room);
-                    if room.model.remote_share_active() {
-                        room.share_epoch = room.share_epoch.wrapping_add(1);
-                    }
                 }
             }
             other => {
                 if let Some(room) = self.room_mut() {
                     let before = room.model.screen_publisher;
                     room.model.apply(&other);
-                    if room.model.screen_publisher != before && room.model.remote_share_active() {
-                        room.share_epoch = room.share_epoch.wrapping_add(1);
-                    }
-                    if !room.model.remote_share_active() {
+                    if room.model.screen_publisher != before || !room.model.remote_share_active() {
                         clear_share_frame(room);
                     }
                 }
@@ -766,7 +747,12 @@ impl App {
         }
     }
 
-    /// Backend events, keyboard shortcuts, and remote video frames while a share is shown.
+    /// Backend events, keyboard shortcuts, and remote video while a share is shown.
+    ///
+    /// Video does not produce a message per picture: the stream moves the newest
+    /// picture into [`RoomScreen::share_frame`], which keeps the decoder's queue
+    /// drained even while the window is minimized and not redrawing, and yields
+    /// only for the first picture after the slot was cleared.
     pub fn subscription(&self) -> Subscription<Message> {
         let backend = Subscription::run_with(self.bridge.clone(), |bridge| {
             let rx = bridge.0.lock().ok().and_then(|mut slot| slot.take());
@@ -795,22 +781,25 @@ impl App {
         });
         let mut subs = vec![backend, keys];
         if let (Screen::Room(room), Some(video)) = (&self.state.screen, &self.state.video)
-            && let Some(publisher) = room.model.screen_publisher
             && room.model.remote_share_active()
         {
             subs.push(Subscription::run_with(
                 VideoSource {
                     queue: video.clone(),
-                    publisher,
-                    epoch: room.share_epoch,
+                    latest: room.share_frame.clone(),
                 },
                 |source| {
                     let queue = source.queue.clone();
+                    let latest = source.latest.clone();
                     stream::unfold((), move |_| {
                         let queue = queue.clone();
+                        let latest = latest.clone();
                         async move {
-                            let frame = queue.next().await;
-                            Some((Message::VideoFrame(frame), ()))
+                            loop {
+                                if latest.put(queue.next().await) {
+                                    return Some((Message::ShareFrameArrived, ()));
+                                }
+                            }
                         }
                     })
                 },

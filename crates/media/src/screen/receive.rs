@@ -21,6 +21,7 @@ use rtc::rtp::packetizer::Depacketizer;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
 use super::playout::{AuBuffer, MAX_PLAYOUT_DELAY, PushError, SharedClock, Step, TimedAu, Wait};
+use crate::video_queue::PlanePool;
 use crate::{MediaError, Nv12Frame, VideoFrameQueue};
 
 /// Minimum interval between PLIs.
@@ -52,42 +53,56 @@ pub fn new_decoder() -> Result<Decoder, MediaError> {
 
 /// Decodes one access unit into NV12. Returns `Ok(None)` when the decoder needs more data.
 pub fn decode_frame(decoder: &mut Decoder, au: &[u8]) -> Result<Option<Nv12Frame>, MediaError> {
+    decode_pooled(decoder, au, &mut PlanePool::default())
+}
+
+fn decode_pooled(
+    decoder: &mut Decoder,
+    au: &[u8],
+    pool: &mut PlanePool,
+) -> Result<Option<Nv12Frame>, MediaError> {
     let Some(yuv) = decoder
         .decode(au)
         .map_err(|e| MediaError::Codec(format!("h264 decode: {e}")))?
     else {
         return Ok(None);
     };
-    Ok(Some(nv12_from_yuv(&yuv)))
+    Ok(Some(nv12_from_yuv(&yuv, pool)))
 }
 
-fn nv12_from_yuv(yuv: &impl YUVSource) -> Nv12Frame {
+/// Packs I420 into tight NV12 planes. Chroma covers odd edges, so it is
+/// `ceil(width / 2)` pairs wide and `ceil(height / 2)` rows high.
+fn nv12_from_yuv(yuv: &impl YUVSource, pool: &mut PlanePool) -> Nv12Frame {
     let (width, height) = yuv.dimensions();
     let (y_stride, u_stride, v_stride) = yuv.strides();
     let y_plane = yuv.y();
     let u_plane = yuv.u();
     let v_plane = yuv.v();
-    let mut y = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let start = row * y_stride;
-        y.extend_from_slice(&y_plane[start..start + width]);
-    }
-    let chroma_w = width / 2;
-    let chroma_h = height / 2;
-    let mut uv = Vec::with_capacity(chroma_w * chroma_h * 2);
-    for row in 0..chroma_h {
-        for col in 0..chroma_w {
-            uv.push(u_plane[row * u_stride + col]);
-            uv.push(v_plane[row * v_stride + col]);
+    let y = pool.fill(width * height, |out| {
+        for (row, dst) in out.chunks_exact_mut(width.max(1)).enumerate() {
+            let start = row * y_stride;
+            dst.copy_from_slice(&y_plane[start..start + width]);
         }
-    }
+    });
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let uv_stride = chroma_w * 2;
+    let uv = pool.fill(uv_stride * chroma_h, |out| {
+        for (row, dst) in out.chunks_exact_mut(uv_stride.max(1)).enumerate() {
+            let u = &u_plane[row * u_stride..][..chroma_w];
+            let v = &v_plane[row * v_stride..][..chroma_w];
+            for ((pair, &u), &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(u).zip(v) {
+                *pair = [u, v];
+            }
+        }
+    });
     Nv12Frame {
         width: width as u32,
         height: height as u32,
         y_stride: width as u32,
-        uv_stride: width as u32,
-        y: Arc::from(y),
-        uv: Arc::from(uv),
+        uv_stride: uv_stride as u32,
+        y,
+        uv,
         seq: Nv12Frame::next_seq(),
     }
 }
@@ -96,6 +111,8 @@ struct PictureDecoder {
     #[cfg(windows)]
     hardware: Option<super::hw_decode::HwDecoder>,
     software: Option<Decoder>,
+    /// Plane buffers for software-decoded pictures.
+    pool: PlanePool,
 }
 
 impl PictureDecoder {
@@ -106,6 +123,7 @@ impl PictureDecoder {
                 return Ok(Self {
                     hardware: Some(decoder),
                     software: None,
+                    pool: PlanePool::default(),
                 });
             }
             Err(error) => {
@@ -116,6 +134,7 @@ impl PictureDecoder {
             #[cfg(windows)]
             hardware: None,
             software: Some(new_decoder()?),
+            pool: PlanePool::default(),
         })
     }
 
@@ -156,7 +175,7 @@ impl PictureDecoder {
             return Ok(None);
         }
         let started = Instant::now();
-        let frame = decode_frame(decoder, au)?;
+        let frame = decode_pooled(decoder, au, &mut self.pool)?;
         let took = started.elapsed();
         if took > Duration::from_millis(12) {
             slow_software_decode(took);
@@ -310,7 +329,7 @@ fn decode_loop(
     let mut generation = 0u64;
     let mut need_idr = false;
     let mut logged_start = false;
-    let mut empty_since: Option<Instant> = None;
+    let mut late_seen = 0u64;
     let mut pace = DecodePace::new(decoder.is_hardware());
     loop {
         pace.tick(decoder.is_hardware());
@@ -328,28 +347,20 @@ fn decode_loop(
             };
         }
 
-        let timeout = clock.with_mut(|clock| clock.frame_duration());
+        // An empty buffer is not an underrun: the publisher sends nothing while the
+        // screen does not change. The clock counts a picture that arrives late.
+        let (timeout, late) = clock.with_mut(|clock| (clock.frame_duration(), clock.late()));
+        if late != late_seen {
+            let new = u32::try_from(late.saturating_sub(late_seen)).unwrap_or(u32::MAX);
+            late_seen = late;
+            pace.underruns = pace.underruns.saturating_add(new);
+            tracing::debug!("screen frame arrived late; buffering again");
+        }
         let peeked = match buffer.wait_generation(generation, timeout) {
             Wait::Closed => return,
             Wait::Overflow => continue,
-            Wait::Timeout { queued: None } => {
-                let (started, cushion) =
-                    clock.with_mut(|clock| (clock.is_started(), clock.delay()));
-                if started {
-                    let since = empty_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= cushion {
-                        empty_since = None;
-                        pace.underruns = pace.underruns.saturating_add(1);
-                        clock.with_mut(super::playout::PlayoutClock::underrun);
-                        tracing::debug!("screen playout underrun; buffering again");
-                    }
-                }
-                continue;
-            }
-            Wait::Timeout { queued: Some(peek) } | Wait::Ready(peek) => {
-                empty_since = None;
-                peek
-            }
+            Wait::Timeout { queued: None } => continue,
+            Wait::Timeout { queued: Some(peek) } | Wait::Ready(peek) => peek,
         };
         generation = peeked.generation;
 
@@ -590,6 +601,99 @@ mod tests {
         assert!(contains_idr(&[0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 9]));
         assert!(!contains_idr(&[0, 0, 0, 1, 0x41, 1, 2, 3]));
         assert!(!contains_idr(&[]));
+    }
+
+    /// I420 planes with padded rows, like OpenH264 output.
+    struct Planes {
+        size: (usize, usize),
+        strides: (usize, usize, usize),
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    }
+
+    impl Planes {
+        fn new(width: usize, height: usize) -> Self {
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let strides = (width + 5, cw + 3, cw + 7);
+            let fill = |len: usize, seed: usize| -> Vec<u8> {
+                (0..len).map(|i| ((i * 7 + seed) % 251) as u8).collect()
+            };
+            Self {
+                size: (width, height),
+                strides,
+                y: fill(strides.0 * height, 1),
+                u: fill(strides.1 * ch, 2),
+                v: fill(strides.2 * ch, 3),
+            }
+        }
+    }
+
+    impl YUVSource for Planes {
+        fn dimensions(&self) -> (usize, usize) {
+            self.size
+        }
+        fn strides(&self) -> (usize, usize, usize) {
+            self.strides
+        }
+        fn y(&self) -> &[u8] {
+            &self.y
+        }
+        fn u(&self) -> &[u8] {
+            &self.u
+        }
+        fn v(&self) -> &[u8] {
+            &self.v
+        }
+    }
+
+    /// The byte-by-byte interleave this module used before pooling.
+    fn reference_uv(yuv: &Planes) -> Vec<u8> {
+        let (width, height) = yuv.size;
+        let mut uv = Vec::new();
+        for row in 0..height / 2 {
+            for col in 0..width / 2 {
+                uv.push(yuv.u[row * yuv.strides.1 + col]);
+                uv.push(yuv.v[row * yuv.strides.2 + col]);
+            }
+        }
+        uv
+    }
+
+    #[test]
+    fn nv12_matches_the_plain_interleave() {
+        let yuv = Planes::new(64, 36);
+        let mut pool = PlanePool::default();
+        let frame = nv12_from_yuv(&yuv, &mut pool);
+        assert_eq!((frame.width, frame.height), (64, 36));
+        assert_eq!((frame.y_stride, frame.uv_stride), (64, 64));
+        assert_eq!(&frame.uv[..], &reference_uv(&yuv)[..]);
+        for row in 0..36 {
+            let src = &yuv.y[row * yuv.strides.0..][..64];
+            assert_eq!(&frame.y[row * 64..][..64], src);
+        }
+        // A pooled buffer is overwritten completely by the next picture.
+        let first = frame.seq;
+        drop(frame);
+        let again = nv12_from_yuv(&yuv, &mut pool);
+        assert_ne!(again.seq, first);
+        assert_eq!(&again.uv[..], &reference_uv(&yuv)[..]);
+    }
+
+    #[test]
+    fn odd_sizes_keep_the_last_chroma_column_and_row() {
+        let yuv = Planes::new(5, 3);
+        let frame = nv12_from_yuv(&yuv, &mut PlanePool::default());
+        assert_eq!((frame.y_stride, frame.uv_stride), (5, 6));
+        assert_eq!(frame.y.len(), 15);
+        assert_eq!(frame.uv.len(), 12);
+        for row in 0..2 {
+            for col in 0..3 {
+                let at = row * 6 + col * 2;
+                assert_eq!(frame.uv[at], yuv.u[row * yuv.strides.1 + col]);
+                assert_eq!(frame.uv[at + 1], yuv.v[row * yuv.strides.2 + col]);
+            }
+        }
     }
 
     #[test]

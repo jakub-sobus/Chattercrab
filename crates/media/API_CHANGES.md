@@ -60,6 +60,17 @@ Behavior notes for the client (no type changes):
   underrun: a picture is late only if it arrives after its RTP due time. The
   standard two-second IDR period counts encoded pictures, so an idle share gets
   periodic IDRs much less often; a joining viewer's keyframe request covers that.
+- Screen-share underruns are counted only when a picture arrives more than one
+  frame after its RTP due time. A jump in the RTP timestamps (the publisher skipped
+  unchanged pictures) is not an underrun, does not raise the delay, and does not
+  change the frame-interval estimate: once one interval is known, steps over 2.5×
+  the estimate are ignored for it. An empty buffer alone no longer rebuffers.
+- Decoded `Nv12Frame` planes come from a per-decoder pool and are reused once every
+  clone of a frame is dropped, so a consumer should not hold old frames (it keeps
+  their buffers out of the pool). Frames are cropped to the visible picture (the
+  Windows hardware decoder reports 1920×1088 for 1080p; frames are 1920×1080).
+  Chroma is `ceil(width / 2)` UV pairs by `ceil(height / 2)` rows, and `uv_stride`
+  is the bytes actually written per chroma row (equal to `width` for even widths).
 - Every screen-share encoder (Media Foundation, D3D11 video processor, VA-API,
   OpenH264) produces BT.709 limited-range YCbCr and signals it in the SPS VUI
   where the encoder allows, matching the viewer's BT.709 shader.

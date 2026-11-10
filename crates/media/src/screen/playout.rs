@@ -4,6 +4,10 @@
 //! newest frame. Arrival jitter and a slow viewer become delay. Once arrivals
 //! have been calm for a while, the delay drifts back toward what the jitter
 //! needs by skipping one picture at a time. Frames are never shown in a burst.
+//!
+//! A publisher does not send unchanged pictures, so the RTP clock can jump between
+//! two frames. Such a gap is neither a slower frame rate nor an underrun: only a
+//! picture that arrives after it was due counts as one.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -21,6 +25,9 @@ pub(super) const MIN_PLAYOUT_DELAY: Duration = Duration::from_millis(50);
 const DECAY_CALM: Duration = Duration::from_secs(5);
 /// At most one picture is skipped per interval to lower the delay.
 const DECAY_INTERVAL: Duration = Duration::from_millis(250);
+/// An RTP step this many times the frame estimate (in quarters) is a skipped
+/// stretch of unchanged screen, not a frame interval.
+const GAP_FACTOR_Q4: u64 = 10;
 /// Encoded access units kept when the decoder falls behind the cap. Past this
 /// the buffer is discarded and the viewer waits for the next keyframe.
 const MAX_BUFFERED_FRAMES: usize = 180;
@@ -55,6 +62,8 @@ pub(super) struct PlayoutClock {
     last_arrival: Option<Instant>,
     jitter_q4: u32,
     skipped: u64,
+    /// Pictures that arrived after they were due.
+    late: u64,
     /// Start of the current calm window. Cleared by an underrun or a raise.
     calm_since: Option<Instant>,
     last_decay: Option<Instant>,
@@ -76,6 +85,7 @@ impl PlayoutClock {
             last_arrival: None,
             jitter_q4: 0,
             skipped: 0,
+            late: 0,
             calm_since: None,
             last_decay: None,
         }
@@ -86,15 +96,12 @@ impl PlayoutClock {
         let delay = self.delay;
         let frame_ticks = self.frame_ticks;
         let jitter_q4 = self.jitter_q4;
+        let late = self.late;
         *self = Self::new();
         self.delay = delay;
         self.frame_ticks = frame_ticks;
         self.jitter_q4 = jitter_q4;
-    }
-
-    /// Whether playout has left the preroll.
-    pub(super) fn is_started(&self) -> bool {
-        self.started
+        self.late = late;
     }
 
     /// Estimated time between pictures.
@@ -112,24 +119,35 @@ impl PlayoutClock {
         self.skipped
     }
 
+    /// Pictures that arrived after they were due (each one was an underrun).
+    pub(super) fn late(&self) -> u64 {
+        self.late
+    }
+
     /// Records one access unit as it arrives, before it is shown.
+    ///
+    /// A picture that arrives more than a frame after it was due means the
+    /// buffer ran dry: that is an [`Self::underrun`]. A gap in the RTP clock
+    /// moves the due time with it, so an idle stretch is not one.
     pub(super) fn observe(&mut self, rtp_ts: u32, arrival: Instant) {
         if let Some(prev) = self.last_rtp {
             let delta = rtp_ts.wrapping_sub(prev);
-            if delta > 0 && delta < RTP_CLOCK_HZ {
-                self.frame_samples = self.frame_samples.saturating_add(1);
-                self.frame_ticks = if self.frame_samples < 8 {
-                    let samples = u64::from(self.frame_samples);
-                    ((u64::from(self.frame_ticks) * (samples - 1) + u64::from(delta)) / samples)
-                        as u32
-                } else {
-                    (self.frame_ticks * 7 + delta) / 8
-                };
+            if delta > 0 && delta <= RTP_CLOCK_HZ * 2 {
+                if delta < RTP_CLOCK_HZ && !self.is_gap(delta) {
+                    self.note_frame_interval(delta);
+                }
                 self.note_jitter(prev, rtp_ts, arrival);
             }
         }
         self.last_rtp = Some(rtp_ts);
         self.last_arrival = Some(arrival);
+        if self.started
+            && let Some(due) = self.due(rtp_ts)
+            && arrival > due + self.frame_duration()
+        {
+            self.late = self.late.saturating_add(1);
+            self.underrun();
+        }
         self.raise_delay(self.target_from_jitter());
     }
 
@@ -160,10 +178,7 @@ impl PlayoutClock {
         if self.decay(span, now) {
             return Step::DecodeOnly;
         }
-        let rtp_due = self
-            .origin_at
-            .checked_add(ticks_to_duration(oldest.wrapping_sub(self.origin_rtp)))
-            .unwrap_or(now);
+        let rtp_due = self.due(oldest).unwrap_or(now);
         let earliest = self
             .last_shown
             .map(|shown| shown + self.frame_duration())
@@ -194,6 +209,28 @@ impl PlayoutClock {
         self.started = false;
         self.buffering_since = None;
         self.last_shown = None;
+    }
+
+    /// When the picture stamped `rtp` should be shown on the current timeline.
+    fn due(&self, rtp: u32) -> Option<Instant> {
+        self.origin_at
+            .checked_add(ticks_to_duration(rtp.wrapping_sub(self.origin_rtp)))
+    }
+
+    /// Whether `delta` skips over unchanged pictures rather than being one frame
+    /// interval. The first interval is always taken.
+    fn is_gap(&self, delta: u32) -> bool {
+        self.frame_samples > 0 && u64::from(delta) * 4 > u64::from(self.frame_ticks) * GAP_FACTOR_Q4
+    }
+
+    fn note_frame_interval(&mut self, delta: u32) {
+        self.frame_samples = self.frame_samples.saturating_add(1);
+        self.frame_ticks = if self.frame_samples < 8 {
+            let samples = u64::from(self.frame_samples);
+            ((u64::from(self.frame_ticks) * (samples - 1) + u64::from(delta)) / samples) as u32
+        } else {
+            (self.frame_ticks * 7 + delta) / 8
+        };
     }
 
     fn preroll(&self) -> Duration {
@@ -560,7 +597,7 @@ mod tests {
             Step::Present { at } => assert_eq!(at, t0),
             other => panic!("expected the first frame, got {other:?}"),
         }
-        assert!(clock.is_started());
+        assert!(clock.started);
     }
 
     #[test]
@@ -588,6 +625,8 @@ mod tests {
     }
 
     /// Steady 60 fps arrivals and a decoder that pops each picture when it is due.
+    /// Optionally the publisher skips unchanged pictures (`gap`) or the network
+    /// holds frames back (`stall`).
     struct Sim {
         clock: PlayoutClock,
         t0: Instant,
@@ -596,6 +635,10 @@ mod tests {
         queue: VecDeque<u32>,
         shown: Vec<Instant>,
         decode_only: u32,
+        /// From frame `.0` on, timestamps (and sending) are `.1` ticks later.
+        gap: Option<(u32, u32)>,
+        /// From frame `.0` on, nothing arrives before `.1` after the start.
+        stall: Option<(u32, Duration)>,
     }
 
     impl Sim {
@@ -614,18 +657,32 @@ mod tests {
                 queue: VecDeque::new(),
                 shown: Vec::new(),
                 decode_only: 0,
+                gap: None,
+                stall: None,
             }
         }
 
+        fn rtp(&self, n: u32) -> u32 {
+            let skipped = match self.gap {
+                Some((from, ticks)) if n >= from => ticks,
+                _ => 0,
+            };
+            n * Self::TICKS + skipped
+        }
+
         fn arrival(&self, n: u32) -> Instant {
-            self.t0 + ticks_to_duration(n * Self::TICKS)
+            let sent = self.t0 + ticks_to_duration(self.rtp(n));
+            match self.stall {
+                Some((from, until)) if n >= from => sent.max(self.t0 + until),
+                _ => sent,
+            }
         }
 
         fn run_until(&mut self, end: Duration) {
             let end = self.t0 + end;
             while self.now < end {
                 while self.arrival(self.next) <= self.now {
-                    let rtp = self.next * Self::TICKS;
+                    let rtp = self.rtp(self.next);
                     self.clock.observe(rtp, self.arrival(self.next));
                     self.queue.push_back(rtp);
                     self.next += 1;
@@ -660,6 +717,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_gap_in_the_timestamps_is_not_a_slower_frame_rate() {
+        let mut clock = PlayoutClock::new();
+        let t0 = Instant::now();
+        for n in 0..20u32 {
+            clock.observe(n * 1_500, t0 + ticks_to_duration(n * 1_500));
+        }
+        let frame = clock.frame_duration();
+        assert_eq!(frame, ticks_to_duration(1_500));
+        // 600 ms of unchanged screen, then the next picture.
+        let rtp = 19 * 1_500 + 54_000;
+        clock.observe(rtp, t0 + ticks_to_duration(rtp));
+        assert_eq!(clock.frame_duration(), frame);
+        clock.observe(rtp + 1_500, t0 + ticks_to_duration(rtp + 1_500));
+        assert_eq!(clock.frame_duration(), frame);
+    }
+
+    #[test]
+    fn the_first_interval_sets_the_frame_rate() {
+        let mut clock = PlayoutClock::new();
+        let t0 = Instant::now();
+        // A 5 fps share is far slower than the 30 fps default.
+        clock.observe(0, t0);
+        clock.observe(18_000, at(t0, 200));
+        clock.observe(36_000, at(t0, 400));
+        assert_eq!(clock.frame_duration(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn an_idle_gap_neither_underruns_nor_raises_the_delay() {
+        let mut sim = Sim::new(MIN_PLAYOUT_DELAY);
+        sim.gap = Some((120, 54_000));
+        sim.run_until(Duration::from_millis(1_900));
+        assert!(sim.clock.started);
+        let frame = sim.clock.frame_duration();
+        let delay = sim.clock.delay();
+        let shown = sim.shown.len();
+
+        sim.run_until(Duration::from_secs(4));
+        assert_eq!(sim.clock.frame_duration(), frame);
+        assert_eq!(sim.clock.delay(), delay);
+        assert_eq!(sim.clock.late(), 0);
+        assert!(sim.clock.started);
+        assert!(
+            sim.shown.len() > shown + 60,
+            "playback stopped after the gap"
+        );
+        sim.assert_no_burst();
+        // The picture after the gap keeps to the RTP clock: one frame plus
+        // 600 ms after the one before it, without a new preroll.
+        let longest = sim
+            .shown
+            .windows(2)
+            .map(|pair| pair[1].saturating_duration_since(pair[0]))
+            .max()
+            .unwrap_or_default();
+        let expected = ticks_to_duration(Sim::TICKS + 54_000);
+        assert!(
+            longest.abs_diff(expected) < Duration::from_millis(2),
+            "longest pause {longest:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_arrives_after_it_was_due_is_an_underrun() {
+        let mut sim = Sim::new(MIN_PLAYOUT_DELAY);
+        // Frames from 2 s on are held back by the network for 300 ms.
+        sim.stall = Some((120, Duration::from_millis(2_300)));
+        sim.run_until(Duration::from_millis(1_900));
+        let delay = sim.clock.delay();
+        assert_eq!(sim.clock.late(), 0);
+
+        sim.run_until(Duration::from_secs(4));
+        assert_eq!(sim.clock.late(), 1);
+        assert!(sim.clock.delay() > delay, "delay {:?}", sim.clock.delay());
+        assert!(sim.clock.started, "playback should resume");
     }
 
     #[test]
@@ -798,10 +933,10 @@ mod tests {
         clock.frame_ticks = 1_500;
         let t0 = Instant::now();
         let _ = clock.step(0, 6 * 1_500, t0);
-        assert!(clock.is_started());
+        assert!(clock.started);
         let before = clock.delay();
         clock.underrun();
-        assert!(!clock.is_started());
+        assert!(!clock.started);
         assert!(clock.delay() > before);
         assert_eq!(clock.step(0, 0, t0), Step::Buffer);
     }

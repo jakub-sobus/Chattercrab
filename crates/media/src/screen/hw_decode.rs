@@ -3,10 +3,9 @@
 //! Hardware H.264 decode on Windows.
 //!
 //! The Media Foundation decoder runs on the GPU. Output NV12 is copied once into
-//! a staging texture and handed to the UI, which uploads the two planes and does
-//! the color conversion in a shader. OpenH264 is used when no hardware decoder opens.
-
-use std::sync::Arc;
+//! a staging texture, cropped to the visible picture into pooled plane buffers,
+//! and handed to the UI, which uploads the two planes and does the color
+//! conversion in a shader. OpenH264 is used when no hardware decoder opens.
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -22,13 +21,13 @@ use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample,
     IMFTransform, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
     MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_EVENT_FLAG_NO_WAIT, MF_LOW_LATENCY, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFStartup, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_LOCALMFT,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
+    MF_EVENT_FLAG_NO_WAIT, MF_LOW_LATENCY, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
+    MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
+    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
     MFVideoFormat_NV12,
 };
@@ -37,6 +36,7 @@ use windows::core::Interface;
 
 use super::receive::contains_idr;
 use crate::Nv12Frame;
+use crate::video_queue::PlanePool;
 
 enum DecoderEvent {
     Quiet,
@@ -57,8 +57,12 @@ pub struct HwDecoder {
     need_input: u32,
     provides_samples: bool,
     staging: Option<ID3D11Texture2D>,
+    /// Output frame size (`MF_MT_FRAME_SIZE`), padded to whole macroblocks.
     width: u32,
     height: u32,
+    /// Picture without the macroblock padding (1080 rows of a 1088-row frame).
+    visible: (u32, u32),
+    pool: PlanePool,
     frames: u64,
     /// Pictures already pulled out of the decoder, oldest first.
     ready: std::collections::VecDeque<Nv12Frame>,
@@ -235,9 +239,9 @@ impl HwDecoder {
                             &self.context,
                             &sample,
                             &mut self.staging,
-                            &mut self.width,
-                            &mut self.height,
-                            true,
+                            (self.width, self.height),
+                            self.visible,
+                            &mut self.pool,
                         );
                     }
                     Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
@@ -257,6 +261,14 @@ impl HwDecoder {
                                 != 0;
                         }
                         read_size(&new_type, &mut self.width, &mut self.height);
+                        self.visible =
+                            read_aperture(&new_type).unwrap_or((self.width, self.height));
+                        tracing::debug!(
+                            width = self.width,
+                            height = self.height,
+                            visible = ?self.visible,
+                            "h264 decoder output size"
+                        );
                     }
                     Err(error) => return Err(format!("decoder output: {error}")),
                 }
@@ -366,6 +378,8 @@ unsafe fn bind(activate: &IMFActivate, name: &str) -> Result<HwDecoder, String> 
         staging: None,
         width: 0,
         height: 0,
+        visible: (0, 0),
+        pool: PlanePool::default(),
         frames: 0,
         ready: std::collections::VecDeque::new(),
     })
@@ -534,26 +548,47 @@ fn read_size(
     *height = packed as u32;
 }
 
+/// The visible picture inside an output type: `MF_MT_MINIMUM_DISPLAY_APERTURE`
+/// when it starts at the top-left corner.
+fn read_aperture(
+    media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+) -> Option<(u32, u32)> {
+    // MFVideoArea: two MFOffset { fract: u16, value: i16 }, then SIZE { cx, cy }.
+    let mut area = [0u8; 16];
+    let mut len = 0u32;
+    unsafe { media_type.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut area, Some(&mut len)) }
+        .ok()?;
+    let int = |at: usize| i32::from_le_bytes([area[at], area[at + 1], area[at + 2], area[at + 3]]);
+    let width = u32::try_from(int(8)).ok()?;
+    let height = u32::try_from(int(12)).ok()?;
+    let origin = area[2..4] == [0, 0] && area[6..8] == [0, 0];
+    (len == 16 && origin && width > 0 && height > 0).then_some((width, height))
+}
+
+/// `visible` clamped to a `width` x `height` surface; the whole surface when unknown.
+fn crop_to(visible: (u32, u32), width: u32, height: u32) -> (u32, u32) {
+    match visible {
+        (0, _) | (_, 0) => (width, height),
+        (w, h) => (w.min(width), h.min(height)),
+    }
+}
+
 fn copy_nv12(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     sample: &IMFSample,
     staging: &mut Option<ID3D11Texture2D>,
-    width: &mut u32,
-    height: &mut u32,
-    log: bool,
+    frame_size: (u32, u32),
+    visible: (u32, u32),
+    pool: &mut PlanePool,
 ) -> Result<Option<Nv12Frame>, String> {
     let buffer = unsafe { sample.GetBufferByIndex(0) }.map_err(|error| error.to_string())?;
     if let Ok(dxgi) = buffer.cast::<IMFDXGIBuffer>() {
-        if log {
-            log_surface(true);
-        }
-        return copy_dxgi(device, context, &dxgi, staging, width, height);
+        log_surface(true);
+        return copy_dxgi(device, context, &dxgi, staging, visible, pool);
     }
-    if log {
-        log_surface(false);
-    }
-    copy_memory(&buffer, width, height)
+    log_surface(false);
+    copy_memory(&buffer, frame_size, visible, pool)
 }
 
 fn log_surface(dxgi: bool) {
@@ -566,8 +601,8 @@ fn copy_dxgi(
     context: &ID3D11DeviceContext,
     dxgi: &IMFDXGIBuffer,
     staging: &mut Option<ID3D11Texture2D>,
-    width: &mut u32,
-    height: &mut u32,
+    visible: (u32, u32),
+    pool: &mut PlanePool,
 ) -> Result<Option<Nv12Frame>, String> {
     let texture = unsafe {
         let mut raw = std::ptr::null_mut();
@@ -581,23 +616,31 @@ fn copy_dxgi(
     let subresource = unsafe { dxgi.GetSubresourceIndex() }.unwrap_or(0);
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&mut desc) };
-    *width = desc.Width;
-    *height = desc.Height;
-    if staging.is_none() {
+    // The publisher may resize its window; the staging copy must match the surface.
+    let fits = staging.as_ref().is_some_and(|stage| {
+        let mut current = D3D11_TEXTURE2D_DESC::default();
+        unsafe { stage.GetDesc(&mut current) };
+        current.Width == desc.Width && current.Height == desc.Height
+    });
+    if !fits {
         *staging = Some(staging_texture(device, desc.Width, desc.Height)?);
     }
     let Some(stage) = staging.as_ref() else {
         return Ok(None);
     };
+    let (width, height) = crop_to(visible, desc.Width, desc.Height);
     unsafe {
         context.CopySubresourceRegion(stage, 0, 0, 0, 0, &texture, subresource, None);
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         context
             .Map(stage, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .map_err(|error| format!("mapping decoder output: {error}"))?;
-        let frame = nv12_from_mapped(&mapped, desc.Width, desc.Height);
+        let pitch = mapped.RowPitch as usize;
+        let rows = desc.Height as usize;
+        let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (rows + rows / 2));
+        let frame = nv12_from_rows(src, pitch, rows, width, height, pool);
         context.Unmap(stage, 0);
-        Ok(Some(frame))
+        Ok(frame)
     }
 }
 
@@ -632,12 +675,14 @@ fn staging_texture(
 
 fn copy_memory(
     buffer: &windows::Win32::Media::MediaFoundation::IMFMediaBuffer,
-    width: &mut u32,
-    height: &mut u32,
+    (width, height): (u32, u32),
+    visible: (u32, u32),
+    pool: &mut PlanePool,
 ) -> Result<Option<Nv12Frame>, String> {
-    if *width < 2 || *height < 2 {
+    if width < 2 || height < 2 {
         return Ok(None);
     }
+    let (visible_w, visible_h) = crop_to(visible, width, height);
     unsafe {
         let mut data = std::ptr::null_mut();
         let mut len = 0u32;
@@ -645,54 +690,150 @@ fn copy_memory(
             .Lock(&mut data, None, Some(&mut len))
             .map_err(|error| error.to_string())?;
         let bytes = std::slice::from_raw_parts(data, len as usize);
-        let frame = nv12_from_tight(bytes, *width, *height);
+        let frame = nv12_from_rows(
+            bytes,
+            width as usize,
+            height as usize,
+            visible_w,
+            visible_h,
+            pool,
+        );
         buffer.Unlock().map_err(|error| error.to_string())?;
         Ok(frame)
     }
 }
 
-fn nv12_from_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u32, height: u32) -> Nv12Frame {
-    let stride = mapped.RowPitch as usize;
-    let src = unsafe {
-        std::slice::from_raw_parts(mapped.pData as *const u8, stride * height as usize * 3 / 2)
-    };
-    let y_rows = height as usize;
-    let uv_rows = height as usize / 2;
-    let mut y = Vec::with_capacity(width as usize * y_rows);
-    for row in 0..y_rows {
-        let start = row * stride;
-        y.extend_from_slice(&src[start..start + width as usize]);
-    }
-    let uv_base = stride * y_rows;
-    let mut uv = Vec::with_capacity(width as usize * uv_rows);
-    for row in 0..uv_rows {
-        let start = uv_base + row * stride;
-        uv.extend_from_slice(&src[start..start + width as usize]);
-    }
-    Nv12Frame {
-        width,
-        height,
-        y_stride: width,
-        uv_stride: width,
-        y: Arc::from(y),
-        uv: Arc::from(uv),
-        seq: Nv12Frame::next_seq(),
-    }
-}
-
-fn nv12_from_tight(bytes: &[u8], width: u32, height: u32) -> Option<Nv12Frame> {
-    let y_len = width as usize * height as usize;
-    let uv_len = y_len / 2;
-    if bytes.len() < y_len + uv_len {
+/// Copies the top-left `width` x `height` picture out of NV12 rows `pitch` bytes
+/// apart, whose chroma plane starts after `plane_rows` luma rows, into tight
+/// pooled planes. `None` when `src` is too short for that.
+fn nv12_from_rows(
+    src: &[u8],
+    pitch: usize,
+    plane_rows: usize,
+    width: u32,
+    height: u32,
+    pool: &mut PlanePool,
+) -> Option<Nv12Frame> {
+    let (w, h) = (width as usize, height as usize);
+    let uv_row = w.div_ceil(2) * 2;
+    let uv_rows = h.div_ceil(2);
+    let uv_base = pitch * plane_rows;
+    if w == 0 || h == 0 || uv_row > pitch || h > plane_rows {
         return None;
     }
+    if src.len() < uv_base + pitch * (uv_rows - 1) + uv_row {
+        return None;
+    }
+    let y = pool.fill(w * h, |out| {
+        for (row, dst) in out.chunks_exact_mut(w).enumerate() {
+            dst.copy_from_slice(&src[row * pitch..][..w]);
+        }
+    });
+    let uv = pool.fill(uv_row * uv_rows, |out| {
+        for (row, dst) in out.chunks_exact_mut(uv_row).enumerate() {
+            dst.copy_from_slice(&src[uv_base + row * pitch..][..uv_row]);
+        }
+    });
     Some(Nv12Frame {
         width,
         height,
         y_stride: width,
-        uv_stride: width,
-        y: Arc::from(bytes[..y_len].to_vec()),
-        uv: Arc::from(bytes[y_len..y_len + uv_len].to_vec()),
+        uv_stride: uv_row as u32,
+        y,
+        uv,
         seq: Nv12Frame::next_seq(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_are_cropped_to_the_visible_picture() {
+        // 4x4 picture in a 6-byte pitch, 6-row surface (2 padding rows), chroma after.
+        let (pitch, rows) = (6usize, 6usize);
+        let mut src = vec![0u8; pitch * (rows + rows / 2)];
+        for row in 0..rows {
+            for col in 0..pitch {
+                src[row * pitch + col] = (row * 10 + col) as u8;
+            }
+        }
+        for row in 0..rows / 2 {
+            for col in 0..pitch {
+                src[(rows + row) * pitch + col] = 100 + (row * 10 + col) as u8;
+            }
+        }
+        let mut pool = PlanePool::default();
+        let frame = nv12_from_rows(&src, pitch, rows, 4, 4, &mut pool).expect("frame");
+        assert_eq!(
+            (frame.width, frame.height, frame.y_stride, frame.uv_stride),
+            (4, 4, 4, 4)
+        );
+        assert_eq!(
+            &frame.y[..],
+            &[0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33]
+        );
+        assert_eq!(&frame.uv[..], &[100, 101, 102, 103, 110, 111, 112, 113]);
+        // The chroma rows of the visible picture end before the surface does.
+        assert!(nv12_from_rows(&src[..pitch * 8], pitch, rows, 4, 4, &mut pool).is_some());
+        assert!(nv12_from_rows(&src[..pitch * 7 + 3], pitch, rows, 4, 4, &mut pool).is_none());
+        assert!(nv12_from_rows(&src, pitch, rows, 8, 4, &mut pool).is_none());
+    }
+
+    #[test]
+    fn crop_falls_back_to_the_surface() {
+        assert_eq!(crop_to((1920, 1080), 1920, 1088), (1920, 1080));
+        assert_eq!(crop_to((0, 0), 1920, 1088), (1920, 1088));
+        assert_eq!(crop_to((4000, 1080), 1920, 1088), (1920, 1080));
+    }
+
+    /// Needs a hardware decoder; returns early without one.
+    #[test]
+    fn hardware_decoder_crops_1080p_and_follows_a_resize() {
+        let mut decoder = match HwDecoder::open() {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                eprintln!("hardware decoder unavailable: {error}");
+                return;
+            }
+        };
+        for (w, h, chroma) in [(1920usize, 1080usize, 160u8), (1280, 720, 100)] {
+            let mut encoder = openh264::encoder::Encoder::new().expect("encoder");
+            // Smooth luma ramp, flat chroma.
+            let mut planes = vec![chroma; w * h * 3 / 2];
+            for (i, px) in planes[..w * h].iter_mut().enumerate() {
+                *px = (16 + (i % w) * 200 / w) as u8;
+            }
+            let yuv = openh264::formats::YUVBuffer::from_vec(planes.clone(), w, h);
+            let mut shown = None;
+            for _ in 0..8 {
+                let au = encoder.encode(&yuv).expect("encode").to_vec();
+                if let Some(frame) = decoder.decode(&au, true).expect("decode") {
+                    shown = Some(frame);
+                    break;
+                }
+            }
+            let frame = shown.expect("no picture from the hardware decoder");
+            assert_eq!((frame.width as usize, frame.height as usize), (w, h));
+            assert_eq!(frame.y.len(), w * h);
+            assert_eq!(frame.uv.len(), w * h / 2);
+            let error: u64 = frame
+                .y
+                .iter()
+                .zip(&planes[..w * h])
+                .map(|(&got, &want)| u64::from(got.abs_diff(want)))
+                .sum();
+            assert!(error / (w * h) as u64 <= 3, "luma differs by {error}");
+            let error: u64 = frame
+                .uv
+                .iter()
+                .map(|&got| u64::from(got.abs_diff(chroma)))
+                .sum();
+            assert!(
+                error / frame.uv.len() as u64 <= 3,
+                "chroma differs by {error}"
+            );
+        }
+    }
 }

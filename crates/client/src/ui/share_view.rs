@@ -1,26 +1,86 @@
-//! Draws one NV12 screen-share frame. The color conversion happens in the shader,
+//! Draws the remote screen share. The color conversion happens in the shader,
 //! so the UI never expands the picture to RGBA.
+//!
+//! Pictures do not go through `update` and `view`. A subscription moves the
+//! newest decoded picture into a [`LatestFrame`] slot without producing
+//! messages, and the widget draws whatever the slot holds, asking for the next
+//! redraw while it is on screen. A redraw does not rebuild the widget tree.
+
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chattercrab_media::Nv12Frame;
-use iced::mouse;
 use iced::widget::shader::{self, Primitive};
-use iced::{Rectangle, wgpu};
+use iced::{Rectangle, mouse, wgpu, window};
 
-/// Latest picture to draw, letterboxed inside the widget.
-#[derive(Clone)]
+/// Newest picture of the current remote share. The room keeps it, so it
+/// survives view rebuilds and layout changes (fullscreen).
+#[derive(Debug, Clone, Default)]
+pub struct LatestFrame(Arc<Mutex<Option<Nv12Frame>>>);
+
+impl LatestFrame {
+    /// Whether a picture arrived since the last [`Self::clear`].
+    pub fn has_frame(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    /// Forgets the picture when the share ends or changes hands.
+    pub fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// Replaces the picture. True for the first one since [`Self::clear`].
+    pub fn put(&self, frame: Nv12Frame) -> bool {
+        self.lock().replace(frame).is_none()
+    }
+
+    /// Tells slots apart (subscription identity).
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    fn get(&self) -> Option<Nv12Frame> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<Nv12Frame>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Newest picture of the share, letterboxed inside the widget.
 pub struct ShareView {
-    /// Decoded NV12 frame.
-    pub frame: Nv12Frame,
+    /// Picture to draw, kept by the room.
+    pub latest: LatestFrame,
 }
 
 #[derive(Debug)]
 pub struct SharePrimitive {
-    frame: Nv12Frame,
+    frame: Option<Nv12Frame>,
 }
 
 impl<Message> shader::Program<Message> for ShareView {
     type State = ();
     type Primitive = SharePrimitive;
+
+    /// Redraws on every display frame while the share is on screen, so a new
+    /// picture in the slot is drawn without a message. `prepare` uploads only
+    /// pictures it has not uploaded yet.
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        event: &iced::Event,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Option<shader::Action<Message>> {
+        match event {
+            iced::Event::Window(window::Event::RedrawRequested(_)) => {
+                Some(shader::Action::request_redraw())
+            }
+            _ => None,
+        }
+    }
 
     fn draw(
         &self,
@@ -29,7 +89,7 @@ impl<Message> shader::Program<Message> for ShareView {
         _bounds: Rectangle,
     ) -> Self::Primitive {
         SharePrimitive {
-            frame: self.frame.clone(),
+            frame: self.latest.get(),
         }
     }
 }
@@ -45,11 +105,16 @@ impl Primitive for SharePrimitive {
         bounds: &Rectangle,
         _viewport: &iced::widget::shader::Viewport,
     ) {
-        pipeline.prepare(device, queue, &self.frame, bounds);
+        if let Some(frame) = &self.frame {
+            pipeline.prepare(device, queue, frame, bounds);
+        }
     }
 
     fn draw(&self, pipeline: &Self::Pipeline, pass: &mut wgpu::RenderPass<'_>) -> bool {
-        pipeline.draw(pass);
+        // The pipeline still holds the last share's textures until a picture arrives.
+        if self.frame.is_some() {
+            pipeline.draw(pass);
+        }
         true
     }
 }
@@ -63,8 +128,6 @@ pub struct SharePipeline {
     bind: Option<wgpu::BindGroup>,
     y: Option<Plane>,
     uv: Option<Plane>,
-    y_pad: Vec<u8>,
-    uv_pad: Vec<u8>,
     /// [`Nv12Frame::seq`] of the picture in the textures; 0 for none.
     uploaded: u64,
     /// A frame was skipped as unusable; logged once.
@@ -164,8 +227,6 @@ impl shader::Pipeline for SharePipeline {
             bind: None,
             y: None,
             uv: None,
-            y_pad: Vec::new(),
-            uv_pad: Vec::new(),
             uploaded: 0,
             rejected: false,
         }
@@ -197,8 +258,8 @@ impl SharePipeline {
         }
         let y_width = frame.width.max(2);
         let y_height = frame.height.max(2);
-        let uv_width = y_width / 2;
-        let uv_height = y_height / 2;
+        let uv_width = y_width.div_ceil(2);
+        let uv_height = y_height.div_ceil(2);
         let same_size = self
             .y
             .as_ref()
@@ -230,8 +291,6 @@ impl SharePipeline {
                     frame.width,
                     frame.height,
                     frame.y_stride,
-                    1,
-                    &mut self.y_pad,
                 );
             }
             if let Some(texture) = self.uv.as_ref().map(|plane| plane.texture.clone()) {
@@ -239,11 +298,9 @@ impl SharePipeline {
                     queue,
                     &texture,
                     &frame.uv,
-                    uv_width.max(1),
-                    uv_height.max(1),
+                    uv_width,
+                    uv_height,
                     frame.uv_stride,
-                    2,
-                    &mut self.uv_pad,
                 );
             }
             self.uploaded = frame.seq;
@@ -299,8 +356,8 @@ fn frame_is_drawable(frame: &Nv12Frame, max_dimension: u32) -> bool {
         return false;
     }
     // Same chroma size as `prepare` uploads.
-    let uv_width = (width.max(2) / 2).max(1);
-    let uv_height = (height.max(2) / 2).max(1);
+    let uv_width = width.max(2).div_ceil(2);
+    let uv_height = height.max(2).div_ceil(2);
     plane_holds(frame.y.len(), width, height, frame.y_stride)
         && plane_holds(frame.uv.len(), uv_width * 2, uv_height, frame.uv_stride)
 }
@@ -354,49 +411,27 @@ fn plane(
     }
 }
 
-/// `bytes_per_texel` is 1 for luma and 2 for interleaved chroma.
-#[allow(clippy::too_many_arguments)]
+/// Uploads `rows` rows of `row_texels` texels, `stride` bytes apart. Unlike
+/// buffer-to-texture copies, `Queue::write_texture` takes any `bytes_per_row`
+/// (no 256-byte alignment), so the planes go up as they are.
 fn write_plane(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     data: &[u8],
     row_texels: u32,
     rows: u32,
-    src_stride: u32,
-    bytes_per_texel: u32,
-    scratch: &mut Vec<u8>,
+    stride: u32,
 ) {
-    let row_bytes = row_texels.saturating_mul(bytes_per_texel).max(1);
-    let rows = rows.max(1);
-    let aligned = row_bytes.next_multiple_of(256);
-    let packed = src_stride == aligned && data.len() >= aligned as usize * rows as usize;
-    let bytes: &[u8] = if packed {
-        data
-    } else {
-        let bytes_len = aligned as usize * rows as usize;
-        scratch.resize(bytes_len, 0);
-        let copy = row_bytes.min(src_stride) as usize;
-        for row in 0..rows as usize {
-            let start = row * src_stride as usize;
-            let end = start + copy;
-            if end > data.len() {
-                break;
-            }
-            let dest = row * aligned as usize;
-            scratch[dest..dest + copy].copy_from_slice(&data[start..end]);
-        }
-        scratch
-    };
     queue.write_texture(
         texture.as_image_copy(),
-        bytes,
+        data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(aligned),
+            bytes_per_row: Some(stride),
             rows_per_image: Some(rows),
         },
         wgpu::Extent3d {
-            width: row_texels.max(1),
+            width: row_texels,
             height: rows,
             depth_or_array_layers: 1,
         },
@@ -437,6 +472,26 @@ mod tests {
             uv: vec![0; uv_len].into(),
             seq: 1,
         }
+    }
+
+    #[test]
+    fn put_reports_the_first_picture_after_a_clear() {
+        let latest = LatestFrame::default();
+        assert!(!latest.has_frame());
+        assert!(
+            latest.put(frame(4, 4, 4, 16, 8)),
+            "first picture of the share"
+        );
+        let mut next = frame(4, 4, 4, 16, 8);
+        next.seq = 2;
+        assert!(!latest.put(next), "not the first picture any more");
+        assert_eq!(latest.get().map(|f| f.seq), Some(2));
+        assert_eq!(latest.clone().id(), latest.id());
+        assert_ne!(LatestFrame::default().id(), latest.id());
+
+        latest.clear();
+        assert!(!latest.has_frame());
+        assert!(latest.put(frame(4, 4, 4, 16, 8)));
     }
 
     #[test]

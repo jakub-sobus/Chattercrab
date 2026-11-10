@@ -445,17 +445,17 @@ fn bottom_bar(room: &RoomScreen, noise_suppression: bool, input_gain: f32) -> El
 }
 
 fn share_stage(room: &RoomScreen) -> Element<'_, Message> {
-    match &room.frame {
-        Some(frame) => Shader::new(ShareView {
-            frame: frame.clone(),
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into(),
-        None => container(text("Waiting for the first frame..."))
+    if !room.share_frame.has_frame() {
+        return container(text("Waiting for the first frame..."))
             .center(Length::Fill)
-            .into(),
+            .into();
     }
+    Shader::new(ShareView {
+        latest: room.share_frame.clone(),
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 fn room_view(
