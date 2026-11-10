@@ -98,7 +98,16 @@ impl Session {
     }
 
     /// Current membership, if `welcome` has arrived and the socket is still up.
+    #[cfg(test)]
     pub fn joined_snapshot(&self) -> Option<JoinedRoom> {
+        self.joined.clone()
+    }
+
+    /// Current membership, if `welcome` has arrived and the socket is still up, for
+    /// re-showing the room. The UI resets every level on `Joined`, so the next levels are
+    /// forwarded even if nobody's speaking state changed.
+    pub fn rejoin_snapshot(&mut self) -> Option<JoinedRoom> {
+        self.speaking = None;
         self.joined.clone()
     }
 

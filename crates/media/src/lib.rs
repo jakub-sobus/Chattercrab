@@ -255,8 +255,8 @@ pub enum MediaCommand {
         /// Remote peer.
         peer: PeerId,
     },
-    /// Close every peer connection (leave room or signaling reconnect). Audio devices
-    /// stay open.
+    /// Close every peer connection (leave room or signaling reconnect) and close the
+    /// audio devices until the next [`MediaCommand::Configure`].
     RemoveAllPeers,
     /// Remote SDP offer relayed by the server.
     RemoteOffer {
@@ -375,8 +375,9 @@ pub struct MediaEngine {
 
 impl MediaEngine {
     /// Starts the engine on the current Tokio runtime. The engine opens the audio devices
-    /// in the background; failures are reported as [`MediaEvent::Error`] and the engine
-    /// keeps running (for example without a microphone).
+    /// in the background on each [`MediaCommand::Configure`] (joining a room); failures
+    /// are reported as [`MediaEvent::Error`] and the engine keeps running (for example
+    /// without a microphone).
     ///
     /// Must be called from within a Tokio runtime.
     pub fn start(config: MediaConfig) -> Result<Self, MediaError> {

@@ -457,10 +457,10 @@ impl Backend {
     async fn join(&mut self, id: RoomId, name: RoomName) {
         // Already in this room (create-and-join, then Join on the lobby row).
         // Leaving first would drop the only member and the server would delete the room.
-        if let Some(room) = &self.room
+        if let Some(room) = self.room.as_mut()
             && room.session.room_id() == &id
         {
-            if let Some(joined) = room.session.joined_snapshot() {
+            if let Some(joined) = room.session.rejoin_snapshot() {
                 self.ui(AppEvent::Joined(joined)).await;
             }
             return;
