@@ -123,6 +123,9 @@ struct Pump {
     client: windows::Win32::Media::Audio::IAudioClient,
     #[cfg(windows)]
     capture: windows::Win32::Media::Audio::IAudioCaptureClient,
+    /// Packet-ready event; `None` polls. Declared after the client so it is closed last.
+    #[cfg(windows)]
+    event: Option<windows_impl::Event>,
 }
 
 impl Session {
@@ -289,19 +292,22 @@ mod windows_impl {
 
     use ringbuf::HeapRb;
     use ringbuf::traits::Split;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Media::Audio::{
-        AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-        AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-        ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
-        IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-        IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+        AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
+        AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
+        IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+        IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{BLOB, CoTaskMemFree};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::Win32::System::Variant::VT_BLOB;
-    use windows::core::{HRESULT, Interface, implement};
+    use windows::core::{HRESULT, Interface, PCWSTR, implement};
 
     use super::{
         FRAME_SAMPLES, Pump, RING_MS, SAMPLE_RATE, SampleKind, Session, downmix_f32, downmix_i16,
@@ -316,6 +322,21 @@ mod windows_impl {
         windows::core::GUID::from_u128(0x0000_0001_0000_0010_8000_00aa_0038_9b71);
     const SUBTYPE_FLOAT: windows::core::GUID =
         windows::core::GUID::from_u128(0x0000_0003_0000_0010_8000_00aa_0038_9b71);
+    /// Longest wait for the packet event, so `stop` is still noticed.
+    const EVENT_TIMEOUT_MS: u32 = 100;
+    /// Poll interval when no packet event could be set up.
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// Auto-reset event WASAPI signals when a capture packet is ready. Closed on drop.
+    pub(super) struct Event(HANDLE);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 
     #[implement(IActivateAudioInterfaceCompletionHandler)]
     struct ActivateHandler {
@@ -345,24 +366,24 @@ mod windows_impl {
     }
 
     pub(super) fn open_session() -> Result<Session, MediaError> {
-        let client = activate_client()?;
-        let format = unsafe { client.GetMixFormat() }
-            .map_err(|e| MediaError::Audio(format!("system audio mix format: {e}")))?;
-        let format = FormatGuard(format);
-        let parsed = parse_format(format.0)?;
-        unsafe {
-            client
-                .Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
-                    0,
-                    0,
-                    format.0,
-                    None,
-                )
-                .map_err(|e| MediaError::Audio(format!("system audio init: {e}")))?;
-        }
-        drop(format);
+        // Event-driven capture first. If the event cannot be set up, start over with a
+        // fresh client (a failed `Initialize` can leave it unusable) and poll instead.
+        let event = match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
+            Ok(handle) => Some(Event(handle)),
+            Err(e) => {
+                tracing::warn!("system audio event unavailable, polling instead: {e}");
+                None
+            }
+        };
+        let (client, parsed, event) = match open_client(event.as_ref()) {
+            Ok((client, parsed)) => (client, parsed, event),
+            Err(e) if event.is_some() => {
+                tracing::warn!("system audio event capture failed, polling instead: {e}");
+                let (client, parsed) = open_client(None)?;
+                (client, parsed, None)
+            }
+            Err(e) => return Err(e),
+        };
         let capture = unsafe { client.GetService::<IAudioCaptureClient>() }
             .map_err(|e| MediaError::Audio(format!("system audio capture client: {e}")))?;
         unsafe { client.Start() }
@@ -395,8 +416,33 @@ mod windows_impl {
                 chunk_buf,
                 client,
                 capture,
+                event,
             },
         })
+    }
+
+    /// Activates and initializes a loopback client that signals `event` when one is given.
+    fn open_client(event: Option<&Event>) -> Result<(IAudioClient, ParsedFormat), MediaError> {
+        let client = activate_client()?;
+        let format = unsafe { client.GetMixFormat() }
+            .map_err(|e| MediaError::Audio(format!("system audio mix format: {e}")))?;
+        let format = FormatGuard(format);
+        let parsed = parse_format(format.0)?;
+        let flags = match event {
+            Some(_) => AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            None => AUDCLNT_STREAMFLAGS_LOOPBACK,
+        };
+        unsafe {
+            client
+                .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, format.0, None)
+                .map_err(|e| MediaError::Audio(format!("system audio init: {e}")))?;
+        }
+        drop(format);
+        if let Some(event) = event {
+            unsafe { client.SetEventHandle(event.0) }
+                .map_err(|e| MediaError::Audio(format!("system audio event handle: {e}")))?;
+        }
+        Ok((client, parsed))
     }
 
     struct FormatGuard(*mut WAVEFORMATEX);
@@ -544,7 +590,12 @@ mod windows_impl {
                     self.read_packet(&mut mono)?;
                 }
                 if !progressed {
-                    std::thread::sleep(Duration::from_millis(5));
+                    match self.event.as_ref() {
+                        Some(event) => unsafe {
+                            let _ = WaitForSingleObject(event.0, EVENT_TIMEOUT_MS);
+                        },
+                        None => std::thread::sleep(POLL_INTERVAL),
+                    }
                 }
             }
             Ok(())

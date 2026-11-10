@@ -30,6 +30,11 @@ Behavior notes for the client (no type changes):
   runtime.
 - `MediaCommand::RemoveAllPeers` also stops a local screen share (emitting
   `LocalScreenStopped`), because the server releases the screen lock when the socket drops.
+- Audio devices are open only while in a room. `MediaCommand::Configure` opens the
+  microphone and speaker (a repeated `Configure` keeps them open), and
+  `MediaCommand::RemoveAllPeers` and `Shutdown` close them. Device errors arrive as
+  `MediaEvent::Error` after `Configure`, not after `MediaEngine::start`. `SelectInput` and
+  `SelectOutput` outside a room only record the device for the next `Configure`.
 - `MediaEvent::Levels` is emitted only between `Configure` and `RemoveAllPeers`, and is
   dropped rather than queued when the event channel is full.
 - A remote screen share is played up to one second behind the sender. The

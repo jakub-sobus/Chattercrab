@@ -5,7 +5,8 @@
 //! peer's Opus decoder (normal, FEC or PLC), applies the peer volume, sums into `i32`,
 //! runs a soft-knee limiter, converts to `i16` and writes the frame to the playback
 //! ring. Pacing follows the playback ring fill level, so the output device clock drives
-//! the mixer. Without an output device the mixer paces itself on a 20 ms timer.
+//! the mixer. Without an output device the mixer paces itself on a 20 ms timer, and with
+//! neither a device nor peers it blocks on the control channel.
 //!
 //! Everything the loop touches is allocated before the loop: peer slots arrive fully
 //! constructed through the control channel and the slot vector has fixed capacity.
@@ -32,6 +33,8 @@ pub const PEER_RING_PACKETS: usize = 64;
 const TARGET_OUTPUT_MS: u32 = 40;
 /// Frame period.
 const FRAME_PERIOD: Duration = Duration::from_millis(20);
+/// Longest wait for the playback ring to drain, so control messages stay responsive.
+const MAX_OUTPUT_WAIT_MS: u32 = 20;
 /// Minimum interval between "mixer overrun" warnings.
 const WARN_INTERVAL: Duration = Duration::from_secs(5);
 /// Fixed-point scale for per-peer gain (Q12).
@@ -341,11 +344,36 @@ impl MixerHandle {
 
 impl Drop for MixerHandle {
     fn drop(&mut self) {
-        let _ = self.control.try_send(MixerControl::Shutdown);
+        // Blocking send: a full queue still drains, and a parked thread wakes on it.
+        let _ = self.control.send(MixerControl::Shutdown);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
+}
+
+/// Time until the playback ring falls below [`TARGET_OUTPUT_MS`]; zero when it already has.
+fn output_wait(buffered_ms: u32) -> Duration {
+    if buffered_ms < TARGET_OUTPUT_MS {
+        return Duration::ZERO;
+    }
+    let ms = (buffered_ms - TARGET_OUTPUT_MS + 1).min(MAX_OUTPUT_WAIT_MS);
+    Duration::from_millis(u64::from(ms))
+}
+
+/// Applies one control message. Returns false on [`MixerControl::Shutdown`].
+fn apply(core: &mut MixerCore, output: &mut Option<Box<OutputSink>>, msg: MixerControl) -> bool {
+    match msg {
+        MixerControl::AddPeer(slot) => {
+            if core.add(slot).is_err() {
+                tracing::warn!("mixer full, peer not mixed");
+            }
+        }
+        MixerControl::RemovePeer(peer) => core.remove(peer),
+        MixerControl::SetOutput(sink) => *output = sink,
+        MixerControl::Shutdown => return false,
+    }
+    true
 }
 
 fn run(
@@ -368,26 +396,31 @@ fn run(
     let mut next_deadline = Instant::now() + FRAME_PERIOD;
 
     loop {
+        if output.is_none() && core.is_empty() {
+            // Nothing to mix and nowhere to play it: park until a control message arrives.
+            let Ok(msg) = rx.recv() else { return };
+            if !apply(&mut core, &mut output, msg) {
+                return;
+            }
+        }
         loop {
             match rx.try_recv() {
-                Ok(MixerControl::AddPeer(slot)) => {
-                    if core.add(slot).is_err() {
-                        tracing::warn!("mixer full, peer not mixed");
+                Ok(msg) => {
+                    if !apply(&mut core, &mut output, msg) {
+                        return;
                     }
                 }
-                Ok(MixerControl::RemovePeer(peer)) => core.remove(peer),
-                Ok(MixerControl::SetOutput(sink)) => output = sink,
-                Ok(MixerControl::Shutdown) | Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             }
         }
 
-        let due = match output.as_ref() {
-            Some(sink) => sink.buffered_ms() < TARGET_OUTPUT_MS,
-            None => Instant::now() >= next_deadline,
+        let wait = match output.as_ref() {
+            Some(sink) => output_wait(sink.buffered_ms()),
+            None => next_deadline.saturating_duration_since(Instant::now()),
         };
-        if !due {
-            std::thread::sleep(Duration::from_millis(2));
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
             continue;
         }
 
@@ -428,6 +461,34 @@ mod tests {
 
     fn frame(v: i16) -> [i16; FRAME_SAMPLES] {
         [v; FRAME_SAMPLES]
+    }
+
+    #[test]
+    fn output_wait_tracks_ring_fill() {
+        assert_eq!(output_wait(0), Duration::ZERO);
+        assert_eq!(output_wait(TARGET_OUTPUT_MS - 1), Duration::ZERO);
+        assert_eq!(output_wait(TARGET_OUTPUT_MS), Duration::from_millis(1));
+        assert_eq!(
+            output_wait(TARGET_OUTPUT_MS + 15),
+            Duration::from_millis(16)
+        );
+        assert_eq!(output_wait(500), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn parked_mixer_wakes_and_shuts_down() {
+        let mixer = MixerHandle::spawn(None).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mixer.stats.frames.load(Ordering::Relaxed), 0);
+        let peer = PeerId::random();
+        let (slot, _prod, _controls) = PeerSlot::new(peer).unwrap();
+        assert!(mixer.send(MixerControl::AddPeer(slot)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(mixer.stats.frames.load(Ordering::Relaxed) > 0);
+        assert!(mixer.send(MixerControl::RemovePeer(peer)));
+        std::thread::sleep(Duration::from_millis(50));
+        // Dropping joins the thread, which must leave the parked state.
+        drop(mixer);
     }
 
     #[test]
