@@ -153,7 +153,7 @@ impl HwDecoder {
             if std::time::Instant::now() >= deadline {
                 return Err("timed out waiting for the hardware decoder".into());
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 

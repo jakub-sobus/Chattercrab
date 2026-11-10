@@ -113,7 +113,15 @@ pub(super) fn sequence_header_for(
     bits.u(1, 1);
     bits.u(8, 1);
     bits.u(1, 0);
+    // video_signal_type: unspecified format (5), limited range, BT.709
+    // primaries, transfer, and matrix, which is what the viewer decodes.
+    bits.u(1, 1);
+    bits.u(3, 5);
     bits.u(1, 0);
+    bits.u(1, 1);
+    bits.u(8, 1);
+    bits.u(8, 1);
+    bits.u(8, 1);
     bits.u(1, 0);
     bits.u(1, 1);
     bits.u(32, 1);
@@ -337,20 +345,29 @@ mod tests {
         assert_eq!(
             sps_16.bytes,
             [
-                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xe0, 0x33, 0xf4, 0xf6, 0x02, 0x20, 0x00, 0x00,
-                0x03, 0x00, 0x20, 0x00, 0x00, 0x07, 0x91, 0xe1, 0x10, 0x8d, 0x40,
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xe0, 0x33, 0xf4, 0xf6, 0x02, 0xd4, 0x04, 0x04,
+                0x05, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x8f, 0x08, 0x84,
+                0x6a,
             ]
         );
         assert!(sps_16.has_emulation_bytes);
         assert_eq!(sps_16.bit_length, sps_16.bytes.len() as u32 * 8);
+        let parsed = parse_sps(&sps_16.bytes);
+        assert_eq!(parsed.profile_idc, 66);
+        assert_eq!(parsed.constraint, 0xe0);
+        assert_eq!(parsed.max_num_ref_frames, 1);
+        assert_eq!(parsed.max_dec_frame_buffering, 1);
+        assert_eq!(parsed.video_format, 5);
+        assert!(!parsed.full_range);
+        assert_eq!(parsed.colour, [1, 1, 1]);
 
         let sps_crop = sequence_header(800, 600, 60);
         assert_eq!(
             sps_crop.bytes,
             [
                 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xe0, 0x33, 0xf4, 0x06, 0x40, 0x9b, 0xf2, 0xe0,
-                0x22, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0xf1, 0x1e, 0x11, 0x08,
-                0xd4,
+                0x2d, 0x40, 0x40, 0x40, 0x50, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x07, 0x88,
+                0xf0, 0x88, 0x46, 0xa0,
             ]
         );
 
@@ -360,8 +377,8 @@ mod tests {
             sps_4k.bytes,
             [
                 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xe0, 0x34, 0xf4, 0x01, 0xe0, 0x02, 0x1f, 0x60,
-                0x22, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0xf1, 0x1e, 0x11, 0x08,
-                0xd4,
+                0x2d, 0x40, 0x40, 0x40, 0x50, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x07, 0x88,
+                0xf0, 0x88, 0x46, 0xa0,
             ]
         );
 
@@ -395,6 +412,9 @@ mod tests {
         assert_eq!(parsed.max_dec_frame_buffering, 2);
         assert!(parsed.frame_mbs_only);
         assert!(parsed.direct_8x8);
+        assert_eq!(parsed.video_format, 5);
+        assert!(!parsed.full_range);
+        assert_eq!(parsed.colour, [1, 1, 1]);
 
         let game = sequence_header_for(2560, 1440, 120, true, 1);
         assert_eq!(game.bytes[5..8], [0x64, 0x00, 0x34]);
@@ -453,6 +473,9 @@ mod tests {
         cropping: bool,
         crop_bottom: u32,
         max_dec_frame_buffering: u32,
+        video_format: u32,
+        full_range: bool,
+        colour: [u32; 3],
     }
 
     struct Pps {
@@ -569,7 +592,13 @@ mod tests {
             let _idc = r.u(8);
         }
         let _overscan = r.u(1);
-        let _video_signal = r.u(1);
+        let video_signal = r.u(1) == 1;
+        assert!(video_signal);
+        let video_format = r.u(3);
+        let full_range = r.u(1) == 1;
+        let colour_description = r.u(1) == 1;
+        assert!(colour_description);
+        let colour = [r.u(8), r.u(8), r.u(8)];
         let _chroma_loc = r.u(1);
         let timing = r.u(1) == 1;
         assert!(timing);
@@ -599,6 +628,9 @@ mod tests {
             cropping,
             crop_bottom,
             max_dec_frame_buffering,
+            video_format,
+            full_range,
+            colour,
         }
     }
 

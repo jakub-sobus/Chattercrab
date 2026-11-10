@@ -32,9 +32,9 @@ use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
-    RateControlMode, UsageType,
+    RateControlMode, UsageType, VuiConfig,
 };
-use openh264::formats::{RgbaSliceU8, YUVBuffer};
+use openh264::formats::YUVSlices;
 use tokio::sync::mpsc;
 
 use crate::{MediaError, ScreenContent, ScreenScale, ScreenSource, ScreenSourceKind};
@@ -452,7 +452,8 @@ fn new_encoder(
         .scene_change_detect(!params.game)
         .adaptive_quantization(params.game)
         .background_detection(false)
-        .skip_frames(true);
+        .skip_frames(true)
+        .vui(VuiConfig::bt709());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .map_err(|e| MediaError::Codec(format!("openh264 encoder: {e}")))
 }
@@ -465,7 +466,8 @@ enum ScreenEncoder {
 
 struct SoftwareEncoder {
     encoder: Encoder,
-    yuv: YUVBuffer,
+    /// I420 picture, Y then U then V, reused for every frame.
+    yuv: Vec<u8>,
     width: usize,
     height: usize,
 }
@@ -481,7 +483,7 @@ impl SoftwareEncoder {
         let params = encode_params(high_quality, width, height, fps, false, game);
         Ok(Self {
             encoder: new_encoder(fps, width, height, params)?,
-            yuv: YUVBuffer::new(width as usize, height as usize),
+            yuv: vec![0; (width as usize) * (height as usize) * 3 / 2],
             width: width as usize,
             height: height as usize,
         })
@@ -496,12 +498,18 @@ impl SoftwareEncoder {
         if force_idr {
             self.encoder.force_intra_frame();
         }
-        self.yuv
-            .read_rgba8(RgbaSliceU8::new(rgba, (self.width, self.height)));
+        let (w, h) = (self.width, self.height);
+        let (y, uv) = self.yuv.split_at_mut(w * h);
+        let (u, v) = uv.split_at_mut(w * h / 4);
+        // OpenH264's own RGBA reader uses BT.601; the viewer decodes BT.709.
+        hw::rgba_to_i420(rgba, w, h, y, u, v);
+        let (y, uv) = self.yuv.split_at(w * h);
+        let (u, v) = uv.split_at(w * h / 4);
+        let picture = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
         let ts = openh264::Timestamp::from_millis(elapsed_ms);
         let bs = self
             .encoder
-            .encode_at(&self.yuv, ts)
+            .encode_at(&picture, ts)
             .map_err(|e| MediaError::Codec(format!("h264 encode: {e}")))?;
         let mut data = Vec::new();
         bs.write_vec(&mut data);
@@ -772,6 +780,7 @@ impl CaptureWorker {
 mod tests {
     use super::*;
     use crate::ScreenScale;
+    use openh264::formats::{RgbaSliceU8, YUVBuffer};
 
     #[test]
     fn fit_keeps_aspect_and_even_sizes() {
@@ -892,6 +901,24 @@ mod tests {
         let frame = receive::decode_frame(&mut dec, &au).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.y.len(), 320 * 240);
+    }
+
+    #[test]
+    fn software_encoder_writes_bt709_i420() {
+        let (w, h) = (64usize, 64usize);
+        let mut enc = SoftwareEncoder::open(30, w as u32, h as u32, false, false).unwrap();
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| [255, 0, 0, 255]).collect();
+        let units = enc.encode(&rgba, true, 0).unwrap();
+        assert!(units[0].keyframe);
+        let mut dec = receive::new_decoder().unwrap();
+        let frame = receive::decode_frame(&mut dec, &units[0].data)
+            .unwrap()
+            .unwrap();
+        // BT.709 limited red is (63, 102, 240); BT.601 would be (81, 90, 240).
+        let (y, cb, cr) = (frame.y[0], frame.uv[0], frame.uv[1]);
+        assert!(y.abs_diff(63) <= 2, "y {y}");
+        assert!(cb.abs_diff(102) <= 2, "cb {cb}");
+        assert!(cr.abs_diff(240) <= 2, "cr {cr}");
     }
 
     fn sps_profile_idc(au: &[u8]) -> Option<u8> {

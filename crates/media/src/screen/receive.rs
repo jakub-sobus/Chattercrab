@@ -369,15 +369,30 @@ fn decode_loop(
             };
         }
 
-        let decision =
-            clock.with_mut(|clock| clock.step(peeked.oldest, peeked.newest, Instant::now()));
+        let (decision, skipped_before) = clock.with_mut(|clock| {
+            let before = clock.skipped();
+            (
+                clock.step(peeked.oldest, peeked.newest, Instant::now()),
+                before,
+            )
+        });
         match decision {
             Step::Buffer => continue,
             Step::DecodeOnly => {
                 pace.skipped = pace.skipped.saturating_add(1);
-                let skipped = clock.with_mut(|clock| clock.skipped());
-                if skipped == 1 || skipped.is_multiple_of(60) {
-                    tracing::debug!(skipped, "screen playout skipped a frame to stay within 1s");
+                let (skipped, delay) = clock.with_mut(|clock| (clock.skipped(), clock.delay()));
+                if skipped != skipped_before {
+                    if skipped == 1 || skipped.is_multiple_of(60) {
+                        tracing::debug!(
+                            skipped,
+                            "screen playout skipped a frame to stay within 1s"
+                        );
+                    }
+                } else {
+                    tracing::trace!(
+                        delay_ms = delay.as_millis(),
+                        "screen playout skipped a frame to lower its delay"
+                    );
                 }
                 if let Some(au) = buffer.pop()
                     && decoder.decode(&au.data, false).is_err()

@@ -1,9 +1,9 @@
 //! Screen-share playout clock and encoded-frame buffer.
 //!
 //! Pictures are shown on the RTP timestamp clock, up to one second behind the
-//! newest frame. Arrival jitter and a slow viewer become delay. Frames are not
-//! dropped to catch up until that second is used up, and they are never shown
-//! in a burst.
+//! newest frame. Arrival jitter and a slow viewer become delay. Once arrivals
+//! have been calm for a while, the delay drifts back toward what the jitter
+//! needs by skipping one picture at a time. Frames are never shown in a burst.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -14,8 +14,13 @@ pub(super) const RTP_CLOCK_HZ: u32 = 90_000;
 /// A viewer may sit this far behind the newest picture.
 pub(super) const MAX_PLAYOUT_DELAY: Duration = Duration::from_secs(1);
 /// Delay before the first picture. Grows toward [`MAX_PLAYOUT_DELAY`] when
-/// arrivals are uneven, and stays there so playback does not speed up again.
-pub(super) const MIN_PLAYOUT_DELAY: Duration = Duration::from_millis(100);
+/// arrivals are uneven and decays back once they are calm. The preroll is
+/// still at least three frames.
+pub(super) const MIN_PLAYOUT_DELAY: Duration = Duration::from_millis(50);
+/// No underrun or delay increase for this long before the delay may decay.
+const DECAY_CALM: Duration = Duration::from_secs(5);
+/// At most one picture is skipped per interval to lower the delay.
+const DECAY_INTERVAL: Duration = Duration::from_millis(250);
 /// Encoded access units kept when the decoder falls behind the cap. Past this
 /// the buffer is discarded and the viewer waits for the next keyframe.
 const MAX_BUFFERED_FRAMES: usize = 180;
@@ -50,6 +55,9 @@ pub(super) struct PlayoutClock {
     last_arrival: Option<Instant>,
     jitter_q4: u32,
     skipped: u64,
+    /// Start of the current calm window. Cleared by an underrun or a raise.
+    calm_since: Option<Instant>,
+    last_decay: Option<Instant>,
 }
 
 impl PlayoutClock {
@@ -68,6 +76,8 @@ impl PlayoutClock {
             last_arrival: None,
             jitter_q4: 0,
             skipped: 0,
+            calm_since: None,
+            last_decay: None,
         }
     }
 
@@ -147,6 +157,9 @@ impl PlayoutClock {
             self.skipped = self.skipped.saturating_add(1);
             return Step::DecodeOnly;
         }
+        if self.decay(span, now) {
+            return Step::DecodeOnly;
+        }
         let rtp_due = self
             .origin_at
             .checked_add(ticks_to_duration(oldest.wrapping_sub(self.origin_rtp)))
@@ -177,6 +190,7 @@ impl PlayoutClock {
     pub(super) fn underrun(&mut self) {
         let extra = self.frame_duration().max(Duration::from_millis(20));
         self.delay = (self.delay + extra).min(MAX_PLAYOUT_DELAY);
+        self.calm_since = None;
         self.started = false;
         self.buffering_since = None;
         self.last_shown = None;
@@ -237,9 +251,42 @@ impl PlayoutClock {
         }
         let add = target - self.delay;
         self.delay = target;
+        self.calm_since = None;
         if self.started {
             self.origin_at += add;
         }
+    }
+
+    /// Lowers the delay by one frame when it sits well above what the jitter
+    /// needs, the last underrun or raise was [`DECAY_CALM`] ago, and the
+    /// buffer holds more than the target. Returns true when the oldest picture
+    /// should be skipped for that.
+    ///
+    /// Later pictures become due one frame earlier, so the picture after the
+    /// skipped one lands one frame after the last shown, not in a burst.
+    fn decay(&mut self, span: Duration, now: Instant) -> bool {
+        let calm_since = *self.calm_since.get_or_insert(now);
+        if now.saturating_duration_since(calm_since) < DECAY_CALM {
+            return false;
+        }
+        if self
+            .last_decay
+            .is_some_and(|last| now.saturating_duration_since(last) < DECAY_INTERVAL)
+        {
+            return false;
+        }
+        let frame = self.frame_duration();
+        let floor = self.target_from_jitter() + frame;
+        if self.delay < floor || span < floor {
+            return false;
+        }
+        let Some(origin_at) = self.origin_at.checked_sub(frame) else {
+            return false;
+        };
+        self.origin_at = origin_at;
+        self.delay -= frame;
+        self.last_decay = Some(now);
+        true
     }
 }
 
@@ -521,10 +568,144 @@ mod tests {
         let mut clock = PlayoutClock::new();
         let t0 = Instant::now();
         assert_eq!(clock.step(0, 0, t0), Step::Buffer);
+        // Three frames at the default 30 fps, above the 50 ms minimum.
+        assert_eq!(clock.step(0, 0, at(t0, 99)), Step::Buffer);
         match clock.step(0, 0, at(t0, 100)) {
             Step::Present { at: shown } => assert_eq!(shown, at(t0, 100)),
             other => panic!("expected start after the timer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preroll_at_60_fps_is_the_minimum_delay() {
+        let mut clock = PlayoutClock::new();
+        clock.frame_ticks = 1_500;
+        let t0 = Instant::now();
+        assert_eq!(clock.step(0, 0, t0), Step::Buffer);
+        assert_eq!(clock.step(0, 0, at(t0, 49)), Step::Buffer);
+        assert!(matches!(clock.step(0, 0, at(t0, 50)), Step::Present { .. }));
+        assert_eq!(clock.delay(), MIN_PLAYOUT_DELAY);
+    }
+
+    /// Steady 60 fps arrivals and a decoder that pops each picture when it is due.
+    struct Sim {
+        clock: PlayoutClock,
+        t0: Instant,
+        now: Instant,
+        next: u32,
+        queue: VecDeque<u32>,
+        shown: Vec<Instant>,
+        decode_only: u32,
+    }
+
+    impl Sim {
+        const TICKS: u32 = 1_500;
+
+        fn new(delay: Duration) -> Self {
+            let mut clock = PlayoutClock::new();
+            clock.frame_ticks = Self::TICKS;
+            clock.delay = delay;
+            let t0 = Instant::now();
+            Self {
+                clock,
+                t0,
+                now: t0,
+                next: 0,
+                queue: VecDeque::new(),
+                shown: Vec::new(),
+                decode_only: 0,
+            }
+        }
+
+        fn arrival(&self, n: u32) -> Instant {
+            self.t0 + ticks_to_duration(n * Self::TICKS)
+        }
+
+        fn run_until(&mut self, end: Duration) {
+            let end = self.t0 + end;
+            while self.now < end {
+                while self.arrival(self.next) <= self.now {
+                    let rtp = self.next * Self::TICKS;
+                    self.clock.observe(rtp, self.arrival(self.next));
+                    self.queue.push_back(rtp);
+                    self.next += 1;
+                }
+                let (Some(&oldest), Some(&newest)) = (self.queue.front(), self.queue.back()) else {
+                    self.now = self.arrival(self.next);
+                    continue;
+                };
+                match self.clock.step(oldest, newest, self.now) {
+                    Step::Buffer => self.now = self.arrival(self.next),
+                    Step::DecodeOnly => {
+                        self.queue.pop_front();
+                        self.decode_only += 1;
+                    }
+                    Step::Present { at } => {
+                        self.queue.pop_front();
+                        self.now = self.now.max(at);
+                        self.clock.did_show(at);
+                        self.shown.push(at);
+                    }
+                }
+            }
+        }
+
+        fn assert_no_burst(&self) {
+            let frame = ticks_to_duration(Self::TICKS);
+            for pair in self.shown.windows(2) {
+                let gap = pair[1].saturating_duration_since(pair[0]);
+                assert!(
+                    gap + Duration::from_millis(1) >= frame,
+                    "pictures {gap:?} apart"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delay_decays_toward_the_jitter_target_under_steady_arrivals() {
+        let mut sim = Sim::new(Duration::from_millis(500));
+        sim.run_until(Duration::from_secs(4));
+        assert_eq!(sim.clock.delay(), Duration::from_millis(500));
+        assert_eq!(sim.decode_only, 0);
+
+        sim.run_until(Duration::from_secs(20));
+        let target = sim.clock.target_from_jitter();
+        let frame = sim.clock.frame_duration();
+        assert!(sim.decode_only > 0);
+        assert!(sim.clock.delay() >= target);
+        assert!(
+            sim.clock.delay() <= target + frame * 2,
+            "delay {:?}, target {target:?}",
+            sim.clock.delay()
+        );
+        assert_eq!(sim.clock.skipped(), 0);
+        sim.assert_no_burst();
+        // The decoder keeps up with a shorter buffer.
+        let span = ticks_to_duration(sim.queue.len() as u32 * Sim::TICKS);
+        assert!(span <= sim.clock.delay() + frame, "buffer still {span:?}");
+    }
+
+    #[test]
+    fn no_decay_during_the_calm_window_after_an_underrun() {
+        let mut sim = Sim::new(Duration::from_millis(500));
+        sim.run_until(Duration::from_secs(6));
+        assert!(sim.decode_only > 0, "decay should have started");
+        sim.clock.underrun();
+        let raised = sim.clock.delay();
+        let skipped = sim.decode_only;
+
+        sim.run_until(Duration::from_millis(10_500));
+        assert_eq!(sim.decode_only, skipped, "decayed inside the calm window");
+        assert_eq!(sim.clock.delay(), raised);
+
+        sim.run_until(Duration::from_secs(13));
+        assert!(
+            sim.decode_only > skipped,
+            "decay should resume after the window"
+        );
+        assert!(sim.clock.delay() < raised);
+        sim.assert_no_burst();
     }
 
     #[test]
