@@ -1,7 +1,7 @@
 //! Audio playback: cpal output stream fed from an SPSC ring.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -42,6 +42,8 @@ pub struct OutputSink {
     device_rate: u32,
     resampler: Option<MonoResampler>,
     scratch: Box<[f32; FRAME_SAMPLES]>,
+    /// Largest number of frames the device callback has taken at once.
+    callback_frames: Arc<AtomicU32>,
 }
 
 impl OutputSink {
@@ -57,7 +59,14 @@ impl OutputSink {
             device_rate,
             resampler,
             scratch: Box::new([0.0; FRAME_SAMPLES]),
+            callback_frames: Arc::default(),
         })
+    }
+
+    /// Longest device callback seen so far, in milliseconds (0 before the first one).
+    pub fn callback_ms(&self) -> u32 {
+        let frames = u64::from(self.callback_frames.load(Ordering::Relaxed));
+        (frames * 1000).div_ceil(u64::from(self.device_rate)) as u32
     }
 
     /// Audio currently queued for the device, in milliseconds.
@@ -96,11 +105,12 @@ impl AudioOutput {
 
         let ring = HeapRb::<f32>::new((rate * RING_MS / 1000) as usize);
         let (prod, cons) = ring.split();
+        let sink = OutputSink::new(prod, rate)?;
         let underruns = Arc::new(AtomicU64::new(0));
         let err_name = name.clone();
         let on_error =
             move |e: cpal::Error| tracing::warn!(device = %err_name, "output stream error: {e}");
-        let u = underruns.clone();
+        let u = (underruns.clone(), sink.callback_frames.clone());
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => build::<f32>(&device, &config, channels, cons, u, on_error),
             cpal::SampleFormat::I16 => build::<i16>(&device, &config, channels, cons, u, on_error),
@@ -120,7 +130,6 @@ impl AudioOutput {
             .play()
             .map_err(|e| MediaError::Audio(format!("{name}: {e}")))?;
         tracing::info!(device = %name, rate, channels, "audio output started");
-        let sink = OutputSink::new(prod, rate)?;
         Ok((
             Self {
                 device_name: name,
@@ -138,7 +147,7 @@ fn build<T>(
     config: &cpal::StreamConfig,
     channels: usize,
     mut cons: HeapCons<f32>,
-    underruns: Arc<AtomicU64>,
+    (underruns, callback_frames): (Arc<AtomicU64>, Arc<AtomicU32>),
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -165,6 +174,7 @@ where
             if missing > 0 {
                 underruns.fetch_add(missing, Ordering::Relaxed);
             }
+            callback_frames.fetch_max((data.len() / channels) as u32, Ordering::Relaxed);
         },
         on_error,
         None,

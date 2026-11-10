@@ -29,8 +29,12 @@ use crate::jitter::{JitterBuffer, MAX_PACKET, Playout};
 pub const MAX_PEERS: usize = 8;
 /// Packets buffered between an RTP reader task and the mixer for one peer.
 pub const PEER_RING_PACKETS: usize = 64;
-/// Playback ring fill level the mixer maintains, in milliseconds.
-const TARGET_OUTPUT_MS: u32 = 40;
+/// Playback ring fill level the mixer maintains, in milliseconds: it writes the next
+/// 20 ms frame as soon as the ring drops below this.
+const TARGET_OUTPUT_MS: u32 = 25;
+/// The fill level is kept at least this far above the device callback period, so each
+/// callback finds a full period queued even when the mixer wakes a little late.
+const CALLBACK_MARGIN_MS: u32 = 5;
 /// Frame period.
 const FRAME_PERIOD: Duration = Duration::from_millis(20);
 /// Longest wait for the playback ring to drain, so control messages stay responsive.
@@ -352,12 +356,20 @@ impl Drop for MixerHandle {
     }
 }
 
-/// Time until the playback ring falls below [`TARGET_OUTPUT_MS`]; zero when it already has.
-fn output_wait(buffered_ms: u32) -> Duration {
-    if buffered_ms < TARGET_OUTPUT_MS {
+/// Playback ring fill level to maintain for a device whose callback takes `callback_ms`.
+fn output_target_ms(callback_ms: u32) -> u32 {
+    TARGET_OUTPUT_MS.max(callback_ms + CALLBACK_MARGIN_MS)
+}
+
+/// Time until the playback ring falls below `target_ms`; zero when it already has.
+///
+/// The device drains the ring at most at real-time speed (in callback-sized steps), so
+/// waking after `buffered_ms - target_ms + 1` is never late.
+fn output_wait(buffered_ms: u32, target_ms: u32) -> Duration {
+    if buffered_ms < target_ms {
         return Duration::ZERO;
     }
-    let ms = (buffered_ms - TARGET_OUTPUT_MS + 1).min(MAX_OUTPUT_WAIT_MS);
+    let ms = (buffered_ms - target_ms + 1).min(MAX_OUTPUT_WAIT_MS);
     Duration::from_millis(u64::from(ms))
 }
 
@@ -416,7 +428,7 @@ fn run(
         }
 
         let wait = match output.as_ref() {
-            Some(sink) => output_wait(sink.buffered_ms()),
+            Some(sink) => output_wait(sink.buffered_ms(), output_target_ms(sink.callback_ms())),
             None => next_deadline.saturating_duration_since(Instant::now()),
         };
         if !wait.is_zero() {
@@ -465,14 +477,22 @@ mod tests {
 
     #[test]
     fn output_wait_tracks_ring_fill() {
-        assert_eq!(output_wait(0), Duration::ZERO);
-        assert_eq!(output_wait(TARGET_OUTPUT_MS - 1), Duration::ZERO);
-        assert_eq!(output_wait(TARGET_OUTPUT_MS), Duration::from_millis(1));
-        assert_eq!(
-            output_wait(TARGET_OUTPUT_MS + 15),
-            Duration::from_millis(16)
-        );
-        assert_eq!(output_wait(500), Duration::from_millis(20));
+        let t = TARGET_OUTPUT_MS;
+        assert_eq!(output_wait(0, t), Duration::ZERO);
+        assert_eq!(output_wait(t - 1, t), Duration::ZERO);
+        assert_eq!(output_wait(t, t), Duration::from_millis(1));
+        assert_eq!(output_wait(t + 15, t), Duration::from_millis(16));
+        assert_eq!(output_wait(500, t), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn output_target_covers_the_device_callback() {
+        // Unknown period (no callback yet) and typical 10 ms / 20 ms periods.
+        assert_eq!(output_target_ms(0), TARGET_OUTPUT_MS);
+        assert_eq!(output_target_ms(10), TARGET_OUTPUT_MS);
+        assert_eq!(output_target_ms(20), TARGET_OUTPUT_MS);
+        // A long period keeps a full period plus margin queued.
+        assert_eq!(output_target_ms(30), 30 + CALLBACK_MARGIN_MS);
     }
 
     #[test]

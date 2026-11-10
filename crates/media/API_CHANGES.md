@@ -67,3 +67,21 @@ Behavior notes for the client (no type changes):
   `Connected` (and while it is transiently `Disconnected`), not during negotiation.
 - `MediaEvent::RemoteScreenEnded` fires when the remote video track ends. The client
   should also hide the stream on the server's `screen_stopped`.
+- Opus DTX frames (libopus "do not transmit" frames, at most `audio::DTX_MAX_BYTES` = 2
+  bytes) are not sent. While a peer is silent or muted only the comfort-noise update
+  (about one packet per 400 ms) goes out. Receivers see an RTP timestamp gap with
+  contiguous sequence numbers (the gap is written as an empty sample, so
+  `SendTarget::write` accepts empty data). The jitter buffer conceals the gap and starts
+  the next talk spurt at its playout target; only a packet that arrives after its media
+  time raises the target. Builds before this change see a gap as a late stream: they
+  play it as concealment, and speech after a short pause may lose its first frames.
+- The voice jitter buffer resynchronises only on a jump of 14 frames or more (was 6),
+  and trims standing excess delay by at most one frame every 0.5 s (preferring DTX
+  packets from older senders) once it is 40 ms above the target.
+- In-band FEC follows the receivers: the expected packet loss given to Opus is the worst
+  RTCP receiver-report `fraction_lost` over the connected peers, smoothed (immediate
+  rise, 3 s decay), 0 % on a clean link and at most 20 %. It was a fixed 10 %. Bitrate
+  (96 kbps) and complexity (5) are unchanged. Building blocks: `AudioInput.packet_loss`,
+  `SendTarget::fraction_lost()`.
+- The mixer keeps the playback ring at 25 ms (was 40 ms), or the device callback period
+  plus 5 ms when that is longer (`OutputSink::callback_ms()`).
