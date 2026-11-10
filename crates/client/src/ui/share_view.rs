@@ -1,8 +1,6 @@
 //! Draws one NV12 screen-share frame. The color conversion happens in the shader,
 //! so the UI never expands the picture to RGBA.
 
-use std::sync::Arc;
-
 use chattercrab_media::Nv12Frame;
 use iced::mouse;
 use iced::widget::shader::{self, Primitive};
@@ -67,7 +65,10 @@ pub struct SharePipeline {
     uv: Option<Plane>,
     y_pad: Vec<u8>,
     uv_pad: Vec<u8>,
-    uploaded: usize,
+    /// [`Nv12Frame::seq`] of the picture in the textures; 0 for none.
+    uploaded: u64,
+    /// A frame was skipped as unusable; logged once.
+    rejected: bool,
 }
 
 struct Plane {
@@ -166,6 +167,7 @@ impl shader::Pipeline for SharePipeline {
             y_pad: Vec::new(),
             uv_pad: Vec::new(),
             uploaded: 0,
+            rejected: false,
         }
     }
 }
@@ -178,6 +180,21 @@ impl SharePipeline {
         frame: &Nv12Frame,
         bounds: &Rectangle,
     ) {
+        // The size comes from the remote encoder; wgpu panics on textures it cannot
+        // create. Keep showing the previous picture instead.
+        if !frame_is_drawable(frame, device.limits().max_texture_dimension_2d) {
+            if !self.rejected {
+                self.rejected = true;
+                tracing::warn!(
+                    width = frame.width,
+                    height = frame.height,
+                    y_len = frame.y.len(),
+                    uv_len = frame.uv.len(),
+                    "skipping screen-share frames that cannot be drawn"
+                );
+            }
+            return;
+        }
         let y_width = frame.width.max(2);
         let y_height = frame.height.max(2);
         let uv_width = y_width / 2;
@@ -204,8 +221,7 @@ impl SharePipeline {
             self.uploaded = 0;
             self.bind = None;
         }
-        let generation = Arc::as_ptr(&frame.y) as *const () as usize;
-        if generation != self.uploaded {
+        if frame.seq != self.uploaded {
             if let Some(texture) = self.y.as_ref().map(|plane| plane.texture.clone()) {
                 write_plane(
                     queue,
@@ -230,7 +246,7 @@ impl SharePipeline {
                     &mut self.uv_pad,
                 );
             }
-            self.uploaded = generation;
+            self.uploaded = frame.seq;
         }
         queue.write_buffer(
             &self.uniform,
@@ -273,6 +289,26 @@ impl SharePipeline {
         pass.set_bind_group(0, bind, &[]);
         pass.draw(0..4, 0..1);
     }
+}
+
+/// Whether the frame fits the GPU's texture limit and its planes hold every row that
+/// [`write_plane`] reads.
+fn frame_is_drawable(frame: &Nv12Frame, max_dimension: u32) -> bool {
+    let (width, height) = (frame.width, frame.height);
+    if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
+        return false;
+    }
+    // Same chroma size as `prepare` uploads.
+    let uv_width = (width.max(2) / 2).max(1);
+    let uv_height = (height.max(2) / 2).max(1);
+    plane_holds(frame.y.len(), width, height, frame.y_stride)
+        && plane_holds(frame.uv.len(), uv_width * 2, uv_height, frame.uv_stride)
+}
+
+/// `rows` rows of `row_bytes` bytes, `stride` bytes apart, fit in `len` bytes.
+fn plane_holds(len: usize, row_bytes: u32, rows: u32, stride: u32) -> bool {
+    let needed = u64::from(stride) * u64::from(rows - 1) + u64::from(row_bytes);
+    stride >= row_bytes && len as u64 >= needed
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -385,4 +421,35 @@ fn fit_bytes(bounds: &Rectangle, frame_w: u32, frame_h: u32) -> [u8; 16] {
     out[8..12].copy_from_slice(&scale_x.to_le_bytes());
     out[12..16].copy_from_slice(&scale_y.to_le_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(width: u32, height: u32, y_stride: u32, y_len: usize, uv_len: usize) -> Nv12Frame {
+        Nv12Frame {
+            width,
+            height,
+            y_stride,
+            uv_stride: y_stride,
+            y: vec![0; y_len].into(),
+            uv: vec![0; uv_len].into(),
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn drawable_frames_fit_the_limit_and_their_planes() {
+        assert!(frame_is_drawable(&frame(4, 4, 4, 16, 8), 8192));
+        // Padded rows; the last row needs no padding.
+        assert!(frame_is_drawable(&frame(4, 4, 8, 28, 12), 8192));
+        assert!(frame_is_drawable(&frame(8192, 2, 8192, 16384, 8192), 8192));
+        assert!(!frame_is_drawable(&frame(8193, 2, 8193, 16386, 8194), 8192));
+        assert!(!frame_is_drawable(&frame(0, 4, 4, 16, 8), 8192));
+        // Short planes and strides narrower than a row.
+        assert!(!frame_is_drawable(&frame(4, 4, 4, 15, 8), 8192));
+        assert!(!frame_is_drawable(&frame(4, 4, 4, 16, 7), 8192));
+        assert!(!frame_is_drawable(&frame(4, 4, 3, 64, 64), 8192));
+    }
 }

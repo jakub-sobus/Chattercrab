@@ -126,6 +126,61 @@ impl Config {
     }
 }
 
+/// Saves the config on a background thread so the UI never waits for the disk.
+/// Saves queued while a write runs collapse into the newest one.
+#[derive(Debug, Clone)]
+pub struct ConfigWriter {
+    tx: std::sync::mpsc::Sender<Option<Config>>,
+}
+
+impl ConfigWriter {
+    /// Starts the writer thread for `path`. `on_error` gets a message for each failed write.
+    pub fn spawn(
+        path: PathBuf,
+        on_error: impl Fn(String) + Send + 'static,
+    ) -> std::io::Result<(Self, std::thread::JoinHandle<()>)> {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Config>>();
+        let thread = std::thread::Builder::new()
+            .name("chattercrab-config".into())
+            .spawn(move || {
+                // `None` or a closed channel stops the thread after the pending write.
+                while let Ok(Some(mut config)) = rx.recv() {
+                    let mut stop = false;
+                    for next in rx.try_iter() {
+                        match next {
+                            Some(next) => config = next,
+                            None => {
+                                stop = true;
+                                break;
+                            }
+                        }
+                    }
+                    if let Err(e) = config.save(&path) {
+                        let message = format!("Could not save settings: {e:#}");
+                        tracing::warn!("{message}");
+                        on_error(message);
+                    }
+                    if stop {
+                        break;
+                    }
+                }
+            })?;
+        Ok((Self { tx }, thread))
+    }
+
+    /// Queues `config` for writing. Never blocks.
+    pub fn save(&self, config: Config) {
+        if self.tx.send(Some(config)).is_err() {
+            tracing::warn!("config writer stopped; settings not saved");
+        }
+    }
+
+    /// Lets the thread finish the pending write, then stop.
+    pub fn stop(&self) {
+        let _ = self.tx.send(None);
+    }
+}
+
 /// True when this file still uses the old `full` or `half` size names.
 fn legacy_screen_scale(text: &str) -> bool {
     text.lines().any(|line| {
@@ -318,6 +373,44 @@ noise_suppression = false
         assert_eq!(config.auth_user, "");
         assert!(config.password.is_empty());
         assert_eq!(config.display_name, "ada");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writer_saves_the_latest_config_before_stopping() {
+        let dir = temp_dir("writer");
+        let path = dir.join("chattercrab").join("config.toml");
+        let (writer, thread) = ConfigWriter::spawn(path.clone(), |e| panic!("{e}")).unwrap();
+        for name in ["a", "b", "c"] {
+            writer.save(Config {
+                display_name: name.into(),
+                ..Config::default()
+            });
+        }
+        writer.stop();
+        thread.join().unwrap();
+        assert_eq!(Config::load(&path).unwrap().display_name, "c");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writer_reports_failed_writes() {
+        let dir = temp_dir("writer-error");
+        // The target is a directory, so the write fails.
+        let (errors_tx, errors) = std::sync::mpsc::channel();
+        let (writer, thread) = ConfigWriter::spawn(dir.clone(), move |e| {
+            errors_tx.send(e).unwrap();
+        })
+        .unwrap();
+        writer.save(Config::default());
+        writer.stop();
+        thread.join().unwrap();
+        assert!(
+            errors
+                .try_recv()
+                .unwrap()
+                .starts_with("Could not save settings")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

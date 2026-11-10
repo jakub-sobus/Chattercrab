@@ -16,8 +16,8 @@ use anyhow::Context;
 use iced::Size;
 use tokio::sync::mpsc;
 
-use config::Config;
-use net::{APP_EVENT_CAPACITY, UI_COMMAND_CAPACITY, UiCommand};
+use config::{Config, ConfigWriter};
+use net::{APP_EVENT_CAPACITY, AppEvent, UI_COMMAND_CAPACITY, UiCommand};
 use ui::App;
 
 /// Log filter when `RUST_LOG` is unset: our logs at info, chatty GPU/windowing crates at warn.
@@ -124,6 +124,19 @@ fn main() -> anyhow::Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(UI_COMMAND_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(APP_EVENT_CAPACITY);
+    // Settings are written off the UI thread; failures show up as notices.
+    let config_writer = match config_path {
+        Some(path) => {
+            let notices = event_tx.clone();
+            let writer = ConfigWriter::spawn(path, move |message| {
+                let _ = notices.try_send(AppEvent::Notice(message));
+            })
+            .context("spawning config writer")?;
+            Some(writer)
+        }
+        None => None,
+    };
+    let writer = config_writer.as_ref().map(|(writer, _)| writer.clone());
     let net_thread =
         net::backend::spawn_runtime_thread(cmd_rx, event_tx).context("spawning network thread")?;
     let events: ui::EventSlot = Arc::new(Mutex::new(Some(event_rx)));
@@ -140,7 +153,7 @@ fn main() -> anyhow::Result<()> {
         move || {
             App::new(
                 config.clone(),
-                config_path.clone(),
+                writer.clone(),
                 boot_tx.clone(),
                 events.clone(),
             )
@@ -156,6 +169,12 @@ fn main() -> anyhow::Result<()> {
     .window(window)
     .run();
 
+    if let Some((writer, thread)) = config_writer {
+        writer.stop();
+        if thread.join().is_err() {
+            tracing::error!("config writer panicked");
+        }
+    }
     let _ = cmd_tx.try_send(UiCommand::Shutdown);
     drop(cmd_tx);
     if net_thread.join().is_err() {

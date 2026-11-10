@@ -304,6 +304,8 @@ fn members_panel(room: &RoomScreen) -> Element<'_, Message> {
 
 fn chat_panel(room: &RoomScreen) -> Element<'_, Message> {
     let model = &room.model;
+    // Positional on purpose: iced 0.14's keyed column re-matches every existing row
+    // when a line is appended (see `CHAT_TRIM_BATCH` for the trim side).
     let mut log = Column::new().spacing(4).width(Length::Fill);
     for msg in &model.chat {
         log = log.push(selectable::message(

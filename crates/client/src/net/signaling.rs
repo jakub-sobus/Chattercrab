@@ -1,6 +1,6 @@
 //! Signaling WebSocket task: one task per connection attempt.
 
-use chattercrab_protocol::{ClientMsg, DisplayName, MAX_WS_MESSAGE_BYTES, ServerMsg};
+use chattercrab_protocol::{ClientMsg, DisplayName, ServerMsg};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -16,11 +16,21 @@ use super::rest::basic_authorization_value;
 /// Capacity of the outgoing message queue of one connection.
 pub const OUTGOING_CAPACITY: usize = 256;
 
+/// Largest message accepted from the server. `welcome` replays up to
+/// [`chattercrab_protocol::CHAT_HISTORY_LEN`] (200) messages of up to
+/// [`chattercrab_protocol::MAX_CHAT_CHARS`] (2000) characters, each at most 6 bytes of
+/// JSON (a 4-byte UTF-8 character, or a control character escaped as `\u00XX`), so
+/// about 2.4 MB. Outgoing messages stay within the server's
+/// [`chattercrab_protocol::MAX_WS_MESSAGE_BYTES`].
+pub const MAX_INBOUND_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Why a signaling connection ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseReason {
     /// The server answered the upgrade with 404: the room does not exist.
     RoomNotFound,
+    /// The server answered the upgrade with 401: wrong user or password.
+    AuthFailed,
     /// Network failure or server-side close.
     Failed(String),
 }
@@ -111,8 +121,8 @@ async fn run(
     events: &mpsc::Sender<SignalEvent>,
 ) -> Option<CloseReason> {
     let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(MAX_WS_MESSAGE_BYTES);
-    config.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
+    config.max_message_size = Some(MAX_INBOUND_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_INBOUND_MESSAGE_BYTES);
     let request = match client_request(url, auth_user, password) {
         Ok(request) => request,
         Err(reason) => return Some(reason),
@@ -121,7 +131,7 @@ async fn run(
     let (ws, _response) = match connect.await {
         Ok(ok) => ok,
         Err(WsError::Http(resp)) if resp.status().as_u16() == 401 => {
-            return Some(CloseReason::Failed("authentication failed".to_owned()));
+            return Some(CloseReason::AuthFailed);
         }
         Err(WsError::Http(resp)) if resp.status().as_u16() == 404 => {
             return Some(CloseReason::RoomNotFound);
@@ -205,4 +215,36 @@ where
     sink.send(Message::text(json))
         .await
         .map_err(|e| format!("send failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chattercrab_protocol::{
+        CHAT_HISTORY_LEN, ChatMessage, MAX_CHAT_CHARS, MAX_WS_MESSAGE_BYTES,
+    };
+
+    #[test]
+    fn worst_case_welcome_fits_the_inbound_limit() {
+        // A 4-byte UTF-8 character, and a control character JSON escapes to 6 bytes.
+        for ch in ['\u{1F980}', '\u{1}'] {
+            let you = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+            let msg = ChatMessage {
+                id: u64::MAX,
+                from: you,
+                display_name: DisplayName::new(&"\u{1F980}".repeat(32)).unwrap(),
+                text: ch.to_string().repeat(MAX_CHAT_CHARS),
+                ts: u64::MAX,
+            };
+            let welcome = ServerMsg::Welcome {
+                you,
+                peers: Vec::new(),
+                history: vec![msg; CHAT_HISTORY_LEN],
+                screen_publisher: Some(you),
+            };
+            let len = serde_json::to_string(&welcome).unwrap().len();
+            assert!(len > MAX_WS_MESSAGE_BYTES, "{len}");
+            assert!(len < MAX_INBOUND_MESSAGE_BYTES, "{len}");
+        }
+    }
 }
