@@ -6,6 +6,7 @@
 pub mod room_model;
 mod selectable;
 mod share_view;
+mod style;
 mod view;
 
 use std::hash::{Hash, Hasher};
@@ -138,8 +139,8 @@ pub enum Message {
     InputSelected(String),
     /// Speakers chosen.
     OutputSelected(String),
-    /// Dark theme toggled.
-    DarkTheme(bool),
+    /// Switch between the light and dark theme.
+    ToggleTheme,
     /// Noise suppression toggled (connect screen or room bar).
     NoiseSuppression(bool),
     /// Microphone gain slider moved (`1.0` is 100%, `5.0` is 500%).
@@ -298,8 +299,8 @@ impl App {
     /// Light or dark theme.
     pub fn theme(&self) -> Theme {
         match self.config.theme {
-            ThemeChoice::Light => Theme::Light,
-            ThemeChoice::Dark => Theme::Dark,
+            ThemeChoice::Light => style::LIGHT.clone(),
+            ThemeChoice::Dark => style::DARK.clone(),
         }
     }
 
@@ -363,11 +364,10 @@ impl App {
             Message::OutputSelected(name) => {
                 self.config.output_device = (name != SYSTEM_DEFAULT).then_some(name);
             }
-            Message::DarkTheme(dark) => {
-                self.config.theme = if dark {
-                    ThemeChoice::Dark
-                } else {
-                    ThemeChoice::Light
+            Message::ToggleTheme => {
+                self.config.theme = match self.config.theme {
+                    ThemeChoice::Dark => ThemeChoice::Light,
+                    ThemeChoice::Light => ThemeChoice::Dark,
                 };
                 self.save_config();
             }
