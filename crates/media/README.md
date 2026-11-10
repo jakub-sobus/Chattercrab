@@ -32,8 +32,8 @@ engine task (Tokio): commands, PeerManager, events
 * The cpal callbacks and the mixer loop do not allocate and do not lock. Peer slots
   (decoder, jitter buffer, ring) are built on the engine task and moved into the mixer.
 * Every channel is bounded; real-time producers use `try_push` / `try_send` and count drops.
-* The mixer runs whenever the playback ring holds less than 40 ms, so the output device
-  clock drives it. Iterations longer than 20 ms are counted and logged (rate-limited).
+* The mixer runs whenever the playback ring holds less than 25 ms (or the device callback
+  period plus 5 ms, if larger), so the output device clock drives it. Iterations longer than 20 ms are counted and logged (rate-limited).
 * Noise suppression adds 10 ms of algorithmic delay to the microphone path while it is on.
 
 ## Loopback example
