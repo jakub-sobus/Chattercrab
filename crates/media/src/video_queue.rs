@@ -5,6 +5,7 @@
 //! the stream smooth.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
@@ -27,6 +28,17 @@ pub struct Nv12Frame {
     pub y: Arc<[u8]>,
     /// Interleaved chroma plane.
     pub uv: Arc<[u8]>,
+    /// Unique, increasing picture number. Pooled plane buffers can reuse an address, so
+    /// the UI tells pictures apart by this rather than by pointer.
+    pub seq: u64,
+}
+
+impl Nv12Frame {
+    /// Next process-wide picture number for [`Nv12Frame::seq`].
+    pub fn next_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for Nv12Frame {
@@ -34,6 +46,7 @@ impl std::fmt::Debug for Nv12Frame {
         f.debug_struct("Nv12Frame")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("seq", &self.seq)
             .finish_non_exhaustive()
     }
 }
@@ -155,6 +168,7 @@ mod tests {
             uv_stride: width,
             y: Arc::from(vec![0u8; width as usize * 2]),
             uv: Arc::from(vec![128u8; width as usize]),
+            seq: Nv12Frame::next_seq(),
         }
     }
 

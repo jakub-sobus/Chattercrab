@@ -88,6 +88,7 @@ fn nv12_from_yuv(yuv: &impl YUVSource) -> Nv12Frame {
         uv_stride: width as u32,
         y: Arc::from(y),
         uv: Arc::from(uv),
+        seq: Nv12Frame::next_seq(),
     }
 }
 

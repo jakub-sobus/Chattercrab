@@ -676,6 +676,7 @@ fn nv12_from_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u32, height: u32) 
         uv_stride: width,
         y: Arc::from(y),
         uv: Arc::from(uv),
+        seq: Nv12Frame::next_seq(),
     }
 }
 
@@ -692,5 +693,6 @@ fn nv12_from_tight(bytes: &[u8], width: u32, height: u32) -> Option<Nv12Frame> {
         uv_stride: width,
         y: Arc::from(bytes[..y_len].to_vec()),
         uv: Arc::from(bytes[y_len..y_len + uv_len].to_vec()),
+        seq: Nv12Frame::next_seq(),
     })
 }

@@ -4,6 +4,7 @@ Changes to the public contract in `src/lib.rs` relative to the stub committed in
 `e2cb69c` ("define media engine API contract with stub engine"). Rows above the ICE change are additive.
 
 | Change | Kind | Notes |
+| `Nv12Frame.seq: u64` + `Nv12Frame::next_seq()` | new field | Unique increasing picture number set by every producer. Plane buffers may be pooled and reuse an address, so consumers must detect a new picture by `seq`, not by `Arc` pointer. |
 | `RgbaFrame` replaced by `Nv12Frame` | breaking | The screen queue now carries NV12 planes. The client draws them with a shader instead of uploading RGBA through the image widget. |
 | `ScreenPublisher.bitrate_bps` | new field | Encoder target for the share that just started. |
 | `MediaCommand::StartScreenShare.content: ScreenContent` | new field | Chosen before the share starts, independent of resolution and frame rate. `Desktop` tunes for crisp fonts (screen-content tools, two references, slower preset). `Game` tunes for moving images (motion tools, one reference, faster preset, and 60 Mbps at 1440p60 instead of 45 when high quality is on). Both rates still scale by pixels and frame rate, up to 120 Mbps. |
