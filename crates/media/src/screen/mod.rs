@@ -584,6 +584,8 @@ impl ScreenEncoder {
 }
 
 struct CaptureWorker {
+    /// Read by the Windows GPU capture path only.
+    #[cfg_attr(not(windows), allow(dead_code))]
     source: crate::ScreenSource,
     target: Target,
     fps: u32,
@@ -604,6 +606,7 @@ struct CaptureWorker {
 }
 
 impl CaptureWorker {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     fn run(mut self, first: xcap::image::RgbaImage) {
         #[cfg(windows)]
         {

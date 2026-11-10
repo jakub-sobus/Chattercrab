@@ -15,10 +15,12 @@ use ringbuf::traits::Producer;
 
 use super::resample::MonoResampler;
 use super::share::ShareMix;
+#[cfg(windows)]
 use super::{FRAME_SAMPLES, SAMPLE_RATE};
 use crate::MediaError;
 
 /// Capacity of the system-audio ring, in milliseconds at 48 kHz.
+#[cfg(windows)]
 const RING_MS: u32 = 500;
 
 /// A running system-audio capture. Dropping it stops the thread and detaches the mix.
@@ -184,6 +186,7 @@ impl Drop for Pump {
 }
 
 /// Downmix interleaved `f32` frames to mono.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn downmix_f32(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) {
     out.clear();
     if channels == 0 {
@@ -198,6 +201,7 @@ pub(crate) fn downmix_f32(interleaved: &[f32], channels: usize, out: &mut Vec<f3
 }
 
 /// Downmix interleaved `i16` frames to mono `f32` in [-1, 1].
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn downmix_i16(interleaved: &[i16], channels: usize, out: &mut Vec<f32>) {
     out.clear();
     if channels == 0 {
@@ -211,24 +215,13 @@ pub(crate) fn downmix_i16(interleaved: &[i16], channels: usize, out: &mut Vec<f3
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn downmix_averages_channels() {
-        let mut out = Vec::new();
-        downmix_f32(&[0.0, 1.0, 0.5, 0.5], 2, &mut out);
-        assert_eq!(out, vec![0.5, 0.5]);
-        downmix_i16(&[0, 0, 16384, -16384], 2, &mut out);
-        assert!(out[0].abs() < 1e-6);
-        assert!(out[1].abs() < 1e-4, "{}", out[1]);
-    }
-}
+/// Nothing to initialize off Windows.
+#[cfg(not(windows))]
+struct ComGuard;
 
 #[cfg(not(windows))]
-fn com_init() -> Result<(), MediaError> {
-    Ok(())
+fn com_init() -> Result<ComGuard, MediaError> {
+    Ok(ComGuard)
 }
 
 #[cfg(not(windows))]
@@ -634,5 +627,20 @@ mod windows_impl {
                 .map_err(|e| MediaError::Audio(format!("system audio release: {e}")))?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmix_averages_channels() {
+        let mut out = Vec::new();
+        downmix_f32(&[0.0, 1.0, 0.5, 0.5], 2, &mut out);
+        assert_eq!(out, vec![0.5, 0.5]);
+        downmix_i16(&[0, 0, 16384, -16384], 2, &mut out);
+        assert!(out[0].abs() < 1e-6);
+        assert!(out[1].abs() < 1e-4, "{}", out[1]);
     }
 }
