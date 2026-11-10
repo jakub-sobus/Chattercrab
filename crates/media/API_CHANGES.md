@@ -38,6 +38,12 @@ Behavior notes for the client (no type changes):
   it skips pictures until the buffer fits in that second again and keeps the
   spacing even. `VideoFrameQueue` no longer drops the oldest frame when it is full:
   `push` waits for a free slot and `try_push` returns the frame it could not store.
+  The delay starts at 50 ms (at least three frames) and grows with jitter and
+  underruns. After 5 s without an underrun or increase it decays back toward the
+  jitter target by skipping (still decoding) one picture at most every 250 ms.
+- Every screen-share encoder (Media Foundation, D3D11 video processor, VA-API,
+  OpenH264) produces BT.709 limited-range YCbCr and signals it in the SPS VUI
+  where the encoder allows, matching the viewer's BT.709 shader.
 - Local audio and video are sent to a peer only after its connection reached
   `Connected` (and while it is transiently `Disconnected`), not during negotiation.
 - `MediaEvent::RemoteScreenEnded` fires when the remote video track ends. The client

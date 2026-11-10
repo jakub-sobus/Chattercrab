@@ -107,8 +107,38 @@ mod h264_headers;
 #[path = "va_abi.rs"]
 mod va_abi;
 
-/// BT.601 limited-range RGBA to tightly packed NV12.
+/// BT.709 limited-range RGBA to tightly packed NV12.
 fn rgba_to_nv12(src: &[u8], width: usize, height: usize, y_plane: &mut [u8], uv_plane: &mut [u8]) {
+    rgba_to_yuv420(src, width, height, y_plane, |i, cb, cr| {
+        uv_plane[2 * i] = cb;
+        uv_plane[2 * i + 1] = cr;
+    });
+}
+
+/// BT.709 limited-range RGBA to tightly packed I420 (separate U and V planes).
+pub(super) fn rgba_to_i420(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    y_plane: &mut [u8],
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+) {
+    rgba_to_yuv420(src, width, height, y_plane, |i, cb, cr| {
+        u_plane[i] = cb;
+        v_plane[i] = cr;
+    });
+}
+
+/// Writes the luma plane and hands each 2×2 block's (Cb, Cr) to `put_chroma`
+/// in raster order. The viewer decodes BT.709 limited range.
+fn rgba_to_yuv420(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    y_plane: &mut [u8],
+    mut put_chroma: impl FnMut(usize, u8, u8),
+) {
     for y in 0..height {
         let src_row = &src[y * width * 4..(y + 1) * width * 4];
         let y_row = &mut y_plane[y * width..(y + 1) * width];
@@ -131,18 +161,25 @@ fn rgba_to_nv12(src: &[u8], width: usize, height: usize, y_plane: &mut [u8], uv_
                     b += i32::from(src[i + 2]);
                 }
             }
-            uv_plane[uv_i] = chroma(-38, -74, 112, r / 4, g / 4, b / 4);
-            uv_plane[uv_i + 1] = chroma(112, -94, -18, r / 4, g / 4, b / 4);
-            uv_i += 2;
+            let (r, g, b) = (r / 4, g / 4, b / 4);
+            put_chroma(
+                uv_i,
+                chroma(-26, -86, 112, r, g, b),
+                chroma(112, -102, -10, r, g, b),
+            );
+            uv_i += 1;
         }
     }
 }
 
+/// BT.709 luma in 16..=235: `219/255 * (0.2126 R + 0.7152 G + 0.0722 B)`, ×256.
 fn luma(r: u8, g: u8, b: u8) -> u8 {
-    let y = (66 * i32::from(r) + 129 * i32::from(g) + 25 * i32::from(b) + 128) >> 8;
+    let y = (47 * i32::from(r) + 157 * i32::from(g) + 16 * i32::from(b) + 128) >> 8;
     (y + 16).clamp(0, 255) as u8
 }
 
+/// BT.709 chroma in 16..=240, ×256. Each coefficient row sums to zero so grey
+/// stays exactly at 128.
 fn chroma(cr: i32, cg: i32, cb: i32, r: i32, g: i32, b: i32) -> u8 {
     let c = (cr * r + cg * g + cb * b + 128) >> 8;
     (c + 128).clamp(0, 255) as u8
@@ -181,17 +218,20 @@ mod platform {
         MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
         MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
         MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
-        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-        MF_VERSION, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-        MFSampleExtension_CleanPoint, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID,
-        MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-        MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC,
+        MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+        MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+        MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_FULL, MFSampleExtension_CleanPoint,
+        MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG,
+        MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+        MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
         MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
         MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
         MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-        MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
+        MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+        MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
         eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_High,
         eAVScenarioInfo_DisplayRemoting, eAVScenarioInfo_LiveStreaming,
     };
@@ -854,16 +894,20 @@ mod platform {
         };
         let mut last = String::from("no output type");
         for &profile in profiles {
-            let output = match h264_output_type(width, height, fps, bitrate, profile) {
-                Ok(output) => output,
-                Err(e) => {
-                    last = e;
-                    continue;
+            // BT.709 colour first so the encoder writes it into the VUI. A
+            // driver that rejects the colour attributes gets the plain type.
+            for bt709 in [true, false] {
+                let output = match h264_output_type(width, height, fps, bitrate, profile, bt709) {
+                    Ok(output) => output,
+                    Err(e) => {
+                        last = e;
+                        continue;
+                    }
+                };
+                match transform.SetOutputType(stream, &output, 0) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = e.to_string(),
                 }
-            };
-            match transform.SetOutputType(stream, &output, 0) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = e.to_string(),
             }
         }
         Err(format!("setting h264 output type: {last}"))
@@ -875,6 +919,7 @@ mod platform {
         fps: u32,
         bitrate: u32,
         profile: u32,
+        bt709: bool,
     ) -> Result<windows::Win32::Media::MediaFoundation::IMFMediaType, String> {
         let output = MFCreateMediaType().map_err(|e| format!("output media type: {e}"))?;
         output
@@ -894,6 +939,7 @@ mod platform {
                     super::h264_level_idc(width, height, fps),
                 )
             })
+            .and_then(|()| if bt709 { set_bt709(&output) } else { Ok(()) })
             .map_err(|e| format!("building h264 output type: {e}"))?;
         Ok(output)
     }
@@ -905,20 +951,45 @@ mod platform {
         height: u32,
         fps: u32,
     ) -> Result<(), String> {
-        let input = MFCreateMediaType().map_err(|e| format!("input media type: {e}"))?;
-        input
-            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .and_then(|()| input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12))
-            .and_then(|()| input.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height)))
-            .and_then(|()| input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)))
+        let mut last = String::from("no input type");
+        // Tagged BT.709 limited range first, then the plain type for drivers
+        // that reject the colour attributes.
+        for bt709 in [true, false] {
+            let input = MFCreateMediaType().map_err(|e| format!("input media type: {e}"))?;
+            input
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+                .and_then(|()| input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12))
+                .and_then(|()| input.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height)))
+                .and_then(|()| input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1)))
+                .and_then(|()| {
+                    input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+                })
+                .and_then(|()| input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width))
+                .and_then(|()| if bt709 { set_bt709(&input) } else { Ok(()) })
+                .map_err(|e| format!("building nv12 input type: {e}"))?;
+            match transform.SetInputType(stream, &input, 0) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(format!("setting nv12 input type: {last}"))
+    }
+
+    /// BT.709 primaries, transfer, and matrix at limited (16-235) range.
+    unsafe fn set_bt709(
+        media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+    ) -> windows::core::Result<()> {
+        media_type
+            .SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)
             .and_then(|()| {
-                input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+                media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)
             })
-            .and_then(|()| input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width))
-            .map_err(|e| format!("building nv12 input type: {e}"))?;
-        transform
-            .SetInputType(stream, &input, 0)
-            .map_err(|e| format!("setting nv12 input type: {e}"))
+            .and_then(|()| {
+                media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)
+            })
+            .and_then(|()| {
+                media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)
+            })
     }
 
     unsafe fn read_sample(sample: &IMFSample) -> Result<Option<AccessUnit>, String> {
@@ -1083,6 +1154,55 @@ pub use platform::HwEncoder;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BT.709 limited range from the defining equations, rounded.
+    fn bt709_reference(r: u8, g: u8, b: u8) -> [u8; 3] {
+        let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let luma = 16.0 + 219.0 * y / 255.0;
+        let cb = 128.0 + 224.0 * (b - y) / (1.8556 * 255.0);
+        let cr = 128.0 + 224.0 * (r - y) / (1.5748 * 255.0);
+        [luma.round() as u8, cb.round() as u8, cr.round() as u8]
+    }
+
+    fn convert_solid(rgb: [u8; 3]) -> ([u8; 3], [u8; 3]) {
+        let rgba: Vec<u8> = (0..4).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
+        let mut y = [0u8; 4];
+        let mut uv = [0u8; 2];
+        rgba_to_nv12(&rgba, 2, 2, &mut y, &mut uv);
+        assert!(y.iter().all(|&v| v == y[0]));
+        let (mut y2, mut u, mut v) = ([0u8; 4], [0u8; 1], [0u8; 1]);
+        rgba_to_i420(&rgba, 2, 2, &mut y2, &mut u, &mut v);
+        assert_eq!(y, y2);
+        ([y[0], uv[0], uv[1]], [y2[0], u[0], v[0]])
+    }
+
+    #[test]
+    fn rgba_converts_with_bt709_limited_range() {
+        assert_eq!(convert_solid([255, 255, 255]).0, [235, 128, 128]);
+        assert_eq!(convert_solid([0, 0, 0]).0, [16, 128, 128]);
+        assert_eq!(convert_solid([128, 128, 128]).0, [126, 128, 128]);
+        for rgb in [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+            [0, 0, 0],
+        ] {
+            let (nv12, i420) = convert_solid(rgb);
+            assert_eq!(nv12, i420);
+            let reference = bt709_reference(rgb[0], rgb[1], rgb[2]);
+            for (got, want) in nv12.iter().zip(reference) {
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "{rgb:?}: got {nv12:?}, reference {reference:?}"
+                );
+            }
+        }
+        // Pure blue and red reach the top of the chroma range, not past it.
+        assert_eq!(convert_solid([0, 0, 255]).0[1], 240);
+        assert_eq!(convert_solid([255, 0, 0]).0[2], 240);
+    }
 
     #[test]
     fn annex_b_is_unchanged_and_avcc_gains_start_codes() {
