@@ -1,4 +1,4 @@
-//! Receiving side of screen share: RTP to H.264 access units to RGBA frames.
+//! Receiving side of screen share: RTP to H.264 access units to NV12 frames.
 //!
 //! An RTP reader task depacketizes the remote H.264 track into access units (one per
 //! marker bit), drops pictures after loss until the next IDR, and asks the publisher for
@@ -21,7 +21,7 @@ use rtc::rtp::packetizer::Depacketizer;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
 use super::playout::{AuBuffer, MAX_PLAYOUT_DELAY, PushError, SharedClock, Step, TimedAu, Wait};
-use crate::{MediaError, RgbaFrame, VideoFrameQueue};
+use crate::{MediaError, Nv12Frame, VideoFrameQueue};
 
 /// Minimum interval between PLIs.
 const PLI_INTERVAL: Duration = Duration::from_millis(500);
@@ -50,22 +50,133 @@ pub fn new_decoder() -> Result<Decoder, MediaError> {
         .map_err(|e| MediaError::Codec(format!("openh264 decoder: {e}")))
 }
 
-/// Decodes one access unit; returns `Ok(None)` when the decoder needs more data.
-pub fn decode_to_rgba(decoder: &mut Decoder, au: &[u8]) -> Result<Option<RgbaFrame>, MediaError> {
+/// Decodes one access unit into NV12. Returns `Ok(None)` when the decoder needs more data.
+pub fn decode_frame(decoder: &mut Decoder, au: &[u8]) -> Result<Option<Nv12Frame>, MediaError> {
     let Some(yuv) = decoder
         .decode(au)
         .map_err(|e| MediaError::Codec(format!("h264 decode: {e}")))?
     else {
         return Ok(None);
     };
-    let (w, h) = yuv.dimensions();
-    let mut pixels = vec![0u8; w * h * 4];
-    yuv.write_rgba8(&mut pixels);
-    Ok(Some(RgbaFrame {
-        width: w as u32,
-        height: h as u32,
-        pixels: Arc::from(pixels),
-    }))
+    Ok(Some(nv12_from_yuv(&yuv)))
+}
+
+fn nv12_from_yuv(yuv: &impl YUVSource) -> Nv12Frame {
+    let (width, height) = yuv.dimensions();
+    let (y_stride, u_stride, v_stride) = yuv.strides();
+    let y_plane = yuv.y();
+    let u_plane = yuv.u();
+    let v_plane = yuv.v();
+    let mut y = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let start = row * y_stride;
+        y.extend_from_slice(&y_plane[start..start + width]);
+    }
+    let chroma_w = width / 2;
+    let chroma_h = height / 2;
+    let mut uv = Vec::with_capacity(chroma_w * chroma_h * 2);
+    for row in 0..chroma_h {
+        for col in 0..chroma_w {
+            uv.push(u_plane[row * u_stride + col]);
+            uv.push(v_plane[row * v_stride + col]);
+        }
+    }
+    Nv12Frame {
+        width: width as u32,
+        height: height as u32,
+        y_stride: width as u32,
+        uv_stride: width as u32,
+        y: Arc::from(y),
+        uv: Arc::from(uv),
+    }
+}
+
+struct PictureDecoder {
+    #[cfg(windows)]
+    hardware: Option<super::hw_decode::HwDecoder>,
+    software: Option<Decoder>,
+}
+
+impl PictureDecoder {
+    fn open() -> Result<Self, MediaError> {
+        #[cfg(windows)]
+        match super::hw_decode::HwDecoder::open() {
+            Ok(decoder) => {
+                return Ok(Self {
+                    hardware: Some(decoder),
+                    software: None,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "hardware h264 decoder unavailable, using openh264");
+            }
+        }
+        Ok(Self {
+            #[cfg(windows)]
+            hardware: None,
+            software: Some(new_decoder()?),
+        })
+    }
+
+    fn is_hardware(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.hardware.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn decode(&mut self, au: &[u8], present: bool) -> Result<Option<Nv12Frame>, MediaError> {
+        #[cfg(windows)]
+        let hardware_failed = if let Some(hw) = self.hardware.as_mut() {
+            match hw.decode(au, present) {
+                Ok(frame) => return Ok(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "hardware h264 decode failed, using openh264");
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(windows)]
+        if hardware_failed {
+            self.hardware = None;
+            self.software = Some(new_decoder()?);
+        }
+        let Some(decoder) = self.software.as_mut() else {
+            return Err(MediaError::Codec("no h264 decoder".into()));
+        };
+        if !present {
+            decode_discard(decoder, au)?;
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let frame = decode_frame(decoder, au)?;
+        let took = started.elapsed();
+        if took > Duration::from_millis(12) {
+            slow_software_decode(took);
+        }
+        Ok(frame)
+    }
+}
+
+fn slow_software_decode(took: Duration) {
+    use std::cell::Cell;
+    thread_local! {
+        static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    let overdue = LAST.with(|last| {
+        last.get()
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+    });
+    if overdue {
+        LAST.with(|last| last.set(Some(Instant::now())));
+        tracing::warn!(?took, "software h264 decode missed the frame budget");
+    }
 }
 
 fn decode_discard(decoder: &mut Decoder, au: &[u8]) -> Result<(), MediaError> {
@@ -188,7 +299,7 @@ fn decode_loop(
     queue: VideoFrameQueue,
     want_keyframe: Arc<AtomicBool>,
 ) {
-    let mut decoder = match new_decoder() {
+    let mut decoder = match PictureDecoder::open() {
         Ok(decoder) => decoder,
         Err(e) => {
             tracing::warn!("{e}");
@@ -199,12 +310,15 @@ fn decode_loop(
     let mut need_idr = false;
     let mut logged_start = false;
     let mut empty_since: Option<Instant> = None;
+    let mut pace = DecodePace::new(decoder.is_hardware());
     loop {
+        pace.tick(decoder.is_hardware());
         if buffer.take_overflow() {
+            pace.underruns = pace.underruns.saturating_add(1);
             need_idr = true;
             want_keyframe.store(true, Ordering::Relaxed);
             clock.with_mut(super::playout::PlayoutClock::underrun);
-            decoder = match new_decoder() {
+            decoder = match PictureDecoder::open() {
                 Ok(decoder) => decoder,
                 Err(e) => {
                     tracing::warn!("{e}");
@@ -224,6 +338,7 @@ fn decode_loop(
                     let since = empty_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= cushion {
                         empty_since = None;
+                        pace.underruns = pace.underruns.saturating_add(1);
                         clock.with_mut(super::playout::PlayoutClock::underrun);
                         tracing::debug!("screen playout underrun; buffering again");
                     }
@@ -244,7 +359,7 @@ fn decode_loop(
         if need_idr {
             need_idr = false;
             clock.with_mut(super::playout::PlayoutClock::reset);
-            decoder = match new_decoder() {
+            decoder = match PictureDecoder::open() {
                 Ok(decoder) => decoder,
                 Err(e) => {
                     tracing::warn!("{e}");
@@ -258,12 +373,13 @@ fn decode_loop(
         match decision {
             Step::Buffer => continue,
             Step::DecodeOnly => {
+                pace.skipped = pace.skipped.saturating_add(1);
                 let skipped = clock.with_mut(|clock| clock.skipped());
                 if skipped == 1 || skipped.is_multiple_of(60) {
                     tracing::debug!(skipped, "screen playout skipped a frame to stay within 1s");
                 }
                 if let Some(au) = buffer.pop()
-                    && decode_discard(&mut decoder, &au.data).is_err()
+                    && decoder.decode(&au.data, false).is_err()
                 {
                     need_idr = true;
                     want_keyframe.store(true, Ordering::Relaxed);
@@ -283,6 +399,7 @@ fn decode_loop(
                     &clock,
                     &queue,
                     &mut decoder,
+                    &mut pace,
                     &want_keyframe,
                     au,
                     at,
@@ -299,11 +416,13 @@ fn decode_loop(
 
 /// Decodes `au` and hands it to the UI at `at`.
 /// Returns false when the picture could not be decoded or the receiver stopped.
+#[allow(clippy::too_many_arguments)]
 fn present_frame(
     buffer: &AuBuffer,
     clock: &SharedClock,
     queue: &VideoFrameQueue,
-    decoder: &mut Decoder,
+    decoder: &mut PictureDecoder,
+    pace: &mut DecodePace,
     want_keyframe: &AtomicBool,
     au: TimedAu,
     at: Instant,
@@ -314,10 +433,20 @@ fn present_frame(
     if !buffer.sleep_until(decode_at) {
         return false;
     }
-    let frame = match decode_to_rgba(decoder, &au.data) {
-        Ok(Some(frame)) => frame,
-        Ok(None) => return true,
+    let started = Instant::now();
+    let decoded = decoder.decode(&au.data, true);
+    pace.last_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let frame = match decoded {
+        Ok(Some(frame)) => {
+            pace.shown = pace.shown.saturating_add(1);
+            frame
+        }
+        Ok(None) => {
+            pace.empty = pace.empty.saturating_add(1);
+            return true;
+        }
         Err(e) => {
+            pace.failed = pace.failed.saturating_add(1);
             tracing::debug!("{e}");
             want_keyframe.store(true, Ordering::Relaxed);
             return false;
@@ -339,10 +468,59 @@ fn present_frame(
         Enqueue::Skipped => {
             // The UI is still busy and we are already a second behind. Keep the
             // picture it has; the next step skips until the buffer fits again.
+            pace.held = pace.held.saturating_add(1);
             clock.with_mut(|clock| clock.did_show(Instant::now()));
             true
         }
         Enqueue::Closed => false,
+    }
+}
+
+struct DecodePace {
+    at: Instant,
+    shown: u32,
+    empty: u32,
+    skipped: u32,
+    held: u32,
+    failed: u32,
+    underruns: u32,
+    last_ms: u64,
+    hardware: bool,
+}
+
+impl DecodePace {
+    fn new(hardware: bool) -> Self {
+        Self {
+            at: Instant::now(),
+            shown: 0,
+            empty: 0,
+            skipped: 0,
+            held: 0,
+            failed: 0,
+            underruns: 0,
+            last_ms: 0,
+            hardware,
+        }
+    }
+
+    fn tick(&mut self, hardware: bool) {
+        self.hardware = hardware;
+        if self.at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let secs = self.at.elapsed().as_secs_f32().max(0.001);
+        tracing::info!(
+            fps = self.shown as f32 / secs,
+            empty = self.empty,
+            skipped = self.skipped,
+            held = self.held,
+            failed = self.failed,
+            underruns = self.underruns,
+            decode_ms = self.last_ms,
+            hardware,
+            "screen decode pace"
+        );
+        *self = Self::new(hardware);
     }
 }
 
@@ -358,7 +536,7 @@ enum Enqueue {
 
 fn enqueue_frame(
     queue: &VideoFrameQueue,
-    frame: RgbaFrame,
+    frame: Nv12Frame,
     buffer: &AuBuffer,
     planned: Instant,
 ) -> Enqueue {

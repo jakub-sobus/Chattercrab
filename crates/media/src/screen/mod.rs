@@ -1,18 +1,23 @@
 //! Screen sharing: capture and H.264 encode (publisher) and H.264 decode (receiver).
 //!
-//! Publisher: a dedicated thread captures the selected monitor or window with `xcap`,
-//! fits it inside 3840x2160, 2560x1440, or 1920x1080 without scaling up, and encodes H.264.
-//! Windows uses the GPU's Media Foundation encoder when one is registered.
-//! Linux uses VA-API when libva and a driver are installed. High quality is
-//! H.264 High on both, with the same bitrate, GOP, and two-frame rate control.
-//! Otherwise the publisher uses OpenH264. Encoded access units (Annex-B) leave
-//! through a channel that holds one second of frames. A full channel blocks
-//! capture instead of dropping pictures, so a viewer can play the stream late
-//! and smooth rather than with gaps.
+//! Publisher: a dedicated thread captures the selected monitor or window, fits it
+//! inside 3840x2160, 2560x1440, or 1920x1080 without scaling up, and encodes H.264.
+//! On Windows the capture stays on the GPU (Windows Graphics Capture into the
+//! encoder's Direct3D device) when that path opens, and falls back to an `xcap`
+//! screenshot otherwise. Linux captures with `xcap` and encodes with VA-API when
+//! a driver is installed. High quality is H.264 High on both, with the same
+//! bitrate, a two-second GOP, and a 100 ms rate-control window. Otherwise the
+//! publisher uses OpenH264. Every encoded picture is stamped with exactly one
+//! frame period. The channel holds a few frames; when it is full the next capture
+//! is skipped instead of blocking, so the clock does not stretch.
 //!
 //! Receiver: see [`receive`].
 
+#[cfg(windows)]
+mod gpu_win;
 mod hw;
+#[cfg(windows)]
+mod hw_decode;
 mod playout;
 pub mod receive;
 
@@ -44,10 +49,19 @@ pub const DEFAULT_FPS: u32 = 15;
 pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 5..=120;
 /// Highest frame rate of a standard (not high-quality) share.
 pub const STANDARD_MAX_FPS: u32 = 60;
-/// Periodic IDR distance in high quality. Far enough that a call never hits it;
-/// a viewer PLI/FIR still inserts an IDR, and those requests are limited to one
-/// a second across every viewer.
+/// High-quality IDR distance. Far enough that a moving share does not spend a
+/// frame on a giant keyframe; a viewer picture-loss request still inserts one.
 const HIGH_QUALITY_GOP: u32 = 65_535;
+/// Media Foundation quality-versus-speed for game shares. 0 is slowest, 100 is fastest.
+pub(crate) const HQ_GAME_SPEED: u32 = 80;
+/// Media Foundation quality-versus-speed for desktop shares.
+pub(crate) const HQ_DESKTOP_SPEED: u32 = 55;
+/// High-quality rate-control window. Wide enough that a scene change does not
+/// miss the frame, and still inside the viewer's one-second playout delay.
+pub(crate) const HQ_RC_WINDOW_MS: u32 = 100;
+/// Encoded pictures waiting to be packetized. Past this the capture thread skips
+/// a frame instead of blocking, which would stretch the presentation clock.
+const SEND_QUEUE_FRAMES: usize = 5;
 /// 1440p60 desktop target for H.264. The spec's HEVC text rate is 25–35 Mbps;
 /// H.264 needs about 1.5× that, which lands in the 40–70 Mbps fallback band.
 const HQ_TEXT_1440P60: u64 = 45_000_000;
@@ -60,9 +74,6 @@ const MIN_BITRATE_BPS: u64 = 2_000_000;
 const MAX_BITRATE_BPS: u64 = 80_000_000;
 /// How often a slow high-quality encode is logged.
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
-/// Longest presentation gap stamped onto one captured picture. A longer stall
-/// shows up as the viewer rebuffering instead of one frozen timestamp.
-const MAX_FRAME_GAP: Duration = Duration::from_secs(1);
 /// Consecutive capture failures after which publishing stops.
 const MAX_CAPTURE_FAILURES: u32 = 30;
 
@@ -209,11 +220,13 @@ pub fn encode_params(
     } else {
         fps.saturating_mul(2).max(1)
     };
-    // Two frames of rate-control delay. 1000 ms is the standard share's window.
-    let rc_window_ms = if high_quality {
-        (2_000 / fps).max(1)
+    let rc_window_ms = if high_quality { HQ_RC_WINDOW_MS } else { 1_000 };
+    let speed = if !high_quality {
+        100
+    } else if game {
+        HQ_GAME_SPEED
     } else {
-        1_000
+        HQ_DESKTOP_SPEED
     };
     hw::EncodeParams {
         bitrate,
@@ -221,6 +234,7 @@ pub fn encode_params(
         high_quality,
         game,
         rc_window_ms,
+        speed,
     }
 }
 
@@ -273,6 +287,8 @@ impl Target {
 pub struct ScreenPublisher {
     /// Encoded access units, bounded.
     pub frames: mpsc::Receiver<EncodedVideo>,
+    /// Encoder target, bits per second.
+    pub bitrate_bps: u32,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -299,11 +315,11 @@ impl ScreenPublisher {
     ) -> Result<Self, MediaError> {
         let fps = clamp_fps(fps, high_quality);
         let game = content.is_game();
-        // One second of encoded pictures. `blocking_send` waits when this is full
-        // instead of dropping a frame (a drop is what makes the share stutter).
-        let (tx, rx) = mpsc::channel(fps.max(1) as usize);
+        // A few frames of slack. A full channel skips the next capture instead of
+        // blocking, so a slow send cannot stretch the presentation clock.
+        let (tx, rx) = mpsc::channel(SEND_QUEUE_FRAMES);
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), MediaError>>(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<u32, MediaError>>(1);
         let source_owned = source.clone();
         let thread_stop = stop.clone();
         // Capture handles are not `Send` on every platform, so the source is opened on the
@@ -316,12 +332,14 @@ impl ScreenPublisher {
                     let (width, height) = (first.width(), first.height());
                     let (tw, th) = encode_dimensions(width, height, scale);
                     let encoder = ScreenEncoder::open(fps, tw, th, high_quality, game)?;
-                    Ok((target, first, encoder, (tw, th)))
+                    let bitrate = encode_params(high_quality, tw, th, fps, true, game).bitrate;
+                    Ok((target, first, encoder, (tw, th), bitrate))
                 });
                 match opened {
-                    Ok((target, first, encoder, encoded)) => {
-                        let _ = ready_tx.send(Ok(()));
+                    Ok((target, first, encoder, encoded, bitrate)) => {
+                        let _ = ready_tx.send(Ok(bitrate));
                         CaptureWorker {
+                            source: source_owned,
                             target,
                             fps,
                             scale,
@@ -331,6 +349,11 @@ impl ScreenPublisher {
                             encoded,
                             keyframe,
                             last_slow_encode: None,
+                            dropped: 0,
+                            last_drop_log: None,
+                            encoded_ok: 0,
+                            last_encode: Duration::ZERO,
+                            pace_at: Instant::now(),
                             tx,
                             stop: thread_stop,
                         }
@@ -342,14 +365,23 @@ impl ScreenPublisher {
                 }
             })
             .map_err(|e| MediaError::Screen(format!("spawn capture thread: {e}")))?;
-        let publisher = Self {
+        let mut publisher = Self {
             frames: rx,
+            bitrate_bps: 0,
             stop,
             thread: Some(thread),
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {
-                tracing::info!(source = %source.name, fps, high_quality, game, "screen publisher started");
+            Ok(Ok(bitrate_bps)) => {
+                publisher.bitrate_bps = bitrate_bps;
+                tracing::info!(
+                    source = %source.name,
+                    fps,
+                    high_quality,
+                    game,
+                    bitrate_bps,
+                    "screen publisher started"
+                );
                 Ok(publisher)
             }
             Ok(Err(e)) => Err(e),
@@ -516,9 +548,35 @@ impl ScreenEncoder {
             Self::Software(encoder) => encoder.encode(rgba, force_idr, elapsed_ms),
         }
     }
+
+    /// Encodes an NV12 texture from the Windows hardware encoder's device.
+    #[cfg(windows)]
+    fn encode_dxgi(
+        &mut self,
+        texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        force_idr: bool,
+    ) -> Result<Vec<hw::AccessUnit>, MediaError> {
+        match self {
+            Self::Hardware(encoder) => encoder
+                .encode_dxgi(texture, force_idr)
+                .map_err(MediaError::Codec),
+            Self::Software(_) => Err(MediaError::Codec(
+                "software encoder has no gpu input".into(),
+            )),
+        }
+    }
+
+    #[cfg(windows)]
+    fn d3d_device(&self) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        match self {
+            Self::Hardware(encoder) => Some(encoder.device()),
+            Self::Software(_) => None,
+        }
+    }
 }
 
 struct CaptureWorker {
+    source: crate::ScreenSource,
     target: Target,
     fps: u32,
     scale: ScreenScale,
@@ -528,12 +586,28 @@ struct CaptureWorker {
     encoded: (u32, u32),
     keyframe: Arc<AtomicBool>,
     last_slow_encode: Option<Instant>,
+    dropped: u64,
+    last_drop_log: Option<Instant>,
+    encoded_ok: u64,
+    last_encode: Duration,
+    pace_at: Instant,
     tx: mpsc::Sender<EncodedVideo>,
     stop: Arc<AtomicBool>,
 }
 
 impl CaptureWorker {
     fn run(mut self, first: xcap::image::RgbaImage) {
+        #[cfg(windows)]
+        {
+            self = match gpu_win::try_run(self) {
+                Ok(()) => return,
+                Err(worker) => *worker,
+            };
+        }
+        self.run_cpu(first);
+    }
+
+    fn run_cpu(mut self, first: xcap::image::RgbaImage) {
         let period = Duration::from_secs_f64(1.0 / f64::from(self.fps));
         let started = Instant::now();
         let mut resizer = Resizer::new();
@@ -544,7 +618,6 @@ impl CaptureWorker {
         let mut failures = 0u32;
         let mut pending = Some(first);
         let mut next = Instant::now();
-        let mut last_capture = Instant::now();
 
         while !self.stop.load(Ordering::Acquire) {
             let image = match pending.take().map_or_else(|| self.target.capture(), Ok) {
@@ -596,55 +669,21 @@ impl CaptureWorker {
                 }
                 dst.buffer()
             };
-            let force_idr = self.keyframe.swap(false, Ordering::Relaxed);
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            let encode_started = Instant::now();
-            match self.encoder.encode(rgba, force_idr, elapsed_ms) {
-                Ok(units) => {
-                    if self.high_quality {
-                        let took = encode_started.elapsed();
-                        let overdue = self
-                            .last_slow_encode
-                            .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
-                        if took > period && overdue {
-                            tracing::warn!(
-                                ?took,
-                                ?period,
-                                "high quality encode missed the frame budget"
-                            );
-                            self.last_slow_encode = Some(Instant::now());
-                        }
-                    }
-                    let captured_at = Instant::now();
-                    let gap = captured_at.saturating_duration_since(last_capture);
-                    last_capture = captured_at;
-                    // Stamp the real gap so a slow encode holds the previous picture
-                    // instead of making the next frames bunch up on the viewer.
-                    let stretched = gap.clamp(period, MAX_FRAME_GAP);
-                    let mut stamped_gap = false;
-                    for unit in units {
-                        if unit.data.is_empty() {
-                            continue;
-                        }
-                        let duration = if stamped_gap {
-                            period
-                        } else {
-                            stamped_gap = true;
-                            stretched
-                        };
-                        let frame = EncodedVideo {
-                            data: Bytes::from(unit.data),
-                            duration,
-                            keyframe: unit.keyframe,
-                        };
-                        // Blocks once a second of frames is queued. Shutdown drops
-                        // the receiver, which unblocks this send.
-                        if self.tx.blocking_send(frame).is_err() {
+            if self.tx.capacity() == 0 {
+                self.note_drop();
+            } else {
+                let force_idr = self.keyframe.swap(false, Ordering::Relaxed);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let encode_started = Instant::now();
+                match self.encoder.encode(rgba, force_idr, elapsed_ms) {
+                    Ok(units) => {
+                        self.note_encode(encode_started.elapsed(), period);
+                        if !self.send_units(units, period) {
                             return;
                         }
                     }
+                    Err(e) => tracing::warn!("h264 encode: {e}"),
                 }
-                Err(e) => tracing::warn!("h264 encode: {e}"),
             }
 
             next += period;
@@ -655,6 +694,77 @@ impl CaptureWorker {
                 next = now;
             }
         }
+    }
+
+    fn note_encode(&mut self, took: Duration, period: Duration) {
+        self.encoded_ok = self.encoded_ok.saturating_add(1);
+        self.last_encode = took;
+        if self.pace_at.elapsed() >= Duration::from_secs(2) {
+            let secs = self.pace_at.elapsed().as_secs_f32().max(0.001);
+            tracing::info!(
+                fps = self.encoded_ok as f32 / secs,
+                skipped = self.dropped,
+                encode_ms = self.last_encode.as_millis() as u64,
+                "screen capture pace"
+            );
+            self.encoded_ok = 0;
+            self.dropped = 0;
+            self.pace_at = Instant::now();
+        }
+        if !self.high_quality || took <= period {
+            return;
+        }
+        let overdue = self
+            .last_slow_encode
+            .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
+        if overdue {
+            tracing::warn!(
+                ?took,
+                ?period,
+                "high quality encode missed the frame budget"
+            );
+            self.last_slow_encode = Some(Instant::now());
+        }
+    }
+
+    fn note_drop(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
+        let overdue = self
+            .last_drop_log
+            .is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY);
+        if overdue {
+            tracing::warn!(
+                dropped = self.dropped,
+                "screen frame skipped; sender is behind"
+            );
+            self.last_drop_log = Some(Instant::now());
+        }
+    }
+
+    /// Sends `units` stamped with exactly one frame period. Returns false when the
+    /// receiver has gone away.
+    fn send_units(&mut self, units: Vec<hw::AccessUnit>, period: Duration) -> bool {
+        for unit in units {
+            if unit.data.is_empty() {
+                continue;
+            }
+            let frame = EncodedVideo {
+                data: Bytes::from(unit.data),
+                duration: period,
+                keyframe: unit.keyframe,
+            };
+            match self.tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // The encoder already advanced. The next picture has to be an
+                    // IDR or the viewer would reference a frame it never received.
+                    self.keyframe.store(true, Ordering::Relaxed);
+                    self.note_drop();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        true
     }
 }
 
@@ -742,17 +852,19 @@ mod tests {
         assert!(!desktop.game);
         assert_eq!(desktop.bitrate, 45_000_000);
         assert_eq!(desktop.gop_frames, HIGH_QUALITY_GOP);
-        assert_eq!(desktop.rc_window_ms, 2_000 / 60);
+        assert_eq!(desktop.rc_window_ms, HQ_RC_WINDOW_MS);
+        assert_eq!(desktop.speed, HQ_DESKTOP_SPEED);
         let desktop_fast = encode_params(true, 2560, 1440, 120, false, false);
         assert!(!desktop_fast.game);
         assert_eq!(desktop_fast.bitrate, 90_000_000);
         let game = encode_params(true, 2560, 1440, 60, true, true);
         assert!(game.game);
         assert_eq!(game.bitrate, 60_000_000);
-        assert_eq!(game.rc_window_ms, 2_000 / 60);
+        assert_eq!(game.rc_window_ms, HQ_RC_WINDOW_MS);
+        assert_eq!(game.speed, HQ_GAME_SPEED);
         let game_fast = encode_params(true, 2560, 1440, 120, true, true);
         assert_eq!(game_fast.bitrate, 120_000_000);
-        assert_eq!(game_fast.rc_window_ms, 2_000 / 120);
+        assert_eq!(game_fast.rc_window_ms, HQ_RC_WINDOW_MS);
         let standard = encode_params(false, 2560, 1440, 60, true, true);
         assert!(!standard.high_quality);
         assert!(standard.game);
@@ -777,9 +889,9 @@ mod tests {
         assert!(receive::contains_idr(&au));
 
         let mut dec = receive::new_decoder().unwrap();
-        let frame = receive::decode_to_rgba(&mut dec, &au).unwrap().unwrap();
+        let frame = receive::decode_frame(&mut dec, &au).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (320, 240));
-        assert_eq!(frame.pixels.len(), 320 * 240 * 4);
+        assert_eq!(frame.y.len(), 320 * 240);
     }
 
     fn sps_profile_idc(au: &[u8]) -> Option<u8> {
@@ -817,7 +929,7 @@ mod tests {
         let au = bs.to_vec();
         assert_eq!(sps_profile_idc(&au), Some(100), "expected High profile");
         let mut dec = receive::new_decoder().unwrap();
-        let frame = receive::decode_to_rgba(&mut dec, &au).unwrap().unwrap();
+        let frame = receive::decode_frame(&mut dec, &au).unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (320, 240));
     }
 }

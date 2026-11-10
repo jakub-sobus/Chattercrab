@@ -867,12 +867,15 @@ fn setup(
         rate_control,
         max_refs,
         quality_level: if attempt.extras {
-            va_quality_level(quality_range(va, dpy, profile, entry), params.game)
+            va_quality_level(quality_range(va, dpy, profile, entry), params.speed)
         } else {
             0
         },
         hrd_bits: if attempt.extras {
-            params.bitrate.saturating_mul(2) / fps.max(1)
+            let bits = u64::from(params.bitrate)
+                .saturating_mul(u64::from(params.rc_window_ms.max(1)))
+                / 1_000;
+            u32::try_from(bits).unwrap_or(u32::MAX).max(1)
         } else {
             0
         },
@@ -900,13 +903,12 @@ fn profile_candidates(high_quality: bool) -> &'static [i32] {
 }
 
 /// Windows quality-vs-speed is 0 for slowest and 100 for fastest. VA-API's
-/// range runs the other way: 1 is the highest quality. 33 and 50 are the
-/// desktop and game knobs from the Media Foundation encoder.
-fn va_quality_level(range: u32, game: bool) -> u32 {
+/// range runs the other way: 1 is the highest quality. `speed` is the same
+/// knob the Media Foundation encoder uses.
+fn va_quality_level(range: u32, speed: u32) -> u32 {
     if range <= 1 {
         return 0;
     }
-    let speed = if game { 50 } else { 33 };
     let level = 1 + ((range - 1) * speed + 50) / 100;
     level.clamp(1, range)
 }
@@ -1381,13 +1383,13 @@ mod tests {
 
     #[test]
     fn quality_level_matches_the_windows_speed_knob() {
-        assert_eq!(va_quality_level(0, false), 0);
-        assert_eq!(va_quality_level(1, true), 0);
-        // Range of 7: 33 → level 3 (about NVENC P5), 50 → level 4 (about P4).
-        assert_eq!(va_quality_level(7, false), 3);
-        assert_eq!(va_quality_level(7, true), 4);
-        assert_eq!(va_quality_level(2, false), 1);
-        assert_eq!(va_quality_level(2, true), 2);
+        assert_eq!(va_quality_level(0, 55), 0);
+        assert_eq!(va_quality_level(1, 80), 0);
+        // Range of 7: desktop speed 55 → level 4, game speed 80 → level 6.
+        assert_eq!(va_quality_level(7, 55), 4);
+        assert_eq!(va_quality_level(7, 80), 6);
+        assert_eq!(va_quality_level(2, 55), 2);
+        assert_eq!(va_quality_level(2, 80), 2);
     }
 
     #[test]

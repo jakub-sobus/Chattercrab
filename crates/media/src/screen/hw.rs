@@ -44,8 +44,11 @@ pub struct EncodeParams {
     /// less blurry. Desktop content keeps two references and a slower preset
     /// for crisp text.
     pub game: bool,
-    /// Rate-control window. About two frames when [`Self::high_quality`].
+    /// Rate-control window. 100 ms in high quality, one second otherwise.
     pub rc_window_ms: u32,
+    /// 0 is the slowest preset, 100 is the fastest. Media Foundation's
+    /// quality-versus-speed knob. VA-API maps it onto the driver's range.
+    pub speed: u32,
 }
 
 /// Length-prefixed NALs (AVCC) become Annex-B start codes. Annex-B input is copied.
@@ -160,7 +163,7 @@ mod platform {
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
-        D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
+        D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D,
     };
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1,
@@ -179,16 +182,17 @@ mod platform {
         MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
         MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
         MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-        MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
-        MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
-        MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-        MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH,
-        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-        MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-        MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-        MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
-        eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_High,
+        MF_VERSION, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+        MFSampleExtension_CleanPoint, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID,
+        MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+        MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+        MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+        MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+        MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
+        eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_High,
         eAVScenarioInfo_DisplayRemoting, eAVScenarioInfo_LiveStreaming,
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
@@ -200,9 +204,6 @@ mod platform {
 
     /// How long to wait for the encoder to accept a frame.
     const NEED_INPUT_TIMEOUT: Duration = Duration::from_millis(500);
-    /// How long to wait for that frame's output before returning. A picture that
-    /// is still inside the encoder comes out on the next call.
-    const OUTPUT_GRACE: Duration = Duration::from_millis(4);
 
     /// GPU H.264 encoder. Touched only from the capture thread that created it.
     pub struct HwEncoder {
@@ -241,6 +242,11 @@ mod platform {
             unsafe { Self::start(width, height, fps, params) }
         }
 
+        /// The Direct3D device the encoder was opened on.
+        pub fn device(&self) -> ID3D11Device {
+            self.device.clone()
+        }
+
         /// Encodes one tightly packed RGBA frame. `force_idr` starts a new GOP.
         pub fn encode(&mut self, rgba: &[u8], force_idr: bool) -> Result<Vec<AccessUnit>, String> {
             let expected = (self.width as usize) * (self.height as usize) * 4;
@@ -251,6 +257,24 @@ mod platform {
                 ));
             }
             let sample = unsafe { self.input_sample(rgba)? };
+            self.submit(sample, force_idr)
+        }
+
+        /// Encodes an NV12 texture created on [`Self::device`].
+        pub fn encode_dxgi(
+            &mut self,
+            texture: &ID3D11Texture2D,
+            force_idr: bool,
+        ) -> Result<Vec<AccessUnit>, String> {
+            let sample = unsafe { self.surface_sample(texture)? };
+            self.submit(sample, force_idr)
+        }
+
+        fn submit(
+            &mut self,
+            sample: IMFSample,
+            force_idr: bool,
+        ) -> Result<Vec<AccessUnit>, String> {
             if let Some(api) = &self.codec_api {
                 // Some drivers leave this set, so every later picture becomes an IDR.
                 let force = u32::from(force_idr || self.frames_submitted == 0);
@@ -328,6 +352,24 @@ mod platform {
             Ok(sample)
         }
 
+        unsafe fn surface_sample(&self, texture: &ID3D11Texture2D) -> Result<IMFSample, String> {
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)
+                .map_err(|e| format!("dxgi surface buffer: {e}"))?;
+            let sample = MFCreateSample().map_err(|e| format!("input sample: {e}"))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|e| format!("attaching input buffer: {e}"))?;
+            let time = (self.frames_submitted as i64) * 10_000_000 / i64::from(self.fps);
+            let duration = 10_000_000 / i64::from(self.fps);
+            sample
+                .SetSampleTime(time)
+                .map_err(|e| format!("sample time: {e}"))?;
+            sample
+                .SetSampleDuration(duration)
+                .map_err(|e| format!("sample duration: {e}"))?;
+            Ok(sample)
+        }
+
         fn encode_async(
             &mut self,
             transform: &IMFTransform,
@@ -353,19 +395,9 @@ mod platform {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            let grace = Instant::now() + OUTPUT_GRACE;
-            let mut got = false;
-            loop {
-                let before = units.len();
-                let handled = self.poll(events, transform, units)?;
-                got |= units.len() > before;
-                if !handled && (got || Instant::now() >= grace) {
-                    break;
-                }
-                if !handled {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
+            // Drain output that is already queued. A pipelined encoder publishes
+            // this picture on a later call; sleeping for it costs the frame budget.
+            while self.poll(events, transform, units)? {}
             Ok(())
         }
 
@@ -953,7 +985,7 @@ mod platform {
 
     /// Rate control, content mode, and the high-quality VBV. Called after both
     /// media types are set, which is when the encoder keeps the values.
-    fn configure_codec(api: &ICodecAPI, fps: u32, bitrate: u32, params: EncodeParams) {
+    fn configure_codec(api: &ICodecAPI, _fps: u32, bitrate: u32, params: EncodeParams) {
         set_codec(
             api,
             &CODECAPI_AVEncCommonRateControlMode,
@@ -979,13 +1011,15 @@ mod platform {
             variant_u32(scenario.0 as u32),
         );
         if params.high_quality {
-            // VBV holds about two frames. The property is in bits.
-            let buffer_bits = bitrate.saturating_mul(2) / fps.max(1);
+            // VBV holds the rate-control window. The property is in bits.
+            let buffer_bits =
+                u64::from(bitrate).saturating_mul(u64::from(params.rc_window_ms.max(1))) / 1_000;
+            let buffer_bits = u32::try_from(buffer_bits).unwrap_or(u32::MAX).max(1);
             set_codec(api, &CODECAPI_AVEncCommonMaxBitRate, variant_u32(bitrate));
             set_codec(
                 api,
                 &CODECAPI_AVEncCommonBufferSize,
-                variant_u32(buffer_bits.max(1)),
+                variant_u32(buffer_bits),
             );
             // One reference for game motion, two for desktop text.
             set_codec(
@@ -994,11 +1028,12 @@ mod platform {
                 variant_u32(if params.game { 1 } else { 2 }),
             );
             set_codec(api, &CODECAPI_AVEncCommonLowLatency, variant_bool(true));
-            // 0 is slowest, 100 is fastest. 33 ≈ NVENC P5, 50 ≈ P4.
+            // 0 is slowest, 100 is fastest. Game mode stays near the fast end so
+            // 1440p60 fits in a frame; desktop mode is a step slower for text.
             set_codec(
                 api,
                 &CODECAPI_AVEncCommonQualityVsSpeed,
-                variant_u32(if params.game { 50 } else { 33 }),
+                variant_u32(params.speed),
             );
         }
     }
@@ -1086,6 +1121,7 @@ mod tests {
                 high_quality: false,
                 game: false,
                 rc_window_ms: 1_000,
+                speed: 100,
             },
         ) {
             Ok(encoder) => encoder,
@@ -1112,8 +1148,7 @@ mod tests {
                     "hardware encoder did not emit annex-b"
                 );
                 if let Some(frame) =
-                    crate::screen::receive::decode_to_rgba(&mut decoder, &unit.data)
-                        .expect("decode")
+                    crate::screen::receive::decode_frame(&mut decoder, &unit.data).expect("decode")
                 {
                     assert_eq!((frame.width, frame.height), (320, 240));
                     decoded = true;
@@ -1167,7 +1202,7 @@ mod tests {
                 saw_idr = true;
             }
             if let Some(frame) =
-                crate::screen::receive::decode_to_rgba(&mut decoder, &unit.data).expect("decode")
+                crate::screen::receive::decode_frame(&mut decoder, &unit.data).expect("decode")
             {
                 assert_eq!((frame.width, frame.height), (320, 240));
                 decoded = true;

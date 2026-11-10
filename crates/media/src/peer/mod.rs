@@ -26,7 +26,7 @@ use bytes::Bytes;
 use chattercrab_protocol::{IceServers, PeerId};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::ice::network_type::NetworkType;
-use rtc::interceptor::Slot;
+use rtc::interceptor::{NackResponderBuilder, Slot};
 use rtc::media::Sample;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS};
 use rtc::rtp_transceiver::rtp_sender::{
@@ -495,6 +495,10 @@ impl PeerManager {
             .map_err(webrtc_err)?;
         let registry = register_default_interceptors(Registry::new(), &mut media)
             .map_err(webrtc_err)?
+            .with(
+                Slot::NackResponder,
+                NackResponderBuilder::new().with_size(8_192).build(),
+            )
             .with(
                 Slot::from(rtcp::RTCP_FORWARDER_SLOT),
                 rtcp::KeyframeRequestForwarder::default(),
