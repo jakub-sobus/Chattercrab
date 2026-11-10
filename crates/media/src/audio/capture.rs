@@ -27,6 +27,10 @@ const _: () = assert!(DENOISE_FRAME_LEN == FRAME_SAMPLES);
 const RING_MS: u32 = 500;
 /// Interval between capture statistics log lines.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Shortest encoder-thread wait for capture data.
+const MIN_WAIT: Duration = Duration::from_millis(1);
+/// Longest encoder-thread wait for capture data, so `stop` stays responsive.
+const MAX_WAIT: Duration = Duration::from_millis(20);
 
 /// Live counters shared between the capture callback, the encoder thread and readers.
 #[derive(Debug, Default)]
@@ -445,8 +449,9 @@ impl EncoderWorker {
         let mut last_log = Instant::now();
 
         while !self.stop.load(Ordering::Acquire) {
-            if self.cons.occupied_len() < chunk {
-                std::thread::sleep(Duration::from_millis(2));
+            let occupied = self.cons.occupied_len();
+            if occupied < chunk {
+                std::thread::sleep(chunk_wait(chunk - occupied, self.device_rate));
                 continue;
             }
             let got = self.cons.pop_slice(&mut input);
@@ -544,9 +549,23 @@ impl EncoderWorker {
     }
 }
 
+/// Time until `missing` more samples arrive at `rate`, plus 1 ms of slack, clamped.
+fn chunk_wait(missing: usize, rate: u32) -> Duration {
+    let arrival = Duration::from_micros(missing as u64 * 1_000_000 / u64::from(rate.max(1)));
+    (arrival + MIN_WAIT).clamp(MIN_WAIT, MAX_WAIT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_wait_tracks_missing_audio() {
+        assert_eq!(chunk_wait(480, 48_000), Duration::from_millis(11));
+        assert_eq!(chunk_wait(48, 48_000), Duration::from_millis(2));
+        assert_eq!(chunk_wait(1, 48_000), Duration::from_micros(1_020));
+        assert_eq!(chunk_wait(48_000, 48_000), MAX_WAIT);
+    }
 
     struct Controls {
         muted: Arc<AtomicBool>,

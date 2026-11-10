@@ -56,6 +56,8 @@ struct Engine {
     output_device: Option<String>,
     /// Synthetic input tone (diagnostics); replaces the microphone when set.
     test_tone: Option<f32>,
+    /// Whether the audio devices should be open: from `Configure` until `RemoveAllPeers`.
+    audio_active: bool,
     input: Option<AudioInput>,
     output: Option<AudioOutput>,
     audio_pump: Option<JoinHandle<()>>,
@@ -102,6 +104,7 @@ pub(crate) async fn run(
         input_device: config.input_device,
         output_device: config.output_device,
         test_tone: diagnostics.test_tone,
+        audio_active: false,
         input: None,
         output: None,
         audio_pump: None,
@@ -112,8 +115,6 @@ pub(crate) async fn run(
         screen: None,
         video_pump: None,
     };
-    engine.open_input().await;
-    engine.open_output().await;
 
     let mut levels = tokio::time::interval(LEVELS_INTERVAL);
     levels.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -141,6 +142,34 @@ impl Engine {
         let msg = msg.into();
         tracing::warn!("{msg}");
         self.emit(MediaEvent::Error(msg)).await;
+    }
+
+    /// Opens the microphone and speaker on entering a room, unless they are already open.
+    async fn open_audio(&mut self) {
+        if self.audio_active {
+            return;
+        }
+        self.audio_active = true;
+        self.open_input().await;
+        self.open_output().await;
+    }
+
+    /// Closes the microphone and speaker on leaving a room.
+    async fn close_audio(&mut self) {
+        self.audio_active = false;
+        if let Some(pump) = self.audio_pump.take() {
+            pump.abort();
+        }
+        let _ = self.mixer.send(MixerControl::SetOutput(None));
+        let input = self.input.take();
+        let output = self.output.take();
+        // Dropping joins the encoder thread and stops the device streams.
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(input);
+            drop(output);
+        })
+        .await;
+        self.local_level.store(0, Ordering::Relaxed);
     }
 
     async fn open_input(&mut self) {
@@ -199,7 +228,10 @@ impl Engine {
 
     async fn handle_command(&mut self, cmd: MediaCommand) {
         match cmd {
-            MediaCommand::Configure { me, ice } => self.peers.configure(me, ice.as_ref()),
+            MediaCommand::Configure { me, ice } => {
+                self.peers.configure(me, ice.as_ref());
+                self.open_audio().await;
+            }
             MediaCommand::AddPeer { peer, initiate } => {
                 if let Err(e) = self.peers.add_peer(peer, initiate).await {
                     self.error(format!("connect to {peer}: {e}")).await;
@@ -214,6 +246,7 @@ impl Engine {
                 if self.screen.is_some() {
                     self.stop_screen().await;
                 }
+                self.close_audio().await;
             }
             MediaCommand::RemoteOffer { from, sdp } => {
                 if let Err(e) = self.peers.remote_offer(from, sdp).await {
@@ -248,13 +281,18 @@ impl Engine {
                     c.set_volume(volume);
                 }
             }
+            // While closed, only remember the device for the next `Configure`.
             MediaCommand::SelectInput(name) => {
                 self.input_device = name;
-                self.open_input().await;
+                if self.audio_active {
+                    self.open_input().await;
+                }
             }
             MediaCommand::SelectOutput(name) => {
                 self.output_device = name;
-                self.open_output().await;
+                if self.audio_active {
+                    self.open_output().await;
+                }
             }
             MediaCommand::StartScreenShare {
                 source,
@@ -447,18 +485,9 @@ impl Engine {
         }
         self.peers.remove_all().await;
         self.stop_screen().await;
-        if let Some(p) = self.audio_pump.take() {
-            p.abort();
-        }
-        let input = self.input.take();
-        let output = self.output.take();
+        self.close_audio().await;
         let mixer = self.mixer;
-        let _ = tokio::task::spawn_blocking(move || {
-            drop(input);
-            drop(mixer);
-            drop(output);
-        })
-        .await;
+        let _ = tokio::task::spawn_blocking(move || drop(mixer)).await;
         tracing::info!("media engine stopped");
     }
 }
